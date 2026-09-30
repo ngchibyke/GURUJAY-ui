@@ -1,0 +1,1011 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Stock App</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#EEF1F6; --surface:#FFFFFF; --surface-2:#F6F8FB; --ink:#141D33; --muted:#5A6378; --line:#D8DEE8;
+  --cobalt:#2743D6; --cobalt-hover:#1E35B0; --on-cobalt:#FFFFFF; --cobalt-soft:#E4E9FC;
+  --money:#12815A; --money-soft:#DDF2E8; --warn:#BD3434; --warn-soft:#FAE4E4; --amber:#9A5C00; --amber-soft:#FFEFD3;
+  --ticket:#141D33; --on-ticket:#FFFFFF; --ticket-num:#FFD23F;
+  box-sizing:border-box; padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0E1424; --surface:#172036; --surface-2:#1C2640; --ink:#E9EDF6; --muted:#9AA4BC; --line:#2A3553;
+    --cobalt:#6F86FF; --cobalt-hover:#8C9EFF; --on-cobalt:#0E1424; --cobalt-soft:#222E57;
+    --money:#4CC99A; --money-soft:#143328; --warn:#FF7B7B; --warn-soft:#3A1C22; --amber:#FFC266; --amber-soft:#3A2C12;
+    --ticket:#E9EDF6; --on-ticket:#141D33; --ticket-num:#2743D6; color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0E1424; --surface:#172036; --surface-2:#1C2640; --ink:#E9EDF6; --muted:#9AA4BC; --line:#2A3553;
+  --cobalt:#6F86FF; --cobalt-hover:#8C9EFF; --on-cobalt:#0E1424; --cobalt-soft:#222E57;
+  --money:#4CC99A; --money-soft:#143328; --warn:#FF7B7B; --warn-soft:#3A1C22; --amber:#FFC266; --amber-soft:#3A2C12;
+  --ticket:#E9EDF6; --on-ticket:#141D33; --ticket-num:#2743D6; color-scheme:dark;
+}
+*,*::before,*::after{box-sizing:inherit}
+html{height:100%;scroll-padding-top:env(safe-area-inset-top,0px)}
+body{margin:0;min-height:100%;background:var(--bg);color:var(--ink);font:16px/1.5 "Figtree",system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased}
+h1,h2,h3{font-family:"Bricolage Grotesque","Figtree",system-ui,sans-serif;line-height:1.1;margin:0;letter-spacing:-.01em}
+h1{font-size:clamp(2rem,6vw,3rem);font-weight:800}
+h2{font-size:1.5rem;font-weight:800}
+h3{font-size:1.125rem;font-weight:600}
+p{margin:0}
+img{max-width:100%;display:block}
+a{color:var(--cobalt)}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:3px solid var(--cobalt);outline-offset:2px;border-radius:6px}
+
+.bar{position:sticky;top:env(safe-area-inset-top,0px);z-index:10;background:var(--bg);border-bottom:1px solid var(--line)}
+.bar-in{max-width:1080px;margin:0 auto;padding:.75rem 1rem;display:flex;align-items:center;gap:.75rem}
+.brand{display:flex;align-items:center;gap:.5rem;font-family:"Bricolage Grotesque",sans-serif;font-weight:800;font-size:1.25rem;background:none;border:0;padding:0;cursor:pointer}
+.brand-mark{width:30px;height:30px;border-radius:8px;background:var(--cobalt);color:var(--on-cobalt);display:grid;place-items:center;font-size:.95rem}
+.bar .spacer{flex:1}
+.wrap{max-width:1080px;margin:0 auto;padding:1.5rem 1rem 4rem}
+.narrow{max-width:520px}
+.stack>*+*{margin-top:1rem}
+.stack-lg>*+*{margin-top:2rem}
+.muted{color:var(--muted)}
+.small{font-size:.875rem}
+.row{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap}
+.between{justify-content:space-between}
+.grid{display:grid;gap:1rem;grid-template-columns:repeat(auto-fill,minmax(250px,1fr))}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:1.25rem}
+.panel-flat{background:var(--surface-2);border-radius:10px;padding:1rem}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.4rem;border:1px solid transparent;border-radius:10px;padding:.65rem 1.1rem;font-weight:600;cursor:pointer;background:var(--cobalt);color:var(--on-cobalt);text-decoration:none;min-height:44px}
+.btn:hover{background:var(--cobalt-hover)}
+.btn[disabled]{opacity:.55;cursor:not-allowed}
+.btn.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
+.btn.ghost:hover{background:var(--surface-2)}
+.btn.text{background:none;color:var(--cobalt);padding:.4rem .5rem;min-height:36px}
+.btn.danger{background:transparent;color:var(--warn);border-color:var(--warn-soft)}
+.btn.danger:hover{background:var(--warn-soft)}
+.btn.money{background:var(--money);color:#fff}
+.btn.block{width:100%}
+.btn.sm{padding:.4rem .75rem;min-height:36px;font-size:.9rem}
+
+label.f{display:block}
+label.f>span{display:block;font-weight:600;font-size:.9rem;margin-bottom:.3rem}
+label.f>small{display:block;color:var(--muted);font-size:.8rem;margin-top:.25rem}
+input,select,textarea{width:100%;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:.65rem .8rem;min-height:44px}
+textarea{min-height:96px;resize:vertical}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--cobalt);box-shadow:0 0 0 3px var(--cobalt-soft)}
+.fields{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))}
+fieldset{border:0;padding:0;margin:0}
+legend{font-family:"Bricolage Grotesque",sans-serif;font-weight:600;font-size:1.125rem;margin-bottom:.75rem;padding:0}
+.err{color:var(--warn);font-weight:600;font-size:.9rem}
+
+/* The ticket: every shop is a numbered stub */
+.ticket{position:relative;background:var(--ticket);color:var(--on-ticket);border-radius:14px;display:grid;grid-template-columns:auto 1fr;overflow:hidden;
+  -webkit-mask:radial-gradient(circle 11px at 0 50%,#0000 98%,#000) left/51% 100% no-repeat,radial-gradient(circle 11px at 100% 50%,#0000 98%,#000) right/51% 100% no-repeat;
+  mask:radial-gradient(circle 11px at 0 50%,#0000 98%,#000) left/51% 100% no-repeat,radial-gradient(circle 11px at 100% 50%,#0000 98%,#000) right/51% 100% no-repeat}
+.ticket-no{padding:1.1rem 1.1rem 1.1rem 1.4rem;border-right:2px dashed color-mix(in srgb,var(--on-ticket) 35%,transparent);display:flex;flex-direction:column;justify-content:center}
+.ticket-no small{font-size:.75rem;opacity:.75}
+.ticket-no b{font-family:"Bricolage Grotesque",sans-serif;font-weight:800;font-size:2.4rem;line-height:1;color:var(--ticket-num);font-variant-numeric:tabular-nums}
+.ticket-body{padding:1.1rem 1.4rem 1.1rem 1.1rem;min-width:0}
+.ticket-body h3{color:inherit;overflow-wrap:anywhere}
+.ticket-body p{opacity:.8;font-size:.9rem}
+.ticket .btn.ghost{color:var(--on-ticket);border-color:color-mix(in srgb,var(--on-ticket) 30%,transparent)}
+.ticket .btn.ghost:hover{background:color-mix(in srgb,var(--on-ticket) 12%,transparent)}
+.ticket .btn{background:var(--ticket-num);color:var(--ticket)}
+.ticket.big .ticket-no b{font-size:clamp(2.6rem,9vw,4rem)}
+.new-ticket{animation:stamp .5s cubic-bezier(.2,1.4,.4,1)}
+@keyframes stamp{from{transform:scale(1.08) rotate(-2deg);opacity:0}to{transform:none;opacity:1}}
+@media (prefers-reduced-motion:reduce){.new-ticket{animation:none}}
+
+.tabs{display:flex;gap:.25rem;border-bottom:1px solid var(--line);overflow-x:auto}
+.tab{background:none;border:0;border-bottom:3px solid transparent;padding:.75rem 1rem;font-weight:600;color:var(--muted);cursor:pointer;white-space:nowrap}
+.tab[aria-selected="true"]{color:var(--ink);border-color:var(--cobalt)}
+
+.card{background:var(--surface);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+.card-img{aspect-ratio:4/3;background:var(--surface-2);display:grid;place-items:center;color:var(--muted);font-size:2rem;overflow:hidden}
+.card-img img{width:100%;height:100%;object-fit:cover}
+.card-body{padding:1rem;display:flex;flex-direction:column;gap:.4rem;flex:1}
+.price{font-family:"Bricolage Grotesque",sans-serif;font-weight:800;font-size:1.35rem;font-variant-numeric:tabular-nums}
+.chips{display:flex;flex-wrap:wrap;gap:.3rem}
+.chip{font-size:.78rem;padding:.15rem .55rem;border-radius:999px;background:var(--surface-2);border:1px solid var(--line)}
+.pill{display:inline-block;font-size:.78rem;font-weight:700;padding:.2rem .6rem;border-radius:999px}
+.pill.ok{background:var(--money-soft);color:var(--money)}
+.pill.wait{background:var(--amber-soft);color:var(--amber)}
+.pill.info{background:var(--cobalt-soft);color:var(--cobalt)}
+.pill.bad{background:var(--warn-soft);color:var(--warn)}
+.stat{font-family:"Bricolage Grotesque",sans-serif;font-weight:800;font-size:1.8rem;font-variant-numeric:tabular-nums;line-height:1.1}
+.stats{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.list>*+*{border-top:1px solid var(--line)}
+.order{padding:1rem 0}
+dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:.25rem 1rem;margin:0;font-size:.92rem}
+dl.kv dt{color:var(--muted)}
+dl.kv dd{margin:0;overflow-wrap:anywhere}
+.copyline{display:flex;gap:.5rem}
+.copyline input{font-variant-numeric:tabular-nums;font-size:.9rem}
+.hero{display:grid;gap:2rem;align-items:center;grid-template-columns:1fr}
+@media (min-width:860px){.hero{grid-template-columns:1.1fr 1fr}}
+.stub-stack{display:grid;gap:.75rem}
+.stub-stack .ticket:nth-child(2){margin-left:1.5rem;opacity:.85}
+.stub-stack .ticket:nth-child(3){margin-left:3rem;opacity:.65}
+.toast{position:fixed;left:50%;bottom:calc(1.25rem + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:.7rem 1.1rem;border-radius:10px;font-weight:600;z-index:50;max-width:90vw}
+.empty{text-align:center;padding:2.5rem 1rem;border:2px dashed var(--line);border-radius:14px}
+.back{margin-bottom:.5rem}
+.img-drop{display:flex;gap:1rem;align-items:center}
+.img-drop .thumb{width:96px;height:96px;border-radius:10px;background:var(--surface-2);border:1px solid var(--line);overflow:hidden;display:grid;place-items:center;color:var(--muted);flex:none}
+.img-drop .thumb img{width:100%;height:100%;object-fit:cover}
+.sum{font-variant-numeric:tabular-nums}
+.sum .row{justify-content:space-between}
+.total{font-weight:800;font-size:1.2rem;border-top:1px solid var(--line);padding-top:.5rem}
+.table-scroll{overflow-x:auto}
+
+/* Contact values shown as copyable text */
+.contact{display:inline-flex;align-items:center;gap:.25rem;flex-wrap:wrap}
+.contact .btn.text{min-height:28px;padding:.1rem .4rem;font-size:.82rem}
+
+/* Stock management */
+.filters{display:flex;gap:.4rem;flex-wrap:wrap}
+.filter{border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:.35rem .8rem;font-weight:600;font-size:.88rem;cursor:pointer;min-height:36px}
+.filter[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.restock{display:flex;gap:.3rem;align-items:center;flex-wrap:wrap}
+.restock .btn{min-height:32px;padding:.2rem .55rem;font-size:.85rem}
+.alert{border-left:4px solid var(--amber);background:var(--amber-soft);border-radius:10px;padding:.8rem 1rem}
+.alert.bad{border-color:var(--warn);background:var(--warn-soft)}
+.btn.armed{background:var(--warn);color:#fff;border-color:var(--warn)}
+.log{font-size:.9rem;font-variant-numeric:tabular-nums}
+.log .row{justify-content:space-between;padding:.5rem 0}
+.chg-up{color:var(--money);font-weight:700}
+.chg-down{color:var(--warn);font-weight:700}
+
+/* Cart */
+.cartbar{position:sticky;bottom:calc(.75rem + env(safe-area-inset-bottom,0px));z-index:9;background:var(--ink);color:var(--bg);border-radius:14px;padding:.75rem 1rem;display:flex;align-items:center;justify-content:space-between;gap:.75rem;flex-wrap:wrap;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+.cartbar b{font-variant-numeric:tabular-nums}
+.cartbar .btn{background:var(--ticket-num);color:#141D33}
+.line{display:grid;grid-template-columns:64px minmax(0,1fr);gap:.75rem;padding:.9rem 0}
+.line .thumb{width:64px;height:64px;border-radius:8px;background:var(--surface-2);overflow:hidden;display:grid;place-items:center;color:var(--muted)}
+.line .thumb img{width:100%;height:100%;object-fit:cover}
+.line .opts{display:grid;gap:.5rem;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));margin-top:.5rem}
+.line .opts input,.line .opts select{min-height:40px;padding:.4rem .6rem}
+.cart-btn{position:relative}
+.cart-btn .n{background:var(--ticket-num);color:#141D33;border-radius:999px;font-size:.75rem;padding:0 .4rem;font-weight:800}
+
+/* Sales dashboard */
+.chart-wrap{position:relative;overflow-x:auto}
+.chart-wrap svg{display:block;width:100%;min-width:520px;height:auto}
+.chart-wrap .axis{fill:var(--muted);font:12px "Figtree",system-ui,sans-serif}
+.chart-wrap .gridline{stroke:var(--line);stroke-width:1}
+.chart-wrap .bar{fill:var(--cobalt)}
+.chart-wrap .hit{fill:transparent;cursor:crosshair}
+.chart-wrap .hit:hover+.bar,.chart-wrap .bar.on{fill:var(--cobalt-hover)}
+.tip{position:absolute;pointer-events:none;background:var(--ink);color:var(--bg);font-size:.82rem;padding:.35rem .6rem;border-radius:8px;white-space:nowrap;transform:translate(-50%,-110%);font-variant-numeric:tabular-nums}
+.hbars{display:grid;gap:.7rem}
+.hbar .row{justify-content:space-between;font-size:.92rem}
+.hbar .track{height:10px;background:var(--surface-2);border-radius:4px;margin-top:.3rem;overflow:hidden}
+.hbar .fill{height:100%;background:var(--cobalt);border-radius:0 4px 4px 0}
+.dash{display:grid;gap:1rem;grid-template-columns:minmax(0,1fr)}
+@media (min-width:860px){.dash.two{grid-template-columns:minmax(0,1.4fr) minmax(0,1fr)}}
+</style>
+</head>
+<body>
+<div id="app"><div class="wrap"><p class="muted">Opening Stock App…</p></div></div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<script>
+(function(){
+"use strict";
+const $app = document.getElementById("app");
+const S = { db:null, user:null, uid:null, profile:null, signedIn:false,
+  shops:[], products:[], orders:[], stockLog:[], cart:{}, view:"loading", params:{}, busy:false, loaded:{shops:false,products:false,orders:false} };
+const CURRENCIES = [["NGN","₦"],["USD","$"],["GHS","GH₵"],["KES","KSh"],["ZAR","R"],["GBP","£"],["EUR","€"],["INR","₹"],["CAD","CA$"]];
+const STATUS = {
+  awaiting:{label:"Awaiting payment check",cls:"wait"},
+  paid:{label:"Payment confirmed",cls:"ok"},
+  shipped:{label:"Out for delivery",cls:"info"},
+  delivered:{label:"Delivered",cls:"ok"},
+  rejected:{label:"Payment not received",cls:"bad"}
+};
+
+// ---------- helpers ----------
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const pad = n => String(n).padStart(4,"0");
+const sym = code => (CURRENCIES.find(c=>c[0]===code)||["","$"])[1];
+const money = (n, code) => sym(code) + Number(n||0).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:2});
+const list = s => String(s||"").split(",").map(x=>x.trim()).filter(Boolean);
+const shopById = no => S.shops.find(s=>s.id===no);
+const myShops = () => S.shops.filter(s=>s.ownerId===S.uid).sort((a,b)=>a.id.localeCompare(b.id));
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+function toast(msg){ const t=document.getElementById("toast"); t.textContent=msg; t.hidden=false; clearTimeout(toast._t); toast._t=setTimeout(()=>t.hidden=true,2800); }
+function formData(form){ const o={}; new FormData(form).forEach((v,k)=>o[k]=typeof v==="string"?v.trim():v); return o; }
+async function hash(pw){ const buf=await crypto.subtle.digest("SHA-256", new TextEncoder().encode("stockapp:"+S.uid+":"+pw)); return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,"0")).join(""); }
+function shopLink(no){ let base=""; try{ base=location.href.split("#")[0]; }catch(e){} return base + "#/shop/" + no; }
+function setSession(v){ try{ v ? sessionStorage.setItem("stockapp-signed-in", S.uid) : sessionStorage.removeItem("stockapp-signed-in"); }catch(e){} }
+function getSession(){ try{ return sessionStorage.getItem("stockapp-signed-in")===S.uid; }catch(e){ return false; } }
+function hashShop(){ const m=(location.hash||"").match(/shop\/(\d{1,6})/); return m ? pad(parseInt(m[1],10)) : null; }
+async function copy(text){ try{ await navigator.clipboard.writeText(text); toast("Copied"); }catch(e){ toast("Select the text and copy it"); } }
+// Phone and email links don't open reliably for every viewer, so show the value with a Copy button.
+const contact = v => `<span class="contact"><span>${esc(v)}</span><button type="button" class="btn text" data-act="copy" data-text="${esc(v)}">Copy</button></span>`;
+
+// ---------- stock ----------
+const lowOf = p => (p.lowStock===undefined||p.lowStock==="") ? 5 : Number(p.lowStock)||0;
+function stockState(p){ const q=Number(p.quantity)||0; return q<=0?"out":q<=lowOf(p)?"low":"ok"; }
+function stockPill(p){ const q=Number(p.quantity)||0, s=stockState(p);
+  return s==="out"?`<span class="pill bad">Sold out</span>`:s==="low"?`<span class="pill wait">Low · ${q} left</span>`:`<span class="pill ok">${q} in stock</span>`; }
+async function logStock(p, change, reason, after){
+  try{ await S.db.collection("stockLog").add({productId:p.id,shopNo:p.shopNo,productName:p.name||"",change,reason,after,by:S.uid||null,at:Date.now()}); }catch(e){ console.warn("Stock log not saved", e&&e.code); }
+}
+async function changeStock(id, delta, reason){
+  const ref=S.db.doc("products/"+id); const snap=await ref.get(); if(!snap.exists) return null;
+  const p={id,...snap.data()}; const after=Math.max(0,(Number(p.quantity)||0)+delta);
+  await ref.update({quantity:after}); await logStock(p, after-(Number(p.quantity)||0), reason, after); return after;
+}
+
+// ---------- orders & cart ----------
+const orderItems = o => Array.isArray(o.items)&&o.items.length ? o.items
+  : [{productId:o.productId,name:o.productName,qty:o.qty,size:o.size||"",colour:o.colour||"",unitPrice:o.unitPrice}];
+function orderTitle(o){ const it=orderItems(o); return it.length>1 ? `${it.length} products · ${it.reduce((a,x)=>a+Number(x.qty||0),0)} items` : `${it[0].name} × ${it[0].qty}`; }
+function loadCart(){ try{ S.cart=JSON.parse(localStorage.getItem("stockapp-cart")||"{}")||{}; }catch(e){ S.cart={}; } }
+function saveCart(){ try{ localStorage.setItem("stockapp-cart", JSON.stringify(S.cart)); }catch(e){} }
+const cartFor = no => S.cart[no] || [];
+const cartCount = no => cartFor(no).reduce((a,x)=>a+Number(x.qty||0),0);
+function addToCart(p){
+  const lines=S.cart[p.shopNo]=cartFor(p.shopNo);
+  const size=list(p.sizes)[0]||"", colour=list(p.colours)[0]||"";
+  const ex=lines.find(l=>l.productId===p.id&&l.size===size&&l.colour===colour);
+  const inCart=lines.filter(l=>l.productId===p.id).reduce((a,l)=>a+l.qty,0);
+  if(inCart>=Number(p.quantity)){ toast("You already have all "+Number(p.quantity)+" in your cart"); return false; }
+  if(ex) ex.qty++; else lines.push({productId:p.id,qty:1,size,colour});
+  saveCart(); return true;
+}
+
+function go(view, params={}){
+  S.view=view; S.params=params;
+  try{
+    if(view==="shop") history.replaceState(null,"","#/shop/"+params.no);
+    else if(location.hash) history.replaceState(null,"",location.pathname+location.search);
+  }catch(e){}
+  render(); window.scrollTo(0,0);
+}
+// Views with forms don't redraw on live data, so typing is never lost.
+function isLive(){ return ["store","market","shop","manage-products","manage-orders","manage-sales"].includes(liveKey()); }
+function liveKey(){ return S.view==="manage" ? "manage-"+(S.params.tab||"products") : S.view; }
+function refresh(){ if(isLive()) render(); }
+
+// ---------- boot ----------
+(async function boot(){
+  if(!window.claude || !window.claude.use){ S.view="nodb"; render(); return; }
+  const [db,user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
+  if(!db){ S.view="nodb"; render(); return; }
+  S.db=db; S.user=user;
+  S.uid = user ? await user.id() : null;
+  const onErr = e => console.warn("Live data stopped:", e && e.code);
+  db.collection("shops").onSnapshot(s=>{ S.shops=s.docs.map(d=>({id:d.id,...d.data()})); S.loaded.shops=true; refresh(); }, onErr);
+  db.collection("products").onSnapshot(s=>{ S.products=s.docs.map(d=>({id:d.id,...d.data()})); S.loaded.products=true; refresh(); }, onErr);
+  db.collection("orders").onSnapshot(s=>{ S.orders=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)); S.loaded.orders=true; refresh(); }, onErr);
+  db.collection("stockLog").onSnapshot(s=>{ S.stockLog=s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(b.at||0)-(a.at||0)); }, onErr);
+  loadCart();
+  if(S.uid){
+    try{ const p=await db.doc("data/users/"+S.uid+"/profile").get(); S.profile=p.exists?p.data():null; }catch(e){}
+    S.signedIn = !!S.profile && getSession();
+  }
+  const h=hashShop();
+  if(h) go("shop",{no:h});
+  else go(S.profile ? (S.signedIn ? "store" : "signin") : "signup");
+  window.addEventListener("hashchange",()=>{ const n=hashShop(); if(n && !(S.view==="shop" && S.params.no===n)) go("shop",{no:n}); });
+})();
+
+// ---------- layout ----------
+function bar(){
+  const cno = S.view==="shop" ? S.params.no : null, cn = cno ? cartCount(cno) : 0;
+  const cartBtn = cn ? `<button class="btn ghost sm cart-btn" data-act="open-cart" data-no="${esc(cno)}">Cart <span class="n">${cn}</span></button>` : "";
+  const right = cartBtn + (S.signedIn
+    ? `<button class="btn ghost sm" data-go="market">Marketplace</button><button class="btn sm" data-go="store">My store</button>`
+    : `<button class="btn ghost sm" data-go="market">Marketplace</button><button class="btn sm" data-go="${S.profile?"signin":"signup"}">${S.profile?"Sign in":"Sign up"}</button>`);
+  return `<header class="bar"><div class="bar-in"><button class="brand" data-go="${S.signedIn?"store":"market"}"><span class="brand-mark" aria-hidden="true">S</span>Stock App</button><span class="spacer"></span>${right}</div></header>`;
+}
+function ticket(shop, opts={}){
+  const prods = S.products.filter(p=>p.shopNo===shop.id).length;
+  return `<article class="ticket ${opts.big?"big":""} ${opts.fresh?"new-ticket":""}">
+    <div class="ticket-no"><small>Shop no.</small><b>${esc(shop.id)}</b></div>
+    <div class="ticket-body stack" style="--gap:.5rem">
+      <div><h3>${esc(shop.shopName||"Untitled shop")}</h3><p>${esc(shop.companyName||"")}${shop.location?" · "+esc(shop.location):""}</p></div>
+      ${opts.actions||`<p>${prods} product${prods===1?"":"s"}</p>`}
+    </div></article>`;
+}
+function render(){
+  const v = VIEWS[S.view] || VIEWS.loading;
+  $app.innerHTML = (S.view==="loading"||S.view==="nodb" ? "" : bar()) + `<main class="wrap">${v()}</main>`;
+  const f=$app.querySelector("[autofocus]"); if(f) f.focus();
+}
+
+// ---------- views ----------
+const VIEWS = {
+loading:()=>`<p class="muted">Opening Stock App…</p>`,
+nodb:()=>`<div class="narrow stack"><h1>Stock App</h1><p>This app keeps shops, products and orders in its own online store. Open it from its claude.ai link while signed in to use it.</p></div>`,
+
+signup:()=>{
+  if(!S.uid) return noIdentity();
+  if(S.profile) return VIEWS.signin();
+  return `<div class="hero">
+  <section class="stack">
+    <h1>Open your shop on Stock App</h1>
+    <p class="muted" style="max-width:46ch">Create your account, get a numbered shop link, list your products and take orders with delivery details. Payments go to the bank details you set for each shop.</p>
+    <div class="stub-stack" aria-hidden="true">
+      ${[["0001","Adaeze Fabrics","Lagos"],["0002","Kofi Hardware","Accra"],["0003","Wanjiru Shoes","Nairobi"]].map(x=>ticket({id:x[0],shopName:x[1],location:x[2]},{actions:"<p>Your link, numbered in order</p>"})).join("")}
+    </div>
+  </section>
+  <section class="panel stack">
+    <h2>Sign up</h2>
+    <form id="f-signup" class="stack" novalidate>
+      <div class="fields">
+        <label class="f"><span>Your full name</span><input name="fullName" required autocomplete="name" autofocus></label>
+        <label class="f"><span>Company or business name</span><input name="companyName" required autocomplete="organization"></label>
+        <label class="f"><span>Phone number</span><input name="phone" type="tel" required autocomplete="tel"></label>
+        <label class="f"><span>Email</span><input name="email" type="email" required autocomplete="email"></label>
+      </div>
+      <label class="f"><span>Password</span><input name="password" type="password" minlength="6" required autocomplete="new-password"><small>At least 6 characters. You'll use it to sign in to your store.</small></label>
+      <p class="err" id="err" hidden></p>
+      <button class="btn block" type="submit">Create account</button>
+    </form>
+    <p class="small muted">Just buying? <button class="btn text" data-go="market">Browse the marketplace</button></p>
+  </section></div>`;
+},
+
+signin:()=>{
+  if(!S.uid) return noIdentity();
+  if(!S.profile) return VIEWS.signup();
+  return `<div class="narrow" style="margin:0 auto"><section class="panel stack">
+    <h2>Sign in to your store</h2>
+    <p class="muted">Welcome back, ${esc(S.profile.fullName)}.</p>
+    <form id="f-signin" class="stack" novalidate>
+      <label class="f"><span>Email</span><input name="email" type="email" value="${esc(S.profile.email)}" autocomplete="email" required></label>
+      <label class="f"><span>Password</span><input name="password" type="password" required autocomplete="current-password" autofocus></label>
+      <p class="err" id="err" hidden></p>
+      <button class="btn block" type="submit">Sign in</button>
+    </form>
+    <p class="small muted">Just buying? <button class="btn text" data-go="market">Browse the marketplace</button></p>
+  </section></div>`;
+},
+
+store:()=>{
+  if(!S.signedIn) return VIEWS.signin();
+  const p=S.profile, shops=myShops();
+  const bankOk = p.bank && p.bank.accountNumber;
+  const fresh = S.params.fresh;
+  return `<div class="stack-lg">
+  <section class="row between">
+    <div><h1>${esc(p.companyName)}</h1><p class="muted">${esc(p.fullName)} · ${esc(p.phone)} · ${esc(p.email)}</p></div>
+    <div class="row"><button class="btn ghost sm" data-go="profile">Edit my details</button><button class="btn ghost sm" data-act="signout">Sign out</button></div>
+  </section>
+  ${bankOk?"":`<section class="panel row between" style="border-color:var(--amber)"><div><h3>Add your bank details</h3><p class="muted small">You need a bank account on file to receive payment from your shops.</p></div><button class="btn" data-go="profile">Add bank details</button></section>`}
+  <section class="stack">
+    <div class="row between"><h2>Your shops</h2><button class="btn" data-act="new-shop-form">Generate a new shop link</button></div>
+    <div id="newshop"></div>
+    ${!S.loaded.shops?`<p class="muted">Loading shops…</p>`: shops.length? `<div class="stack">${shops.map(s=>{
+      const bal=shopTotals(s.id), sp=S.products.filter(x=>x.shopNo===s.id);
+      const low=sp.filter(x=>stockState(x)!=="ok").length;
+      return ticket(s,{big:true,fresh:fresh===s.id,actions:`<p>${sp.length} products · ${money(bal.confirmed,s.currency)} received · ${bal.awaitingCount} to check${low?` · <b>${low} low or sold out</b>`:""}</p>
+        <div class="copyline"><input readonly value="${esc(shopLink(s.id))}" aria-label="Shop link"><button class="btn ghost sm" data-act="copy" data-text="${esc(shopLink(s.id))}">Copy</button></div>
+        <div class="row"><button class="btn sm" data-act="manage" data-no="${s.id}">Open shop</button><button class="btn ghost sm" data-go="shop" data-no="${s.id}">View as customer</button></div>`});
+    }).join("")}</div>`
+    : `<div class="empty stack"><h3>No shop yet</h3><p class="muted">Generate a shop link to get your shop number. Each link is new and belongs only to that shop.</p></div>`}
+  </section>
+  ${buyerOrders()}
+  </div>`;
+},
+
+profile:()=>{
+  if(!S.signedIn) return VIEWS.signin();
+  const p=S.profile, b=p.bank||{};
+  return `<div class="narrow stack" style="margin:0 auto">
+  <button class="btn text back" data-go="store">← Back to my store</button>
+  <h1>My details</h1>
+  <form id="f-profile" class="panel stack" novalidate>
+    <fieldset class="stack"><legend>About you</legend>
+      <label class="f"><span>Full name</span><input name="fullName" value="${esc(p.fullName)}" required></label>
+      <label class="f"><span>Company or business name</span><input name="companyName" value="${esc(p.companyName)}" required></label>
+      <label class="f"><span>Phone number</span><input name="phone" type="tel" value="${esc(p.phone)}" required></label>
+      <label class="f"><span>Email</span><input name="email" type="email" value="${esc(p.email)}" required></label>
+    </fieldset>
+    <fieldset class="stack"><legend>Bank details for receiving payment</legend>
+      <p class="small muted">Only you can see these. You choose which account customers see in each shop's settings.</p>
+      <label class="f"><span>Bank name</span><input name="bankName" value="${esc(b.bankName)}"></label>
+      <label class="f"><span>Account name</span><input name="accountName" value="${esc(b.accountName)}"></label>
+      <label class="f"><span>Account number</span><input name="accountNumber" inputmode="numeric" value="${esc(b.accountNumber)}"></label>
+      <label class="f"><span>Sort code, SWIFT or routing number (optional)</span><input name="bankCode" value="${esc(b.bankCode)}"></label>
+    </fieldset>
+    <p class="err" id="err" hidden></p>
+    <button class="btn block" type="submit">Save details</button>
+  </form></div>`;
+},
+
+manage:()=>{
+  if(!S.signedIn) return VIEWS.signin();
+  const shop=shopById(S.params.no);
+  if(!shop) return S.loaded.shops?`<p>That shop wasn't found. <button class="btn text" data-go="store">Back to my store</button></p>`:`<p class="muted">Loading…</p>`;
+  if(shop.ownerId!==S.uid) return `<p>Only the owner of shop ${esc(shop.id)} can manage it. <button class="btn text" data-go="shop" data-no="${shop.id}">View the shop</button></p>`;
+  const tab=S.params.tab||"products";
+  const t=(k,l)=>`<button class="tab" role="tab" aria-selected="${tab===k}" data-act="tab" data-tab="${k}">${l}</button>`;
+  return `<div class="stack">
+    <button class="btn text back" data-go="store">← Back to my store</button>
+    ${ticket(shop,{big:true,actions:`<div class="row"><button class="btn sm" data-go="shop" data-no="${shop.id}">View as customer</button><button class="btn ghost sm" data-act="copy" data-text="${esc(shopLink(shop.id))}">Copy shop link</button></div>`})}
+    <div class="tabs" role="tablist">${t("products","Products & stock")}${t("orders","Orders & payments")}${t("sales","Sales")}${t("settings","Shop details")}</div>
+    <div>${tab==="products"?manageProducts(shop):tab==="orders"?manageOrders(shop):tab==="sales"?salesDashboard(shop):shopSettings(shop)}</div>
+  </div>`;
+},
+
+"product-edit":()=>{
+  if(!S.signedIn) return VIEWS.signin();
+  const shop=shopById(S.params.no); if(!shop) return `<p class="muted">Loading…</p>`;
+  const p = S.params.id ? (S.products.find(x=>x.id===S.params.id)||{}) : {location:shop.location,contactPhone:shop.phone,contactEmail:shop.email};
+  S._img = p.image||"";
+  return `<div class="stack" style="max-width:760px;margin:0 auto">
+  <button class="btn text back" data-act="manage" data-no="${shop.id}">← Back to shop ${esc(shop.id)}</button>
+  <h1>${S.params.id?"Edit product":"Add a product"}</h1>
+  <form id="f-product" class="panel stack" novalidate>
+    <fieldset class="stack"><legend>The product</legend>
+      <div class="img-drop"><div class="thumb" id="thumb">${p.image?`<img src="${esc(p.image)}" alt="">`:"No photo"}</div>
+        <label class="f" style="flex:1"><span>Photo</span><input type="file" id="img" accept="image/*"><small>Resized to fit before saving.</small></label></div>
+      <div class="fields">
+        <label class="f"><span>Product name</span><input name="name" value="${esc(p.name)}" required autofocus></label>
+        <label class="f"><span>Type or category</span><input name="type" value="${esc(p.type)}" placeholder="e.g. Shoes, Fabric, Phone"></label>
+        <label class="f"><span>Price (${esc(sym(shop.currency))})</span><input name="price" type="number" min="0" step="0.01" inputmode="decimal" value="${esc(p.price)}" required></label>
+        <label class="f"><span>Quantity in stock</span><input name="quantity" type="number" min="0" step="1" inputmode="numeric" value="${esc(p.quantity)}" required></label>
+        <label class="f"><span>Warn me when stock falls to</span><input name="lowStock" type="number" min="0" step="1" inputmode="numeric" value="${esc(p.lowStock===undefined?5:p.lowStock)}"><small>You'll see a low-stock warning at this number</small></label>
+      </div>
+      <label class="f"><span>Description of the goods</span><textarea name="description">${esc(p.description)}</textarea></label>
+    </fieldset>
+    <fieldset class="stack"><legend>Options</legend>
+      <div class="fields">
+        <label class="f"><span>Sizes</span><input name="sizes" value="${esc(p.sizes)}" placeholder="S, M, L, XL"><small>Separate with commas</small></label>
+        <label class="f"><span>Colours</span><input name="colours" value="${esc(p.colours)}" placeholder="Black, White, Red"><small>Separate with commas</small></label>
+        <label class="f"><span>Height or length</span><input name="height" value="${esc(p.height)}" placeholder="e.g. 120 cm"></label>
+        <label class="f"><span>Weight (optional)</span><input name="weight" value="${esc(p.weight)}" placeholder="e.g. 2 kg"></label>
+      </div>
+    </fieldset>
+    <fieldset class="stack"><legend>Where and who to contact</legend>
+      <div class="fields">
+        <label class="f"><span>Location of goods</span><input name="location" value="${esc(p.location)}"></label>
+        <label class="f"><span>Contact number</span><input name="contactPhone" type="tel" value="${esc(p.contactPhone)}"></label>
+        <label class="f"><span>Contact email</span><input name="contactEmail" type="email" value="${esc(p.contactEmail)}"></label>
+      </div>
+    </fieldset>
+    <p class="err" id="err" hidden></p>
+    <div class="row"><button class="btn" type="submit">${S.params.id?"Save product":"Add product"}</button><button class="btn ghost" type="button" data-act="manage" data-no="${shop.id}">Cancel</button></div>
+  </form>
+  ${S.params.id?stockHistory(S.params.id):""}
+  </div>`;
+},
+
+market:()=>{
+  const q=(S.params.q||"").toLowerCase();
+  const shops=S.shops.filter(s=>!q||(s.id+" "+s.shopName+" "+s.companyName+" "+(s.location||"")).toLowerCase().includes(q)).sort((a,b)=>a.id.localeCompare(b.id));
+  return `<div class="stack-lg">
+  <section class="stack"><h1>Marketplace</h1><p class="muted">Every shop has its own number. Enter one to go straight to that shop.</p>
+    <form id="f-find" class="row" style="max-width:520px"><input name="no" inputmode="numeric" placeholder="Shop number, e.g. 0001" aria-label="Shop number" style="flex:1"><button class="btn">Open shop</button></form>
+  </section>
+  <section class="stack"><div class="row between"><h2>All shops</h2><input id="q" type="search" placeholder="Search shops" value="${esc(S.params.q||"")}" style="max-width:260px" aria-label="Search shops"></div>
+    ${!S.loaded.shops?`<p class="muted">Loading shops…</p>`:shops.length?`<div class="grid">${shops.map(s=>`<button class="btn ghost" style="display:block;padding:0;border:0;text-align:left;background:none" data-go="shop" data-no="${s.id}">${ticket(s)}</button>`).join("")}</div>`:`<div class="empty"><p class="muted">No shops yet${q?" match your search":""}.</p></div>`}
+  </section>
+  ${buyerOrders()}
+  </div>`;
+},
+
+shop:()=>{
+  const shop=shopById(S.params.no);
+  if(!shop) return S.loaded.shops?`<div class="empty stack"><h2>Shop ${esc(S.params.no)} doesn't exist</h2><p class="muted">Check the number and try again.</p><div><button class="btn" data-go="market">Go to the marketplace</button></div></div>`:`<p class="muted">Loading shop…</p>`;
+  const prods=S.products.filter(p=>p.shopNo===shop.id).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+  const social=["instagram","facebook","twitter","tiktok","whatsapp"].filter(k=>shop.social&&shop.social[k]);
+  const owner = shop.ownerId===S.uid && S.signedIn;
+  return `<div class="stack-lg">
+  ${ticket(shop,{big:true,actions:`<p>${shop.about?esc(shop.about):""}</p>${owner?`<div><button class="btn sm" data-act="manage" data-no="${shop.id}">Manage this shop</button></div>`:""}`})}
+  <section class="panel"><dl class="kv">
+    ${shop.companyName?`<dt>Company</dt><dd>${esc(shop.companyName)}</dd>`:""}
+    ${shop.location?`<dt>Location</dt><dd>${esc(shop.location)}</dd>`:""}
+    ${shop.phone?`<dt>Phone</dt><dd>${contact(shop.phone)}</dd>`:""}
+    ${shop.email?`<dt>Email</dt><dd>${contact(shop.email)}</dd>`:""}
+    ${social.map(k=>`<dt>${k[0].toUpperCase()+k.slice(1)}</dt><dd>${esc(shop.social[k])}</dd>`).join("")}
+  </dl></section>
+  <section class="stack"><h2>Products</h2>
+  ${!S.loaded.products?`<p class="muted">Loading products…</p>`:prods.length?`<div class="grid">${prods.map(p=>productCard(p,shop)).join("")}</div>`:`<div class="empty"><p class="muted">This shop hasn't added products yet.</p></div>`}
+  </section>
+  ${cartCount(shop.id)?`<div class="cartbar"><span>Your cart: <b>${cartCount(shop.id)} item${cartCount(shop.id)===1?"":"s"}</b> · <b>${money(cartFor(shop.id).reduce((a,l)=>{const p=S.products.find(x=>x.id===l.productId);return a+(p?Number(p.price)*l.qty:0)},0),shop.currency)}</b></span><button class="btn sm" data-act="open-cart" data-no="${shop.id}">Check out</button></div>`:""}
+  </div>`;
+},
+
+checkout:()=>{
+  const shop=shopById(S.params.shopNo);
+  if(!shop||!S.loaded.products) return `<p class="muted">Loading…</p>`;
+  if(!cartFor(shop.id).length) return `<div class="empty stack"><h2>Your cart is empty</h2><p class="muted">Add products from shop ${esc(shop.id)} to order them together.</p><div><button class="btn" data-go="shop" data-no="${shop.id}">Back to the shop</button></div></div>`;
+  const pay=shop.payment||{}; const del=(shop.delivery&&shop.delivery.options)||[];
+  const buyer=S.profile||{};
+  return `<div class="stack" style="max-width:760px;margin:0 auto">
+  <button class="btn text back" data-go="shop" data-no="${shop.id}">← Keep shopping at shop ${esc(shop.id)}</button>
+  <div><h1 style="font-size:1.8rem">Checkout</h1><p class="muted">${esc(shop.shopName)} · shop ${esc(shop.id)}</p></div>
+  <form id="f-order" class="panel stack" novalidate>
+    <fieldset class="stack"><legend>Your cart</legend>
+      <div id="lines" class="list">${cartLines(shop)}</div>
+    </fieldset>
+    <fieldset class="stack"><legend>Delivery details</legend>
+      ${del.length?`<label class="f"><span>Delivery option</span><select name="delivery">${del.map((d,i)=>`<option value="${i}">${esc(d.name)} — ${money(d.fee,shop.currency)}${d.time?" · "+esc(d.time):""}</option>`).join("")}</select></label>`:`<p class="small muted">The seller will contact you to arrange delivery.</p>`}
+      <div class="fields">
+        <label class="f"><span>Full name</span><input name="name" value="${esc(buyer.fullName)}" required autocomplete="name"></label>
+        <label class="f"><span>Phone number</span><input name="phone" type="tel" value="${esc(buyer.phone)}" required autocomplete="tel"></label>
+        <label class="f"><span>Email</span><input name="email" type="email" value="${esc(buyer.email)}" autocomplete="email"></label>
+        <label class="f"><span>City</span><input name="city" required autocomplete="address-level2"></label>
+      </div>
+      <label class="f"><span>Delivery address</span><textarea name="address" required autocomplete="street-address"></textarea></label>
+      <label class="f"><span>Note for the seller (optional)</span><input name="note"></label>
+    </fieldset>
+    <fieldset class="stack"><legend>Pay the shop</legend>
+      <div class="panel-flat sum stack" id="sum"></div>
+      ${pay.accountNumber?`<div class="panel-flat"><p class="small muted" style="margin-bottom:.5rem">Transfer the total to this shop's account:</p><dl class="kv">
+        <dt>Bank</dt><dd>${esc(pay.bankName)}</dd><dt>Account name</dt><dd>${esc(pay.accountName)}</dd>
+        <dt>Account number</dt><dd><b>${esc(pay.accountNumber)}</b> <button type="button" class="btn text sm" data-act="copy" data-text="${esc(pay.accountNumber)}">Copy</button></dd>
+        ${pay.bankCode?`<dt>Bank code</dt><dd>${esc(pay.bankCode)}</dd>`:""}</dl>
+        ${pay.instructions?`<p class="small" style="margin-top:.5rem">${esc(pay.instructions)}</p>`:""}</div>`
+      :`<p class="err">This shop hasn't added payment details yet. Contact the seller before paying.</p>`}
+      <div class="fields">
+        <label class="f"><span>Name on the paying account</span><input name="payer" required></label>
+        <label class="f"><span>Transfer reference or receipt number</span><input name="reference" required></label>
+      </div>
+    </fieldset>
+    <p class="err" id="err" hidden></p>
+    <button class="btn money block" type="submit" ${pay.accountNumber?"":"disabled"}>I've paid — place order</button>
+    <p class="small muted">The shop checks your transfer, confirms it, then sends your order.</p>
+  </form></div>`;
+},
+
+placed:()=>{
+  const o=S.orders.find(x=>x.id===S.params.id)||S.params.order; const shop=o&&shopById(o.shopNo);
+  return `<div class="narrow stack" style="margin:0 auto;text-align:center">
+    <h1>Order placed</h1>
+    <p>Your order number is <b>${esc(S.params.id)}</b>. ${shop?esc(shop.shopName):"The shop"} will check your payment and contact you on ${esc(o&&o.buyer&&o.buyer.phone)}.</p>
+    <div class="row" style="justify-content:center"><button class="btn" data-go="shop" data-no="${esc(o&&o.shopNo)}">Back to the shop</button><button class="btn ghost" data-go="market">Marketplace</button></div>
+  </div>`;
+}
+};
+
+function noIdentity(){ return `<div class="narrow stack"><h1>Sign in to claude.ai first</h1><p class="muted">Stock App uses your claude.ai sign-in to keep your store private. You can still browse shops.</p><div><button class="btn" data-go="market">Browse the marketplace</button></div></div>`; }
+
+function productCard(p,shop){
+  const out=!(Number(p.quantity)>0);
+  const opts=[...list(p.sizes).map(s=>"Size "+s),...list(p.colours)];
+  return `<article class="card">
+    <div class="card-img">${p.image?`<img src="${esc(p.image)}" alt="${esc(p.name)}" loading="lazy">`:"<span aria-hidden='true'>▦</span>"}</div>
+    <div class="card-body">
+      <div class="row between"><span class="price">${money(p.price,shop.currency)}</span>${out?`<span class="pill bad">Sold out</span>`:`<span class="small muted">${Number(p.quantity)} left</span>`}</div>
+      <h3>${esc(p.name)}</h3>
+      ${p.type?`<p class="small muted">${esc(p.type)}${p.height?" · "+esc(p.height):""}${p.weight?" · "+esc(p.weight):""}</p>`:""}
+      ${p.description?`<p class="small">${esc(p.description)}</p>`:""}
+      ${opts.length?`<div class="chips">${opts.slice(0,8).map(o=>`<span class="chip">${esc(o)}</span>`).join("")}</div>`:""}
+      ${p.location?`<p class="small muted">Located in ${esc(p.location)}</p>`:""}
+      ${p.contactPhone?`<p class="small muted">Call ${esc(p.contactPhone)}</p>`:""}
+      <div class="row" style="margin-top:auto;padding-top:.5rem;flex-wrap:nowrap">
+        <button class="btn ghost" style="flex:1" data-act="add-cart" data-id="${p.id}" ${out?"disabled":""}>Add to cart</button>
+        <button class="btn" style="flex:1" data-act="buy" data-id="${p.id}" ${out?"disabled":""}>${out?"Sold out":"Buy now"}</button></div>
+    </div></article>`;
+}
+
+function restockButtons(p){
+  return `<div class="restock"><span class="small muted">Add stock:</span>${[1,5,10].map(n=>`<button class="btn ghost" data-act="restock" data-id="${p.id}" data-n="${n}">+${n}</button>`).join("")}</div>`;
+}
+
+function manageProducts(shop){
+  const all=S.products.filter(p=>p.shopNo===shop.id).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+  const low=all.filter(p=>stockState(p)==="low"), out=all.filter(p=>stockState(p)==="out");
+  const f=S.params.filter||"all";
+  const prods=f==="low"?low:f==="out"?out:all;
+  const units=all.reduce((a,p)=>a+(Number(p.quantity)||0),0);
+  const value=all.reduce((a,p)=>a+(Number(p.quantity)||0)*(Number(p.price)||0),0);
+  const fb=(k,l,n)=>`<button class="filter" aria-pressed="${f===k}" data-act="filter" data-f="${k}">${l} (${n})</button>`;
+  return `<div class="stack">
+  ${all.length?`<div class="stats">
+    <div class="panel"><p class="small muted">Units in stock</p><p class="stat">${units.toLocaleString()}</p></div>
+    <div class="panel"><p class="small muted">Stock value at your prices</p><p class="stat">${money(value,shop.currency)}</p></div>
+    <div class="panel"><p class="small muted">Low or sold out</p><p class="stat" style="color:${low.length+out.length?"var(--warn)":"var(--money)"}">${low.length+out.length}</p></div>
+  </div>`:""}
+  ${out.length?`<div class="alert bad"><b>${out.length} product${out.length===1?" is":"s are"} sold out.</b> Customers can't buy ${out.length===1?"it":"them"} until you add stock.</div>`:low.length?`<div class="alert"><b>${low.length} product${low.length===1?" is":"s are"} running low.</b> Restock soon to avoid selling out.</div>`:""}
+  <div class="row between"><div class="filters">${fb("all","All",all.length)}${fb("low","Low stock",low.length)}${fb("out","Sold out",out.length)}</div><button class="btn" data-act="add-product" data-no="${shop.id}">Add a product</button></div>
+  ${prods.length?`<div class="grid">${prods.map(p=>`<article class="card">
+    <div class="card-img">${p.image?`<img src="${esc(p.image)}" alt="">`:"<span aria-hidden='true'>▦</span>"}</div>
+    <div class="card-body"><div class="row between"><span class="price">${money(p.price,shop.currency)}</span>${stockPill(p)}</div>
+      <h3>${esc(p.name)}</h3><p class="small muted">${esc(p.type||"")}${p.type?" · ":""}warns at ${lowOf(p)}</p>
+      ${restockButtons(p)}
+      <div class="row" style="margin-top:auto"><button class="btn ghost sm" data-act="edit-product" data-id="${p.id}" data-no="${shop.id}">Edit & history</button><button class="btn danger sm" data-act="del-product" data-id="${p.id}">Delete</button></div>
+    </div></article>`).join("")}</div>`
+  : all.length?`<div class="empty"><p class="muted">No products ${f==="low"?"are running low":"are sold out"} right now.</p></div>`
+  :`<div class="empty stack"><h3>Add your first product</h3><p class="muted">Name, price, quantity, sizes, colours and a photo — customers see it right away.</p></div>`}</div>`;
+}
+
+const REASONS={restock:"Restocked",sale:"Sold",returned:"Returned (payment not received)",edit:"Edited by hand"};
+function stockHistory(id){
+  const logs=S.stockLog.filter(l=>l.productId===id).slice(0,25);
+  return `<section class="panel stack"><h2>Stock history</h2>
+  ${logs.length?`<div class="list log">${logs.map(l=>`<div class="row"><span>${esc(REASONS[l.reason]||l.reason)}<br><span class="small muted">${new Date(l.at||0).toLocaleString()}</span></span>
+    <span><span class="${l.change>=0?"chg-up":"chg-down"}">${l.change>=0?"+":""}${l.change}</span> <span class="muted">→ ${l.after}</span></span></div>`).join("")}</div>`
+  :`<p class="muted">Changes to this product's stock will appear here: restocks, sales and returns.</p>`}</section>`;
+}
+
+function cartLines(shop){
+  return cartFor(shop.id).map((l,i)=>{
+    const p=S.products.find(x=>x.id===l.productId);
+    if(!p) return `<div class="line"><div class="thumb">▦</div><div class="row between"><span class="muted">This product is no longer available.</span><button type="button" class="btn text sm" data-act="cart-remove" data-i="${i}">Remove</button></div></div>`;
+    const sizes=list(p.sizes), colours=list(p.colours), max=Number(p.quantity)||0;
+    return `<div class="line"><div class="thumb">${p.image?`<img src="${esc(p.image)}" alt="">`:"▦"}</div>
+      <div><div class="row between"><div><h3>${esc(p.name)}</h3><p class="small muted">${money(p.price,shop.currency)} each · ${max} in stock</p></div>
+        <button type="button" class="btn text sm" data-act="cart-remove" data-i="${i}">Remove</button></div>
+      <div class="opts">
+        <label class="f"><span class="small">Quantity</span><input type="number" min="1" max="${max||1}" value="${l.qty}" data-line="${i}" data-k="qty" id="qty-${i}"></label>
+        ${sizes.length?`<label class="f"><span class="small">Size</span><select data-line="${i}" data-k="size" id="size-${i}">${sizes.map(s=>`<option ${s===l.size?"selected":""}>${esc(s)}</option>`).join("")}</select></label>`:""}
+        ${colours.length?`<label class="f"><span class="small">Colour</span><select data-line="${i}" data-k="colour" id="colour-${i}">${colours.map(s=>`<option ${s===l.colour?"selected":""}>${esc(s)}</option>`).join("")}</select></label>`:""}
+      </div></div></div>`;
+  }).join("");
+}
+
+// ---------- sales dashboard ----------
+const PAID=["paid","shipped","delivered"];
+function salesDashboard(shop){
+  const c=shop.currency, os=S.orders.filter(o=>o.shopNo===shop.id), paid=os.filter(o=>PAID.includes(o.status));
+  const rev=paid.reduce((a,o)=>a+Number(o.total||0),0);
+  const units=paid.reduce((a,o)=>a+orderItems(o).reduce((b,x)=>b+Number(x.qty||0),0),0);
+  // revenue per day, last 30 days
+  const day=864e5, today=new Date(); today.setHours(0,0,0,0); const start=today.getTime()-29*day;
+  const days=Array.from({length:30},(_,i)=>({t:start+i*day,v:0,n:0}));
+  paid.forEach(o=>{ const d=new Date(o.createdAt||0); d.setHours(0,0,0,0); const i=Math.round((d.getTime()-start)/day); if(i>=0&&i<30){ days[i].v+=Number(o.total||0); days[i].n++; } });
+  const rev30=days.reduce((a,d)=>a+d.v,0);
+  // best sellers by units
+  const best={}; paid.forEach(o=>orderItems(o).forEach(x=>{ const k=x.productId||x.name; best[k]=best[k]||{name:x.name,units:0,rev:0}; best[k].units+=Number(x.qty||0); best[k].rev+=Number(x.qty||0)*Number(x.unitPrice||0); }));
+  const top=Object.values(best).sort((a,b)=>b.units-a.units).slice(0,5), maxU=top[0]?top[0].units:1;
+  const counts=Object.keys(STATUS).map(k=>[k,os.filter(o=>(o.status||"awaiting")===k).length]);
+  const watch=S.products.filter(p=>p.shopNo===shop.id&&stockState(p)!=="ok");
+  return `<div class="stack-lg">
+  <div class="stats">
+    <div class="panel"><p class="small muted">Revenue confirmed</p><p class="stat" style="color:var(--money)">${money(rev,c)}</p></div>
+    <div class="panel"><p class="small muted">Last 30 days</p><p class="stat">${money(rev30,c)}</p></div>
+    <div class="panel"><p class="small muted">Paid orders</p><p class="stat">${paid.length}</p></div>
+    <div class="panel"><p class="small muted">Average order</p><p class="stat">${money(paid.length?rev/paid.length:0,c)}</p></div>
+    <div class="panel"><p class="small muted">Items sold</p><p class="stat">${units}</p></div>
+  </div>
+  <section class="panel stack"><div class="row between"><h2>Revenue per day</h2><span class="small muted">Last 30 days · confirmed payments only</span></div>
+    ${rev30?revenueChart(days,c):`<div class="empty"><p class="muted">No confirmed payments in the last 30 days. Confirm payments in Orders & payments and they'll show here.</p></div>`}
+  </section>
+  <div class="dash two">
+    <section class="panel stack"><h2>Best sellers</h2>
+      ${top.length?`<div class="hbars">${top.map(b=>`<div class="hbar"><div class="row"><span>${esc(b.name)}</span><span class="muted" style="font-variant-numeric:tabular-nums">${b.units} sold · ${money(b.rev,c)}</span></div><div class="track"><div class="fill" style="width:${Math.max(3,b.units/maxU*100)}%"></div></div></div>`).join("")}</div>`
+      :`<p class="muted">Your top five products by items sold will show here after your first confirmed order.</p>`}
+    </section>
+    <section class="panel stack"><h2>Orders by status</h2>
+      <div class="list">${counts.map(([k,n])=>`<div class="row between" style="padding:.5rem 0"><span class="pill ${STATUS[k].cls}">${STATUS[k].label}</span><b style="font-variant-numeric:tabular-nums">${n}</b></div>`).join("")}</div>
+    </section>
+  </div>
+  <section class="panel stack"><h2>Stock to watch</h2>
+    ${watch.length?`<div class="list">${watch.map(p=>`<div class="row between" style="padding:.6rem 0"><span><b>${esc(p.name)}</b> ${stockPill(p)}</span>${restockButtons(p)}</div>`).join("")}</div>`:`<p class="muted">All products are above their low-stock level.</p>`}
+  </section></div>`;
+}
+function revenueChart(days,c){
+  const W=720,H=240,L=64,R=12,T=14,B=30, iw=W-L-R, ih=H-T-B;
+  const max=Math.max(...days.map(d=>d.v)); const step=Math.pow(10,Math.floor(Math.log10(max||1))); let top=Math.ceil(max/step)*step; if(top/step<3) top=Math.ceil(max/(step/2))*(step/2);
+  const y=v=>T+ih-(v/top)*ih, bw=iw/days.length, gap=4;
+  const fmtShort=v=>sym(c)+(v>=1e6?(v/1e6).toFixed(v%1e6?1:0)+"M":v>=1e3?(v/1e3).toFixed(v%1e3?1:0)+"k":v);
+  const ticks=[0,top/2,top];
+  const dl=t=>new Date(t).toLocaleDateString(undefined,{day:"numeric",month:"short"});
+  return `<div class="chart-wrap" id="rchart"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Revenue per day for the last 30 days">
+    ${ticks.map(v=>`<line class="gridline" x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}"/><text class="axis" x="${L-8}" y="${y(v)+4}" text-anchor="end">${fmtShort(v)}</text>`).join("")}
+    ${days.map((d,i)=>{const x=L+i*bw, h=Math.max(0,T+ih-y(d.v)), tip=`${dl(d.t)} · ${money(d.v,c)} · ${d.n} order${d.n===1?"":"s"}`;
+      return `<rect class="hit" x="${x}" y="${T}" width="${bw}" height="${ih}" data-tip="${esc(tip)}" data-cx="${x+bw/2}" data-cy="${y(d.v)}"/>`+
+        (d.v?`<path class="bar" d="M${x+gap/2},${T+ih} V${T+ih-h+Math.min(4,h)} q0,-${Math.min(4,h)} ${Math.min(4,h)},-${Math.min(4,h)} H${x+bw-gap/2-Math.min(4,h)} q${Math.min(4,h)},0 ${Math.min(4,h)},${Math.min(4,h)} V${T+ih} Z"/>`:"");}).join("")}
+    ${[0,7,14,21,29].map(i=>`<text class="axis" x="${L+i*bw+bw/2}" y="${H-8}" text-anchor="middle">${dl(days[i].t)}</text>`).join("")}
+  </svg><div class="tip" id="rtip" hidden></div></div>`;
+}
+
+function shopTotals(no){
+  const os=S.orders.filter(o=>o.shopNo===no);
+  const sum=f=>os.filter(f).reduce((a,o)=>a+Number(o.total||0),0);
+  return { confirmed:sum(o=>["paid","shipped","delivered"].includes(o.status)), awaiting:sum(o=>o.status==="awaiting"),
+    awaitingCount:os.filter(o=>o.status==="awaiting").length, count:os.length };
+}
+
+function manageOrders(shop){
+  const os=S.orders.filter(o=>o.shopNo===shop.id), t=shopTotals(shop.id), c=shop.currency;
+  const pay=shop.payment||{};
+  return `<div class="stack-lg">
+  <div class="stats">
+    <div class="panel"><p class="small muted">Received in shop account</p><p class="stat" style="color:var(--money)">${money(t.confirmed,c)}</p></div>
+    <div class="panel"><p class="small muted">Waiting for you to check</p><p class="stat">${money(t.awaiting,c)}</p></div>
+    <div class="panel"><p class="small muted">Orders</p><p class="stat">${t.count}</p></div>
+  </div>
+  <p class="small muted">Payments go to ${pay.accountNumber?`${esc(pay.bankName)} · ${esc(pay.accountName)} · ${esc(pay.accountNumber)}`:"no account yet — add one in Shop details"}. Check your bank for each transfer before confirming.</p>
+  <section class="panel">${os.length?`<div class="list">${os.map(o=>{const st=STATUS[o.status]||STATUS.awaiting;return `<div class="order stack">
+    <div class="row between"><div><h3>${esc(orderTitle(o))}</h3><p class="small muted">Order ${esc(o.id)} · ${new Date(o.createdAt||0).toLocaleString()}</p></div><div class="row"><span class="price">${money(o.total,c)}</span><span class="pill ${st.cls}">${st.label}</span></div></div>
+    <dl class="kv">
+      <dt>Items</dt><dd>${orderItems(o).map(x=>`${esc(x.name)} × ${esc(x.qty)}${x.size?" · size "+esc(x.size):""}${x.colour?" · "+esc(x.colour):""}`).join("<br>")}</dd>
+      <dt>Customer</dt><dd>${esc(o.buyer.name)} · ${contact(o.buyer.phone)}${o.buyer.email?" · "+contact(o.buyer.email):""}</dd>
+      <dt>Deliver to</dt><dd>${esc(o.buyer.address)}, ${esc(o.buyer.city)}</dd>
+      <dt>Delivery</dt><dd>${esc(o.deliveryName||"To arrange")}${o.deliveryFee?" ("+money(o.deliveryFee,c)+")":""}</dd>
+      ${o.buyer.note?`<dt>Note</dt><dd>${esc(o.buyer.note)}</dd>`:""}
+      <dt>Payment</dt><dd>From ${esc(o.payer)} · ref ${esc(o.reference)}</dd>
+    </dl>
+    <div class="row">${o.status==="awaiting"?`<button class="btn money sm" data-act="status" data-id="${o.id}" data-s="paid">Confirm payment received</button><button class="btn danger sm" data-act="status" data-id="${o.id}" data-s="rejected">Payment not received</button>`:""}
+      ${o.status==="paid"?`<button class="btn sm" data-act="status" data-id="${o.id}" data-s="shipped">Mark as sent for delivery</button>`:""}
+      ${o.status==="shipped"?`<button class="btn sm" data-act="status" data-id="${o.id}" data-s="delivered">Mark as delivered</button>`:""}</div>
+  </div>`}).join("")}</div>`:`<div class="empty"><p class="muted">No orders yet. Share your shop link to start selling.</p></div>`}</section></div>`;
+}
+
+function shopSettings(shop){
+  const so=shop.social||{}, pay=shop.payment||{}, del=(shop.delivery&&shop.delivery.options)||[];
+  const rows=[0,1,2].map(i=>del[i]||{});
+  return `<form id="f-shop" class="panel stack-lg" novalidate>
+  <fieldset class="stack"><legend>Shop and company</legend><div class="fields">
+    <label class="f"><span>Shop name</span><input name="shopName" value="${esc(shop.shopName)}" required></label>
+    <label class="f"><span>Company name</span><input name="companyName" value="${esc(shop.companyName)}"></label>
+    <label class="f"><span>Location</span><input name="location" value="${esc(shop.location)}" placeholder="City, area"></label>
+    <label class="f"><span>Currency</span><select name="currency">${CURRENCIES.map(c=>`<option value="${c[0]}" ${shop.currency===c[0]?"selected":""}>${c[0]} (${c[1]})</option>`).join("")}</select></label>
+  </div><label class="f"><span>About the shop</span><input name="about" value="${esc(shop.about)}" placeholder="One line customers see at the top"></label></fieldset>
+  <fieldset class="stack"><legend>Contact</legend><div class="fields">
+    <label class="f"><span>Contact number</span><input name="phone" type="tel" value="${esc(shop.phone)}"></label>
+    <label class="f"><span>Email</span><input name="email" type="email" value="${esc(shop.email)}"></label>
+  </div></fieldset>
+  <fieldset class="stack"><legend>Social media</legend><div class="fields">
+    ${[["instagram","Instagram"],["facebook","Facebook"],["twitter","X (Twitter)"],["tiktok","TikTok"],["whatsapp","WhatsApp"]].map(([k,l])=>`<label class="f"><span>${l}</span><input name="s_${k}" value="${esc(so[k])}" placeholder="@handle or number"></label>`).join("")}
+  </div></fieldset>
+  <fieldset class="stack"><legend>Payment details customers pay into</legend>
+    <p class="small muted">Customers see these at checkout. Every payment for this shop goes to this account.</p>
+    <div><button type="button" class="btn ghost sm" data-act="use-my-bank">Use my saved bank details</button></div>
+    <div class="fields">
+      <label class="f"><span>Bank name</span><input name="p_bankName" value="${esc(pay.bankName)}"></label>
+      <label class="f"><span>Account name</span><input name="p_accountName" value="${esc(pay.accountName)}"></label>
+      <label class="f"><span>Account number</span><input name="p_accountNumber" inputmode="numeric" value="${esc(pay.accountNumber)}"></label>
+      <label class="f"><span>Bank code (optional)</span><input name="p_bankCode" value="${esc(pay.bankCode)}"></label>
+    </div>
+    <label class="f"><span>Payment information for customers</span><input name="p_instructions" value="${esc(pay.instructions)}" placeholder="e.g. Use your phone number as the transfer reference"></label>
+  </fieldset>
+  <fieldset class="stack"><legend>Delivery options</legend>
+    <p class="small muted">Up to three. Leave a row empty to skip it.</p>
+    <div class="table-scroll"><div class="stack" style="min-width:480px">${rows.map((d,i)=>`<div class="fields" style="grid-template-columns:2fr 1fr 1.5fr">
+      <label class="f"><span>Option ${i+1}</span><input name="d_name_${i}" value="${esc(d.name)}" placeholder="${["Pick up at shop","Delivery within city","Nationwide delivery"][i]}"></label>
+      <label class="f"><span>Fee</span><input name="d_fee_${i}" type="number" min="0" step="0.01" value="${esc(d.fee)}"></label>
+      <label class="f"><span>Time</span><input name="d_time_${i}" value="${esc(d.time)}" placeholder="e.g. 1–3 days"></label></div>`).join("")}</div></div>
+  </fieldset>
+  <p class="err" id="err" hidden></p>
+  <button class="btn" type="submit">Save shop details</button>
+  </form>`;
+}
+
+function buyerOrders(){
+  if(!S.uid) return "";
+  const os=S.orders.filter(o=>o.buyerId===S.uid); if(!os.length) return "";
+  return `<section class="stack"><h2>Things you've ordered</h2><div class="panel list">${os.map(o=>{const st=STATUS[o.status]||STATUS.awaiting; const sh=shopById(o.shopNo);
+    return `<div class="order row between"><div><h3>${esc(orderTitle(o))}</h3><p class="small muted">Shop ${esc(o.shopNo)}${sh?" · "+esc(sh.shopName):""} · order ${esc(o.id)}</p></div><div class="row"><span class="price">${money(o.total,sh&&sh.currency)}</span><span class="pill ${st.cls}">${st.label}</span></div></div>`}).join("")}</div></section>`;
+}
+
+// ---------- actions ----------
+function showErr(msg){ const e=document.getElementById("err"); if(e){ e.textContent=msg; e.hidden=!msg; } else toast(msg); }
+function need(o, keys, labels){ for(const k of keys){ if(!o[k]) return `Add ${labels[k]||k}.`; } return ""; }
+async function saveProfile(data){ await S.db.doc("data/users/"+S.uid+"/profile").set(data); S.profile=data; }
+
+async function newShop(form){
+  const d=formData(form);
+  if(!d.shopName) return showErr("Add a shop name.");
+  const btn=form.querySelector("button[type=submit]"); btn.disabled=true; btn.textContent="Generating…";
+  try{
+    const counter=S.db.doc("meta/counter"); let got=false;
+    for(let i=0;i<8 && !got;i++){ const r=await counter.acquire({holder:S.uid,ttlMs:5000}); got=r.acquired; if(!got) await sleep(400+Math.random()*600); }
+    if(!got) throw new Error("busy");
+    const snap=await counter.get(); let n=(snap.exists?Number(snap.data().last)||0:0)+1;
+    while(shopById(pad(n)) || (await S.db.doc("shops/"+pad(n)).get()).exists) n++;
+    await counter.set({last:n});
+    const no=pad(n), p=S.profile;
+    await S.db.doc("shops/"+no).set({ no, ownerId:S.uid, shopName:d.shopName, currency:d.currency||"NGN", companyName:p.companyName, phone:p.phone, email:p.email,
+      location:"", about:"", social:{}, payment: p.bank&&p.bank.accountNumber ? {...p.bank, instructions:""} : {}, delivery:{options:[]}, createdAt:Date.now() });
+    toast("Shop "+no+" created"); go("store",{fresh:no});
+  }catch(e){ btn.disabled=false; btn.textContent="Generate link"; showErr(e.message==="busy"?"Another shop is being created right now. Try again in a moment.":"The shop wasn't created. Check your connection and try again."); }
+}
+
+async function resizeImage(file){
+  const url=URL.createObjectURL(file);
+  try{ const img=await new Promise((res,rej)=>{const i=new Image(); i.onload=()=>res(i); i.onerror=rej; i.src=url;});
+    const max=520, sc=Math.min(1,max/Math.max(img.width,img.height)); const c=document.createElement("canvas");
+    c.width=Math.round(img.width*sc); c.height=Math.round(img.height*sc); c.getContext("2d").drawImage(img,0,0,c.width,c.height);
+    return c.toDataURL("image/jpeg",.78);
+  } finally{ URL.revokeObjectURL(url); }
+}
+
+document.addEventListener("click", async e=>{
+  const g=e.target.closest("[data-go]");
+  if(g){ e.preventDefault(); const v=g.dataset.go; return go(v, v==="shop"?{no:g.dataset.no}:{}); }
+  const a=e.target.closest("[data-act]"); if(!a) return;
+  const act=a.dataset.act;
+  if(act==="copy") return copy(a.dataset.text);
+  if(act==="signout"){ setSession(false); S.signedIn=false; return go("signin"); }
+  if(act==="manage") return go("manage",{no:a.dataset.no,tab:"products"});
+  if(act==="tab") return go("manage",{no:S.params.no,tab:a.dataset.tab});
+  if(act==="add-product") return go("product-edit",{no:a.dataset.no});
+  if(act==="edit-product") return go("product-edit",{no:a.dataset.no,id:a.dataset.id});
+  if(act==="add-cart"||act==="buy"){
+    const p=S.products.find(x=>x.id===a.dataset.id); if(!p) return;
+    const inCart=cartFor(p.shopNo).some(l=>l.productId===p.id);
+    if(act==="buy"&&inCart) return go("checkout",{shopNo:p.shopNo});
+    if(!addToCart(p)) return act==="buy"?go("checkout",{shopNo:p.shopNo}):undefined;
+    if(act==="buy") return go("checkout",{shopNo:p.shopNo});
+    toast(p.name+" added to cart"); return render();
+  }
+  if(act==="open-cart") return go("checkout",{shopNo:a.dataset.no});
+  if(act==="cart-remove"){
+    const no=S.params.shopNo; cartFor(no).splice(Number(a.dataset.i),1); saveCart();
+    if(!cartFor(no).length) return render();
+    document.getElementById("lines").innerHTML=cartLines(shopById(no)); return updateSum();
+  }
+  if(act==="filter") return go("manage",{no:S.params.no,tab:"products",filter:a.dataset.f});
+  if(act==="restock"){
+    a.disabled=true;
+    try{ const after=await changeStock(a.dataset.id, Number(a.dataset.n), "restock"); toast(after===null?"That product no longer exists":"Stock is now "+after); }
+    catch(err){ a.disabled=false; toast("Stock wasn't updated. Try again."); }
+    return;
+  }
+  if(act==="new-shop-form"){
+    const box=document.getElementById("newshop"); if(!box) return;
+    box.innerHTML=`<form id="f-newshop" class="panel stack"><h3>New shop link</h3><p class="small muted">Your shop gets the next number in line. The link is yours alone.</p>
+      <div class="fields"><label class="f"><span>Shop name</span><input name="shopName" required value="${esc(S.profile.companyName)}"></label>
+      <label class="f"><span>Currency</span><select name="currency">${CURRENCIES.map(c=>`<option value="${c[0]}">${c[0]} (${c[1]})</option>`).join("")}</select></label></div>
+      <p class="err" id="err" hidden></p><div class="row"><button class="btn" type="submit">Generate link</button><button class="btn ghost" type="button" data-act="cancel-new">Cancel</button></div></form>`;
+    S._holdRender=true; box.querySelector("input").focus(); return;
+  }
+  if(act==="cancel-new"){ S._holdRender=false; document.getElementById("newshop").innerHTML=""; return; }
+  if(act==="use-my-bank"){
+    const b=S.profile.bank||{}; if(!b.accountNumber) return toast("Add bank details in My details first");
+    const f=document.getElementById("f-shop"); ["bankName","accountName","accountNumber","bankCode"].forEach(k=>f.elements["p_"+k].value=b[k]||""); return toast("Filled in from your saved bank details");
+  }
+  if(act==="del-product"){
+    // Pop-up confirmations are blocked in the viewer, so ask for a second tap instead.
+    if(a.dataset.armed!=="1"){
+      a.dataset.armed="1"; a.classList.add("armed"); a.textContent="Tap again to delete";
+      setTimeout(()=>{ if(a.isConnected){ a.dataset.armed=""; a.classList.remove("armed"); a.textContent="Delete"; } },4000);
+      return;
+    }
+    a.disabled=true;
+    try{ await S.db.doc("products/"+a.dataset.id).delete(); toast("Product deleted"); }catch(err){ a.disabled=false; toast("The product wasn't deleted. Try again."); }
+    return;
+  }
+  if(act==="status"){
+    a.disabled=true;
+    try{ await S.db.doc("orders/"+a.dataset.id).update({status:a.dataset.s, updatedAt:Date.now()});
+      if(a.dataset.s==="rejected"){ const o=S.orders.find(x=>x.id===a.dataset.id);
+        if(o) for(const x of orderItems(o)){ if(x.productId) await changeStock(x.productId, Number(x.qty||0), "returned"); } }
+      toast(STATUS[a.dataset.s].label);
+    }catch(err){ a.disabled=false; toast("That didn't save. Try again."); }
+  }
+});
+
+// Keep the live store view from wiping the new-shop form.
+const _refresh=refresh; refresh=function(){ if(S._holdRender && S.view==="store") return; _refresh(); };
+const _go=go; go=function(v,p){ S._holdRender=false; _go(v,p); };
+
+document.addEventListener("input", e=>{
+  if(e.target.id==="q"){ S.params.q=e.target.value; const pos=e.target.selectionStart; render(); const q=document.getElementById("q"); q.focus(); try{q.setSelectionRange(pos,pos);}catch(_){} }
+  if(e.target.closest("#f-order")){ syncLine(e.target); updateSum(); }
+});
+function syncLine(el){
+  if(!el.dataset||el.dataset.line===undefined) return;
+  const l=cartFor(S.params.shopNo)[Number(el.dataset.line)]; if(!l) return;
+  if(el.dataset.k==="qty"){ const v=parseInt(el.value,10); if(v>0) l.qty=v; } else l[el.dataset.k]=el.value;
+  saveCart();
+}
+// Revenue chart tooltip
+document.addEventListener("mouseover", e=>{
+  const h=e.target.closest && e.target.closest("#rchart .hit"); const tip=document.getElementById("rtip"); if(!tip) return;
+  document.querySelectorAll("#rchart .bar.on").forEach(b=>b.classList.remove("on"));
+  if(!h){ tip.hidden=true; return; }
+  const svg=h.ownerSVGElement, r=svg.getBoundingClientRect(), wrap=svg.parentElement.getBoundingClientRect(), k=r.width/svg.viewBox.baseVal.width;
+  tip.textContent=h.dataset.tip; tip.hidden=false;
+  tip.style.left=(r.left-wrap.left+svg.parentElement.scrollLeft+Number(h.dataset.cx)*k)+"px";
+  tip.style.top=(r.top-wrap.top+Number(h.dataset.cy)*k)+"px";
+});
+document.addEventListener("change", async e=>{
+  if(e.target.id==="img" && e.target.files[0]){
+    try{ S._img=await resizeImage(e.target.files[0]); document.getElementById("thumb").innerHTML=`<img src="${S._img}" alt="">`; }
+    catch(err){ toast("That photo couldn't be read. Try a JPG or PNG."); }
+  }
+  if(e.target.closest("#f-order")){ syncLine(e.target); updateSum(); }
+});
+
+function orderMath(form){
+  const shop=shopById(S.params.shopNo); if(!shop) return null;
+  const lines=cartFor(shop.id).map(l=>({l,p:S.products.find(x=>x.id===l.productId)})).filter(x=>x.p);
+  if(!lines.length) return null;
+  const opts=(shop.delivery&&shop.delivery.options)||[]; const di=form.elements.delivery?parseInt(form.elements.delivery.value,10):-1;
+  const d=opts[di]; const fee=d?Number(d.fee)||0:0;
+  const sub=lines.reduce((a,x)=>a+x.l.qty*(Number(x.p.price)||0),0);
+  return {shop,lines,d,fee,sub,total:sub+fee};
+}
+function updateSum(){
+  const f=document.getElementById("f-order"), box=document.getElementById("sum"); if(!f||!box) return;
+  const m=orderMath(f); if(!m) return; const c=m.shop.currency;
+  box.innerHTML=`${m.lines.map(x=>`<div class="row"><span>${esc(x.p.name)} × ${x.l.qty}</span><span>${money(x.l.qty*(Number(x.p.price)||0),c)}</span></div>`).join("")}
+    <div class="row"><span>Delivery</span><span>${m.d?money(m.fee,c):"To arrange"}</span></div>
+    <div class="row total"><span>Total to pay</span><span>${money(m.total,c)}</span></div>`;
+}
+
+document.addEventListener("submit", async e=>{
+  const f=e.target; e.preventDefault(); const d=formData(f);
+  try{
+  if(f.id==="f-signup"){
+    const miss=need(d,["fullName","companyName","phone","email","password"],{fullName:"your full name",companyName:"your company name",phone:"your phone number",email:"your email",password:"a password"}); if(miss) return showErr(miss);
+    if(d.password.length<6) return showErr("Use a password of at least 6 characters.");
+    await saveProfile({fullName:d.fullName,companyName:d.companyName,phone:d.phone,email:d.email,pw:await hash(d.password),bank:{},createdAt:Date.now()});
+    S.signedIn=true; setSession(true); toast("Account created"); go("store");
+  }
+  if(f.id==="f-signin"){
+    if(d.email.toLowerCase()!==String(S.profile.email).toLowerCase() || await hash(d.password)!==S.profile.pw) return showErr("That email and password don't match your account.");
+    S.signedIn=true; setSession(true); go("store");
+  }
+  if(f.id==="f-profile"){
+    const miss=need(d,["fullName","companyName","phone","email"],{fullName:"your full name",companyName:"your company name",phone:"your phone number",email:"your email"}); if(miss) return showErr(miss);
+    await saveProfile({...S.profile,fullName:d.fullName,companyName:d.companyName,phone:d.phone,email:d.email,bank:{bankName:d.bankName,accountName:d.accountName,accountNumber:d.accountNumber,bankCode:d.bankCode}});
+    toast("Details saved"); go("store");
+  }
+  if(f.id==="f-newshop") return newShop(f);
+  if(f.id==="f-find"){ const n=parseInt(d.no,10); if(!n) return toast("Enter a shop number"); return go("shop",{no:pad(n)}); }
+  if(f.id==="f-shop"){
+    if(!d.shopName) return showErr("Add a shop name.");
+    const options=[0,1,2].map(i=>({name:d["d_name_"+i],fee:Number(d["d_fee_"+i])||0,time:d["d_time_"+i]})).filter(o=>o.name);
+    await S.db.doc("shops/"+S.params.no).update({shopName:d.shopName,companyName:d.companyName,location:d.location,currency:d.currency,about:d.about,phone:d.phone,email:d.email,
+      social:{instagram:d.s_instagram,facebook:d.s_facebook,twitter:d.s_twitter,tiktok:d.s_tiktok,whatsapp:d.s_whatsapp},
+      payment:{bankName:d.p_bankName,accountName:d.p_accountName,accountNumber:d.p_accountNumber,bankCode:d.p_bankCode,instructions:d.p_instructions},
+      delivery:{options}});
+    toast("Shop details saved");
+  }
+  if(f.id==="f-product"){
+    const miss=need(d,["name","price","quantity"],{name:"a product name",price:"a price",quantity:"the quantity in stock"}); if(miss) return showErr(miss);
+    const body={shopNo:S.params.no,ownerId:S.uid,name:d.name,type:d.type,description:d.description,price:Number(d.price)||0,quantity:Math.max(0,parseInt(d.quantity,10)||0),
+      lowStock:Math.max(0,parseInt(d.lowStock,10)||0),
+      sizes:d.sizes,colours:d.colours,height:d.height,weight:d.weight,location:d.location,contactPhone:d.contactPhone,contactEmail:d.contactEmail,image:S._img||""};
+    const btn=f.querySelector("button[type=submit]"); btn.disabled=true;
+    if(S.params.id){
+      const before=S.products.find(x=>x.id===S.params.id); const was=before?Number(before.quantity)||0:body.quantity;
+      await S.db.doc("products/"+S.params.id).update(body);
+      if(body.quantity!==was) await logStock({id:S.params.id,...body}, body.quantity-was, "edit", body.quantity);
+      toast("Product saved");
+    }
+    else { const ref=await S.db.collection("products").add({...body,createdAt:Date.now()});
+      if(body.quantity&&ref&&ref.id) await logStock({id:ref.id,...body}, body.quantity, "restock", body.quantity);
+      toast("Product added"); }
+    go("manage",{no:S.params.no,tab:"products"});
+  }
+  if(f.id==="f-order"){
+    const m=orderMath(f); if(!m) return;
+    const miss=need(d,["name","phone","city","address","payer","reference"],{name:"your name",phone:"your phone number",city:"your city",address:"your delivery address",payer:"the name on the paying account",reference:"the transfer reference"}); if(miss) return showErr(miss);
+    // Check live stock for every product in the cart (the same product can appear with different sizes).
+    const want={}; m.lines.forEach(x=>want[x.p.id]=(want[x.p.id]||0)+x.l.qty);
+    const stock={};
+    for(const pid of Object.keys(want)){ const fr=await S.db.doc("products/"+pid).get(); stock[pid]=fr.exists?Number(fr.data().quantity)||0:0;
+      if(want[pid]>stock[pid]){ const nm=(m.lines.find(x=>x.p.id===pid)||{}).p.name; return showErr(stock[pid]?`Only ${stock[pid]} ${nm} left. Lower the quantity.`:`${nm} just sold out. Remove it to continue.`); } }
+    const btn=f.querySelector("button[type=submit]"); btn.disabled=true; btn.textContent="Placing order…";
+    const id="SA-"+m.shop.id+"-"+Date.now().toString(36).toUpperCase().slice(-6);
+    const items=m.lines.map(x=>({productId:x.p.id,name:x.p.name,unitPrice:Number(x.p.price)||0,qty:x.l.qty,size:x.l.size||"",colour:x.l.colour||""}));
+    const units=items.reduce((a,x)=>a+x.qty,0);
+    const order={shopNo:m.shop.id,ownerId:m.shop.ownerId,items,
+      productId:items[0].productId,productName:items.length>1?`${items.length} products`:items[0].name,unitPrice:items.length>1?0:items[0].unitPrice,qty:units,size:items[0].size,colour:items[0].colour,
+      subtotal:m.sub,deliveryName:m.d?m.d.name:"",deliveryFee:m.fee,total:m.total,buyerId:S.uid||null,
+      buyer:{name:d.name,phone:d.phone,email:d.email,city:d.city,address:d.address,note:d.note},payer:d.payer,reference:d.reference,status:"awaiting",createdAt:Date.now()};
+    await S.db.doc("orders/"+id).set(order);
+    for(const pid of Object.keys(want)){ const p=m.lines.find(x=>x.p.id===pid).p; const after=stock[pid]-want[pid];
+      await S.db.doc("products/"+pid).update({quantity:after}); await logStock(p, -want[pid], "sale", after); }
+    delete S.cart[m.shop.id]; saveCart();
+    go("placed",{id,order});
+  }
+  }catch(err){
+    console.warn(err);
+    const code=err&&err.code;
+    const b=f.querySelector("button[type=submit]"); if(b) b.disabled=false;
+    showErr(code==="quota_exceeded"?"Stock App's storage is full. Delete old products to make room.":code==="invalid_argument"?"You don't have permission to save here. Ask the app owner to make you a Contributor.":"That didn't save. Check your connection and try again.");
+  }
+});
+
+// Fill order summary after checkout renders
+const _render=render; render=function(){ _render(); if(S.view==="checkout") updateSum(); };
+})();
+</script>
+</body>
+</html>
