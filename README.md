@@ -9,7 +9,7 @@ A marketplace where sellers open numbered shops, list products, take orders and 
 - Stock management: low-stock warnings, quick restock (+1 / +5 / +10), per-product stock history
 - Shopping cart: several products in one order, paid in one transfer
 - Orders & payments: confirm payment, mark as sent, mark as delivered
-- Sales dashboard: revenue per day (last 30 days), best sellers, orders by status
+- Sales dashboard: revenue per day (last 30 days), best sellers, orders by status.
 
 ## How it runs
 
