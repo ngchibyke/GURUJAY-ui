@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod error;
 pub mod extract;
 pub mod phone;
+pub mod products;
 pub mod stores;
 
 use axum::{
@@ -59,6 +60,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(auth::routes::router())
         .merge(access_codes::routes::router())
         .merge(stores::routes::router())
+        .merge(products::routes::router())
         .layer(trace)
         .with_state(state)
 }

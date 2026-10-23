@@ -23,7 +23,7 @@ pub fn router() -> Router<AppState> {
 }
 
 /// Optional authentication: no credentials means anonymous; bad credentials are still rejected.
-struct MaybeAuth(Option<AuthUser>);
+pub(crate) struct MaybeAuth(pub Option<AuthUser>);
 
 impl FromRequestParts<AppState> for MaybeAuth {
     type Rejection = AppError;
@@ -36,7 +36,7 @@ impl FromRequestParts<AppState> for MaybeAuth {
     }
 }
 
-fn require_seller(user: &AuthUser) -> Result<(), AppError> {
+pub(crate) fn require_seller(user: &AuthUser) -> Result<(), AppError> {
     if user.is_seller { Ok(()) } else { Err(AppError::Forbidden("not_a_seller")) }
 }
 
