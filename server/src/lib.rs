@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod error;
 pub mod extract;
 pub mod phone;
+pub mod stores;
 
 use axum::{
     Json, Router,
@@ -57,6 +58,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(health))
         .merge(auth::routes::router())
         .merge(access_codes::routes::router())
+        .merge(stores::routes::router())
         .layer(trace)
         .with_state(state)
 }

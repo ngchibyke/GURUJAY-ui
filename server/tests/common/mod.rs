@@ -198,4 +198,31 @@ impl TestApp {
         self.request(Method::POST, "/seller/redeem", Some(json!({ "code": code })), Some(token))
             .await
     }
+
+    /// The owner's session token: signs in if the owner already exists, else creates it.
+    pub async fn owner_token(&self) -> String {
+        let res = self
+            .request(
+                Method::POST,
+                "/auth/sign-in",
+                Some(json!({ "phone": "08099999999", "password": TEST_PASSWORD })),
+                None,
+            )
+            .await;
+        if res.status == 200 {
+            res.json["token"].as_str().unwrap().to_string()
+        } else {
+            self.make_owner().await
+        }
+    }
+
+    /// Verified user who has redeemed an owner-issued code; returns (user id, token).
+    pub async fn make_seller(&self, phone: &str) -> (Uuid, String) {
+        let owner = self.owner_token().await;
+        let (_, code) = self.create_access_code(&owner, json!({})).await;
+        let (id, token) = self.sign_up_verified(phone).await;
+        let res = self.redeem(&token, &code).await;
+        assert_eq!(res.status, 200, "redeem failed: {}", res.json);
+        (id, token)
+    }
 }
