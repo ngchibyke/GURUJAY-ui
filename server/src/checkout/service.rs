@@ -1,4 +1,5 @@
-//! Checkout: reserves stock and creates one checkout plus one order per store,
+//! Checkout: reserves stock (`reserved_quantity`; on-hand `stock` changes only
+//! when the payment settles, see [`commit_reserved`]) and creates one checkout plus one order per store,
 //! then asks the payment provider for a payment page.
 //!
 //! Locking follows the global order `users -> stores -> products ->
@@ -64,7 +65,7 @@ pub struct Created {
 pub enum Outcome {
     /// A new checkout (201).
     Created(Created),
-    /// An earlier checkout with the same idempotency key (200).
+    /// An earlier checkout with the same idempotency key (also 201, same body).
     Replayed(Created),
 }
 
@@ -88,6 +89,7 @@ struct VariantRow {
     product_id: Uuid,
     attributes: serde_json::Value,
     stock: i32,
+    reserved_quantity: i32,
     price_kobo: Option<i64>,
 }
 
@@ -188,8 +190,8 @@ pub async fn create(
 
     // product_variants: one standalone statement, always in id order.
     let variants: HashMap<Uuid, VariantRow> = sqlx::query_as::<_, VariantRow>(
-        "SELECT id, product_id, attributes, stock, price_kobo FROM product_variants \
-         WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+        "SELECT id, product_id, attributes, stock, reserved_quantity, price_kobo \
+         FROM product_variants WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE",
     )
     .bind(&ids)
     .fetch_all(&mut *tx)
@@ -231,7 +233,8 @@ pub async fn create(
         if p.owner_id == buyer {
             return Err(own_store_item());
         }
-        if v.stock < quantity {
+        // Available = on hand minus what other pending checkouts hold, read from the locked row.
+        if v.stock - v.reserved_quantity < quantity {
             return Err(AppError::ConflictDetail(
                 "out_of_stock",
                 format!("Item {variant_id} does not have enough stock"),
@@ -273,10 +276,12 @@ pub async fn create(
         return Err(too_large());
     }
 
-    // The reservation.
+    // The reservation: on-hand stock is untouched until the payment settles (commit_reserved).
     for (_, order) in &orders {
         for l in &order.lines {
-            sqlx::query("UPDATE product_variants SET stock = stock - $2 WHERE id = $1")
+            sqlx::query(
+                "UPDATE product_variants SET reserved_quantity = reserved_quantity + $2 WHERE id = $1",
+            )
                 .bind(l.variant_id)
                 .bind(l.quantity)
                 .execute(&mut *tx)
@@ -368,20 +373,17 @@ pub async fn create(
         customer_email: None,
         redirect_url: state.payment_redirect_url.clone(),
     };
+    let db = state.db.clone();
     let task = tokio::spawn(async move {
         let failure = match provider.initiate(req).await {
             Ok(p) if payment_url_allowed(&p.payment_url, provider.payment_url_hosts()) => {
-                sqlx::query(
-                    "UPDATE checkouts SET provider_payment_id = $2, payment_url = $3 WHERE id = $1",
-                )
-                .bind(checkout_id)
-                .bind(&p.provider_payment_id)
-                .bind(&p.payment_url)
-                .execute(&state.db)
-                .await
-                .context("store payment url")?;
-                let mut conn = state.db.acquire().await.context("acquire")?;
-                return load_created(&mut conn, checkout_id).await;
+                match store_payment(&state.db, checkout_id, &p).await {
+                    Ok(created) => return Ok(created),
+                    Err(e) => {
+                        tracing::error!(error = %e, "could not store the payment page");
+                        "could not store the payment page"
+                    }
+                }
             }
             Ok(_) => "untrusted payment url",
             // The outcome is unknown; see the module docs.
@@ -393,18 +395,50 @@ pub async fn create(
             outcome = failure,
             "payment initiate did not succeed; expiring checkout"
         );
-        let mut tx = state.db.begin().await.context("begin")?;
-        expire_and_restore(&mut tx, checkout_id).await?;
-        tx.commit().await.context("commit")?;
+        expire_now(&state.db, checkout_id).await?;
         Err(AppError::ProviderUnavailable)
     });
-    let created = task.await.context("initiate task")??;
-    Ok(Outcome::Created(created))
+    match task.await {
+        Ok(result) => result.map(Outcome::Created),
+        // The task panicked: never leave the checkout pending with stock reserved.
+        Err(e) => {
+            tracing::error!(error = %e, "checkout initiate task failed; expiring checkout");
+            expire_now(&db, checkout_id).await?;
+            Err(AppError::ProviderUnavailable)
+        }
+    }
+}
+
+/// Saves the provider's payment id and page, then builds the 201 body.
+async fn store_payment(
+    db: &sqlx::PgPool,
+    checkout_id: Uuid,
+    p: &payments::InitiatedPayment,
+) -> Result<Created, AppError> {
+    sqlx::query("UPDATE checkouts SET provider_payment_id = $2, payment_url = $3 WHERE id = $1")
+        .bind(checkout_id)
+        .bind(&p.provider_payment_id)
+        .bind(&p.payment_url)
+        .execute(db)
+        .await
+        .context("store payment url")?;
+    let mut conn = db.acquire().await.context("acquire")?;
+    load_created(&mut conn, checkout_id).await
+}
+
+/// [`expire_and_restore`] in a transaction of its own.
+async fn expire_now(db: &sqlx::PgPool, checkout_id: Uuid) -> Result<(), AppError> {
+    let mut tx = db.begin().await.context("begin")?;
+    expire_and_restore(&mut tx, checkout_id).await?;
+    tx.commit().await.context("commit")?;
+    Ok(())
 }
 
 /// Looks up the buyer's checkout with this idempotency key. `Ok(Some)` replays a
-/// checkout that has a payment page; one still being created or one that failed
-/// is a 409, and a different method under the same key is a 422.
+/// pending checkout that has a payment page (201, same body). A pending one still
+/// being created is 409 `checkout_in_progress`; one no longer pending (expired,
+/// failed, paid, ...) is 409 `checkout_not_pending`, so a dead payment page is never
+/// handed out; a different method under the same key is 422.
 async fn replay(
     tx: &mut Transaction<'_, Postgres>,
     buyer: Uuid,
@@ -429,10 +463,10 @@ async fn replay(
             "This Idempotency-Key was used for a different request".into(),
         ));
     }
-    match (url, status.as_str()) {
-        (Some(_), _) => Ok(Some(load_created(tx, id).await?)),
-        (None, "pending") => Err(AppError::Conflict("checkout_in_progress")),
-        (None, _) => Err(AppError::Conflict("checkout_failed")),
+    match (status.as_str(), url) {
+        ("pending", Some(_)) => Ok(Some(load_created(tx, id).await?)),
+        ("pending", None) => Err(AppError::Conflict("checkout_in_progress")),
+        _ => Err(AppError::Conflict("checkout_not_pending")),
     }
 }
 
@@ -467,18 +501,12 @@ async fn load_created(conn: &mut PgConnection, checkout_id: Uuid) -> Result<Crea
     })
 }
 
-/// Expires a `pending` checkout and puts its reserved stock back, inside the
-/// caller's transaction. Returns whether it did anything.
-///
-/// Stock is restored only when this call moves the checkout out of `pending`
-/// (`UPDATE ... WHERE status = 'pending'`), so running it twice, or racing the
-/// expiry job (Task 9) or a paid webhook (Task 6), never restores twice. Locks
-/// the variants (id order), then the checkout, then its orders. Quantities come
-/// from the snapshotted `order_items`, never from the live cart.
-pub async fn expire_and_restore(
+/// The checkout's reserved quantities per variant (from the snapshotted
+/// `order_items`, never the live cart), with those variants locked in id order.
+async fn lock_reserved(
     conn: &mut PgConnection,
     checkout_id: Uuid,
-) -> Result<bool, AppError> {
+) -> Result<Vec<(Uuid, i32)>, AppError> {
     let items: Vec<(Uuid, i64)> = sqlx::query_as(
         "SELECT oi.variant_id, sum(oi.quantity)::bigint FROM order_items oi \
          JOIN orders o ON o.id = oi.order_id WHERE o.checkout_id = $1 \
@@ -489,11 +517,50 @@ pub async fn expire_and_restore(
     .await
     .context("load reserved items")?;
     let ids: Vec<Uuid> = items.iter().map(|(id, _)| *id).collect();
-    sqlx::query("SELECT id FROM product_variants WHERE id = ANY($1) ORDER BY id FOR UPDATE")
+    sqlx::query("SELECT id FROM product_variants WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE")
         .bind(&ids)
         .fetch_all(&mut *conn)
         .await
         .context("lock variants")?;
+    items
+        .into_iter()
+        .map(|(id, q)| Ok((id, i32::try_from(q).context("quantity range")?)))
+        .collect()
+}
+
+/// Turns a checkout's reservation into a sale, inside the caller's transaction:
+/// `stock -= q` and `reserved_quantity -= q` for every line, under the variant
+/// locks (id order). Task 6 calls this when the payment settles, in the same
+/// transaction that moves the checkout `pending -> paid`; that transition is the
+/// gate, so this must run only when it succeeded (never twice).
+pub async fn commit_reserved(conn: &mut PgConnection, checkout_id: Uuid) -> Result<(), AppError> {
+    for (variant_id, quantity) in lock_reserved(conn, checkout_id).await? {
+        sqlx::query(
+            "UPDATE product_variants \
+             SET stock = stock - $2, reserved_quantity = reserved_quantity - $2 WHERE id = $1",
+        )
+        .bind(variant_id)
+        .bind(quantity)
+        .execute(&mut *conn)
+        .await
+        .context("commit reserved stock")?;
+    }
+    Ok(())
+}
+
+/// Expires a `pending` checkout and releases its reserved stock, inside the
+/// caller's transaction. Returns whether it did anything.
+///
+/// The reservation is released only when this call moves the checkout out of
+/// `pending` (`UPDATE ... WHERE status = 'pending'`), so running it twice, or
+/// racing the expiry job (Task 9) or a paid webhook (Task 6), never releases
+/// twice. Locks the variants (id order), then the checkout, then its orders.
+/// On-hand `stock` is not touched: seller edits made meanwhile stand.
+pub async fn expire_and_restore(
+    conn: &mut PgConnection,
+    checkout_id: Uuid,
+) -> Result<bool, AppError> {
+    let items = lock_reserved(conn, checkout_id).await?;
 
     let moved: Option<Uuid> = sqlx::query_scalar(
         "UPDATE checkouts SET status = 'expired' WHERE id = $1 AND status = 'pending' RETURNING id",
@@ -506,14 +573,14 @@ pub async fn expire_and_restore(
         return Ok(false);
     }
     for (variant_id, quantity) in &items {
-        // Capped at the stock limit (100,000) so a seller who raised stock meanwhile
-        // cannot make the restore fail the CHECK and wedge expiry forever.
-        sqlx::query("UPDATE product_variants SET stock = LEAST(stock + $2, 100000) WHERE id = $1")
-            .bind(variant_id)
-            .bind(i32::try_from(*quantity).context("quantity range")?)
-            .execute(&mut *conn)
-            .await
-            .context("restore stock")?;
+        sqlx::query(
+            "UPDATE product_variants SET reserved_quantity = reserved_quantity - $2 WHERE id = $1",
+        )
+        .bind(variant_id)
+        .bind(quantity)
+        .execute(&mut *conn)
+        .await
+        .context("release reservation")?;
     }
     sqlx::query(
         "UPDATE orders SET status = 'cancelled', cancelled_at = now() \

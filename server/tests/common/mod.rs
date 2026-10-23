@@ -433,6 +433,21 @@ impl TestApp {
             .unwrap()
     }
 
+    /// Units held by pending checkouts.
+    pub async fn reserved(&self, variant_id: Uuid) -> i32 {
+        sqlx::query_scalar("SELECT reserved_quantity FROM product_variants WHERE id = $1")
+            .bind(variant_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Units a buyer can still buy (`stock - reserved_quantity`).
+    pub async fn available(&self, variant_id: Uuid) -> i32 {
+        self.stock(variant_id).await - self.reserved(variant_id).await
+    }
+
+    /// On-hand stock.
     pub async fn stock(&self, variant_id: Uuid) -> i32 {
         sqlx::query_scalar("SELECT stock FROM product_variants WHERE id = $1")
             .bind(variant_id)

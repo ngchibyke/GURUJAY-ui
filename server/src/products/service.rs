@@ -93,7 +93,14 @@ const PRODUCT_COLUMNS: &str = "p.id, p.store_id, p.name, p.description, p.catego
 pub struct Variant {
     pub id: Uuid,
     pub attributes: BTreeMap<String, String>,
-    pub stock: i32,
+    /// Units a buyer can still buy: on-hand stock minus units reserved by pending checkouts.
+    pub available_stock: i32,
+    /// On-hand stock as the seller set it. Shown to the store owner only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stock: Option<i32>,
+    /// Units held by pending checkouts. Shown to the store owner only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_quantity: Option<i32>,
     pub price_kobo: Option<i64>,
     pub sku: Option<String>,
 }
@@ -103,6 +110,7 @@ struct VariantRow {
     id: Uuid,
     attributes: serde_json::Value,
     stock: i32,
+    reserved_quantity: i32,
     price_kobo: Option<i64>,
     sku: Option<String>,
 }
@@ -138,6 +146,13 @@ fn duplicate_variant() -> AppError {
 
 fn variant_in_use() -> AppError {
     AppError::Conflict("variant_in_use")
+}
+
+fn stock_below_reserved() -> AppError {
+    AppError::ConflictDetail(
+        "stock_below_reserved",
+        "Stock cannot be set below the units reserved by pending checkouts".into(),
+    )
 }
 
 fn validate_text(value: &str, max: usize, field: &str) -> Result<(), AppError> {
@@ -296,11 +311,23 @@ async fn upsert_variants(
     // The product row is locked by the caller for the whole diff, so concurrent replaces serialise.
     // Its variants are then locked in id order, the same order checkout uses, so a replace
     // and a checkout touching the same variants cannot deadlock.
-    sqlx::query("SELECT id FROM product_variants WHERE product_id = $1 ORDER BY id FOR UPDATE")
-        .bind(product_id)
-        .fetch_all(&mut **tx)
-        .await
-        .context("lock variants")?;
+    let current: Vec<(serde_json::Value, i32)> = sqlx::query_as(
+        "SELECT attributes, reserved_quantity FROM product_variants \
+         WHERE product_id = $1 ORDER BY id FOR UPDATE",
+    )
+    .bind(product_id)
+    .fetch_all(&mut **tx)
+    .await
+    .context("lock variants")?;
+    // `stock` is on-hand stock; it may never drop below what pending checkouts reserve.
+    for (v, attrs) in variants.iter().zip(&keep) {
+        if current
+            .iter()
+            .any(|(a, reserved)| a == attrs && v.stock < *reserved)
+        {
+            return Err(stock_below_reserved());
+        }
+    }
     // An ordered variant is part of an order's history and cannot be deleted.
     let in_use: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM product_variants v JOIN order_items oi ON oi.variant_id = v.id \
@@ -337,14 +364,25 @@ async fn upsert_variants(
         .bind(&v.sku)
         .execute(&mut **tx)
         .await
-        .context("upsert variant")?;
+        .map_err(|e| match &e {
+            // Backstop for the check above (product_variants_reserved_le_stock).
+            sqlx::Error::Database(db) if db.constraint() == Some("product_variants_reserved_le_stock") => {
+                stock_below_reserved()
+            },
+            _ => AppError::Internal(anyhow::Error::new(e).context("upsert variant")),
+        })?;
     }
     Ok(())
 }
 
-async fn load_variants(db: &PgPool, product_id: Uuid) -> Result<Vec<Variant>, AppError> {
+/// `owner_view`: the viewer owns the store, so on-hand and reserved stock are included.
+async fn load_variants(
+    db: &PgPool,
+    product_id: Uuid,
+    owner_view: bool,
+) -> Result<Vec<Variant>, AppError> {
     let rows: Vec<VariantRow> = sqlx::query_as(
-        "SELECT id, attributes, stock, price_kobo, sku FROM product_variants \
+        "SELECT id, attributes, stock, reserved_quantity, price_kobo, sku FROM product_variants \
          WHERE product_id = $1 ORDER BY attributes::text, id",
     )
     .bind(product_id)
@@ -356,7 +394,9 @@ async fn load_variants(db: &PgPool, product_id: Uuid) -> Result<Vec<Variant>, Ap
             Ok(Variant {
                 id: r.id,
                 attributes: serde_json::from_value(r.attributes).context("decode attributes")?,
-                stock: r.stock,
+                available_stock: r.stock - r.reserved_quantity,
+                stock: owner_view.then_some(r.stock),
+                reserved_quantity: owner_view.then_some(r.reserved_quantity),
                 price_kobo: r.price_kobo,
                 sku: r.sku,
             })
@@ -364,8 +404,25 @@ async fn load_variants(db: &PgPool, product_id: Uuid) -> Result<Vec<Variant>, Ap
         .collect::<Result<_, AppError>>()
 }
 
-async fn view(db: &PgPool, product: Product) -> Result<ProductView, AppError> {
-    let variants = load_variants(db, product.id).await?;
+/// The product with its variants. The store owner also sees on-hand and reserved
+/// stock; everyone else sees available stock only.
+async fn view(
+    db: &PgPool,
+    product: Product,
+    viewer: Option<Uuid>,
+) -> Result<ProductView, AppError> {
+    let owner_view = match viewer {
+        Some(viewer) => sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM stores WHERE id = $1 AND owner_id = $2)",
+        )
+        .bind(product.store_id)
+        .bind(viewer)
+        .fetch_one(db)
+        .await
+        .context("check store owner")?,
+        None => false,
+    };
+    let variants = load_variants(db, product.id, owner_view).await?;
     Ok(ProductView { product, variants })
 }
 
@@ -449,7 +506,7 @@ pub async fn create_product(
     )
     .await?;
     tx.commit().await.context("commit")?;
-    view(db, product).await
+    view(db, product, Some(owner)).await
 }
 
 pub async fn update_product(
@@ -518,7 +575,7 @@ pub async fn update_product(
     )
     .await?;
     tx.commit().await.context("commit")?;
-    view(db, product).await
+    view(db, product, Some(owner)).await
 }
 
 pub async fn replace_variants(
@@ -547,7 +604,7 @@ pub async fn replace_variants(
     )
     .await?;
     tx.commit().await.context("commit")?;
-    view(db, product).await
+    view(db, product, Some(owner)).await
 }
 
 pub async fn delete_product(db: &PgPool, owner: Uuid, id: Uuid) -> Result<(), AppError> {
@@ -588,7 +645,7 @@ pub async fn get_product(
     .await
     .context("get product")?
     .ok_or(AppError::NotFound)?;
-    view(db, product).await
+    view(db, product, viewer).await
 }
 
 /// Lists a store's products by slug. Anyone who cannot see the store gets an empty list.
@@ -610,7 +667,7 @@ pub async fn list_store_products(
     .context("list products")?;
     let mut out = Vec::with_capacity(products.len());
     for p in products {
-        out.push(view(db, p).await?);
+        out.push(view(db, p, viewer).await?);
     }
     Ok(out)
 }
@@ -645,7 +702,9 @@ mod tests {
         Variant {
             id: Uuid::nil(),
             attributes: BTreeMap::new(),
-            stock: 1,
+            available_stock: 1,
+            stock: None,
+            reserved_quantity: None,
             price_kobo: price,
             sku: None,
         }

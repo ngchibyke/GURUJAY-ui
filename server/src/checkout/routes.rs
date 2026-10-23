@@ -58,7 +58,8 @@ async fn create(
     let key = idempotency_key(&headers)?;
     match service::create(&state, user.id, &body.method, key.as_deref()).await? {
         Outcome::Created(c) => Ok((StatusCode::CREATED, Json(c))),
-        Outcome::Replayed(c) => Ok((StatusCode::OK, Json(c))),
+        // A replay answers exactly like the original request.
+        Outcome::Replayed(c) => Ok((StatusCode::CREATED, Json(c))),
     }
 }
 

@@ -156,7 +156,31 @@ async fn checkout_reserves_stock(pool: PgPool) {
     app.set_cart(&buyer, l.variant_id, 2).await;
     let res = app.checkout(&buyer, METHOD).await;
     assert_eq!(res.status, 201, "{}", res.json);
-    assert_eq!(app.stock(l.variant_id).await, 3);
+    assert_eq!(app.available(l.variant_id).await, 3);
+    // Reserved, not sold: on-hand stock is unchanged until the payment settles.
+    assert_eq!(app.stock(l.variant_id).await, 5);
+    assert_eq!(app.reserved(l.variant_id).await, 2);
+    // Buyers see available stock only; the seller also sees on hand and reserved.
+    let path = format!("/products/{}", l.product_id);
+    let public = app.request(Method::GET, &path, None, None).await;
+    let v = &public.json["variants"][0];
+    assert_eq!(v["available_stock"], 3);
+    assert!(
+        v.get("stock").is_none() && v.get("reserved_quantity").is_none(),
+        "{v}"
+    );
+    let own = app
+        .request(Method::GET, &path, None, Some(&l.seller_token))
+        .await;
+    let v = &own.json["variants"][0];
+    assert_eq!(
+        (
+            v["stock"].as_i64(),
+            v["reserved_quantity"].as_i64(),
+            v["available_stock"].as_i64()
+        ),
+        (Some(5), Some(2), Some(3))
+    );
 }
 
 #[sqlx::test]
@@ -180,7 +204,7 @@ async fn concurrent_last_unit_one_wins(pool: PgPool) {
             .unwrap()
             .contains(&l.variant_id.to_string())
     );
-    assert_eq!(app.stock(l.variant_id).await, 0);
+    assert_eq!(app.available(l.variant_id).await, 0);
     assert_eq!(count(&app, "SELECT count(*) FROM checkouts").await, 1);
 }
 
@@ -219,7 +243,7 @@ async fn unpublished_or_pending_store_item_unavailable(pool: PgPool) {
     assert_eq!(res.json["error"]["code"], "item_unavailable");
 
     // Nothing was reserved or created.
-    assert_eq!(app.stock(l.variant_id).await, 5);
+    assert_eq!(app.available(l.variant_id).await, 5);
     assert_eq!(count(&app, "SELECT count(*) FROM checkouts").await, 0);
 }
 
@@ -232,7 +256,7 @@ async fn disabled_method_rejected(pool: PgPool) {
     let res = app.checkout(&buyer, "paystack_card").await;
     assert_eq!(res.status, 422, "{}", res.json);
     assert_eq!(res.json["error"]["code"], "payment_method_disabled");
-    assert_eq!(app.stock(l.variant_id).await, 5);
+    assert_eq!(app.available(l.variant_id).await, 5);
     assert_eq!(app.fake.calls("initiate"), 0);
 }
 
@@ -250,7 +274,7 @@ async fn own_store_item_rejected(pool: PgPool) {
     let res = app.checkout(&l.seller_token, METHOD).await;
     assert_eq!(res.status, 422, "{}", res.json);
     assert_eq!(res.json["error"]["code"], "own_store_item");
-    assert_eq!(app.stock(l.variant_id).await, 5);
+    assert_eq!(app.available(l.variant_id).await, 5);
 }
 
 #[sqlx::test]
@@ -276,6 +300,8 @@ async fn empty_cart_rejected(pool: PgPool) {
 async fn assert_failed_and_restored(app: &TestApp, l: &Listing, res: &common::TestResponse) {
     assert_eq!(res.status, 502, "{}", res.json);
     assert_eq!(res.json["error"]["code"], "payment_provider_unavailable");
+    assert_eq!(app.available(l.variant_id).await, 5);
+    assert_eq!(app.reserved(l.variant_id).await, 0);
     assert_eq!(app.stock(l.variant_id).await, 5);
     let (status, url): (String, Option<String>) =
         sqlx::query_as("SELECT status::text, payment_url FROM checkouts")
@@ -337,7 +363,7 @@ async fn expiring_twice_restores_once(pool: PgPool) {
     app.set_cart(&buyer, l.variant_id, 2).await;
     let res = app.checkout(&buyer, METHOD).await;
     assert_eq!(res.status, 201, "{}", res.json);
-    assert_eq!(app.stock(l.variant_id).await, 3);
+    assert_eq!(app.available(l.variant_id).await, 3);
     let id: Uuid = res.json["checkout_id"].as_str().unwrap().parse().unwrap();
 
     for expected in [true, false] {
@@ -347,7 +373,7 @@ async fn expiring_twice_restores_once(pool: PgPool) {
             .unwrap();
         tx.commit().await.unwrap();
         assert_eq!(expired, expected);
-        assert_eq!(app.stock(l.variant_id).await, 5);
+        assert_eq!(app.available(l.variant_id).await, 5);
     }
     assert_eq!(checkout_status(&app, &id.to_string()).await, "expired");
 
@@ -367,7 +393,7 @@ async fn expiring_twice_restores_once(pool: PgPool) {
             .unwrap()
     );
     tx.commit().await.unwrap();
-    assert_eq!(app.stock(l.variant_id).await, 4);
+    assert_eq!(app.available(l.variant_id).await, 4);
 }
 
 #[sqlx::test]
@@ -440,8 +466,8 @@ async fn checkout_total_cap(pool: PgPool) {
     let res = app.checkout(&buyer, METHOD).await;
     assert_eq!(res.status, 422, "{}", res.json);
     assert_eq!(res.json["error"]["code"], "amount_too_large");
-    assert_eq!(app.stock(l.variant_id).await, 5);
-    assert_eq!(app.stock(cheap).await, 10);
+    assert_eq!(app.available(l.variant_id).await, 5);
+    assert_eq!(app.available(cheap).await, 10);
 }
 
 #[sqlx::test]
@@ -456,7 +482,7 @@ async fn pending_checkout_cap(pool: PgPool) {
     let res = app.checkout(&buyer, METHOD).await;
     assert_eq!(res.status, 429, "{}", res.json);
     assert_eq!(res.json["error"]["code"], "too_many_pending_checkouts");
-    assert_eq!(app.stock(l.variant_id).await, 47);
+    assert_eq!(app.available(l.variant_id).await, 47);
 
     // Once one is no longer pending, the buyer can check out again.
     sqlx::query(
@@ -498,11 +524,11 @@ async fn idempotent_checkout_returns_same(pool: PgPool) {
     let first = send("order-1_abc", METHOD).await;
     assert_eq!(first.status, 201, "{}", first.json);
     let again = send("order-1_abc", METHOD).await;
-    assert_eq!(again.status, 200, "{}", again.json);
+    assert_eq!(again.status, 201, "{}", again.json);
     assert_eq!(again.json, first.json);
     assert_eq!(app.fake.calls("initiate"), 1);
     assert_eq!(count(&app, "SELECT count(*) FROM checkouts").await, 1);
-    assert_eq!(app.stock(l.variant_id).await, 4);
+    assert_eq!(app.available(l.variant_id).await, 4);
 
     // Same key, different request.
     let res = send("order-1_abc", "paystack_card").await;
@@ -553,7 +579,7 @@ async fn idempotent_replay_of_failed_checkout_is_refused(pool: PgPool) {
     assert_eq!(send().await.status, 502);
     let res = send().await;
     assert_eq!(res.status, 409, "{}", res.json);
-    assert_eq!(res.json["error"]["code"], "checkout_failed");
+    assert_eq!(res.json["error"]["code"], "checkout_not_pending");
     assert_eq!(app.fake.calls("initiate"), 1);
 }
 
@@ -626,4 +652,174 @@ async fn get_checkout_is_buyer_only(pool: PgPool) {
         app.request(Method::GET, &path, None, None).await.status,
         401
     );
+}
+
+async fn put_stock(app: &TestApp, l: &Listing, stock: i32) -> common::TestResponse {
+    app.request(
+        Method::PUT,
+        &format!("/products/{}/variants", l.product_id),
+        Some(json!([{ "attributes": {}, "stock": stock }])),
+        Some(&l.seller_token),
+    )
+    .await
+}
+
+async fn pending_checkout(app: &TestApp, l: &Listing, quantity: i64) -> Uuid {
+    let (_, buyer) = app.sign_up_verified(BUYER).await;
+    app.set_cart(&buyer, l.variant_id, quantity).await;
+    let res = app.checkout(&buyer, METHOD).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    res.json["checkout_id"].as_str().unwrap().parse().unwrap()
+}
+
+#[sqlx::test]
+async fn seller_edit_keeps_reservations(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let l = listing(&app, 100_000, 5).await;
+    let id = pending_checkout(&app, &l, 2).await;
+
+    // The seller counts 6 on the shelf; the 2 held by the checkout stay held.
+    let res = put_stock(&app, &l, 6).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["variants"][0]["stock"], 6);
+    assert_eq!(res.json["variants"][0]["reserved_quantity"], 2);
+    assert_eq!(res.json["variants"][0]["available_stock"], 4);
+
+    let mut tx = app.pool.begin().await.unwrap();
+    assert!(
+        server::checkout::expire_and_restore(&mut tx, id)
+            .await
+            .unwrap()
+    );
+    tx.commit().await.unwrap();
+    // 6, not 8: expiry releases the reservation and never adds to on-hand stock.
+    assert_eq!(app.available(l.variant_id).await, 6);
+    assert_eq!(app.stock(l.variant_id).await, 6);
+    assert_eq!(app.reserved(l.variant_id).await, 0);
+}
+
+#[sqlx::test]
+async fn seller_cannot_set_stock_below_reserved(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let l = listing(&app, 100_000, 5).await;
+    pending_checkout(&app, &l, 2).await;
+
+    let res = put_stock(&app, &l, 1).await;
+    assert_eq!(res.status, 409, "{}", res.json);
+    assert_eq!(res.json["error"]["code"], "stock_below_reserved");
+    assert_eq!(app.stock(l.variant_id).await, 5);
+    assert_eq!(app.reserved(l.variant_id).await, 2);
+
+    // Exactly the reserved amount is allowed: nothing left to buy.
+    let res = put_stock(&app, &l, 2).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(app.available(l.variant_id).await, 0);
+
+    // The database refuses it too.
+    let direct = sqlx::query("UPDATE product_variants SET stock = 1 WHERE id = $1")
+        .bind(l.variant_id)
+        .execute(&app.pool)
+        .await;
+    assert!(direct.is_err());
+}
+
+#[sqlx::test]
+async fn commit_reserved_moves_units(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let l = listing(&app, 100_000, 5).await;
+    let id = pending_checkout(&app, &l, 2).await;
+    assert_eq!(
+        (
+            app.stock(l.variant_id).await,
+            app.reserved(l.variant_id).await
+        ),
+        (5, 2)
+    );
+
+    let mut tx = app.pool.begin().await.unwrap();
+    server::checkout::commit_reserved(&mut tx, id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(app.stock(l.variant_id).await, 3);
+    assert_eq!(app.reserved(l.variant_id).await, 0);
+    assert_eq!(app.available(l.variant_id).await, 3);
+}
+
+#[sqlx::test]
+async fn concurrent_same_idempotency_key_creates_one(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let l = listing(&app, 100_000, 5).await;
+    let (_, buyer) = app.sign_up_verified(BUYER).await;
+    app.set_cart(&buyer, l.variant_id, 2).await;
+    let send = || {
+        app.request_with_headers(
+            Method::POST,
+            "/checkout",
+            Some(json!({ "method": METHOD })),
+            Some(&buyer),
+            &[("idempotency-key", "same-key")],
+        )
+    };
+    let (r1, r2) = tokio::join!(send(), send());
+    let mut statuses = [r1.status, r2.status];
+    statuses.sort();
+    match statuses {
+        [201, 201] => assert_eq!(r1.json, r2.json),
+        [201, 409] => {
+            let loser = if r1.status == 409 { &r1 } else { &r2 };
+            assert_eq!(loser.json["error"]["code"], "checkout_in_progress");
+        }
+        other => panic!("unexpected {other:?}: {} / {}", r1.json, r2.json),
+    }
+    assert_eq!(count(&app, "SELECT count(*) FROM checkouts").await, 1);
+    assert_eq!(app.reserved(l.variant_id).await, 2);
+    assert_eq!(app.fake.calls("initiate"), 1);
+}
+
+#[sqlx::test]
+async fn replay_of_paid_checkout_is_not_pending(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let l = listing(&app, 100_000, 5).await;
+    let (_, buyer) = app.sign_up_verified(BUYER).await;
+    app.set_cart(&buyer, l.variant_id, 1).await;
+    let send = || {
+        app.request_with_headers(
+            Method::POST,
+            "/checkout",
+            Some(json!({ "method": METHOD })),
+            Some(&buyer),
+            &[("idempotency-key", "k1")],
+        )
+    };
+    assert_eq!(send().await.status, 201);
+    sqlx::query("UPDATE checkouts SET status = 'paid', paid_at = now()")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let res = send().await;
+    assert_eq!(res.status, 409, "{}", res.json);
+    assert_eq!(res.json["error"]["code"], "checkout_not_pending");
+    assert!(res.json.get("payment_url").is_none());
+}
+
+#[sqlx::test]
+async fn failure_to_store_payment_page_expires_checkout(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let l = listing(&app, 100_000, 5).await;
+    let (_, buyer) = app.sign_up_verified(BUYER).await;
+    app.set_cart(&buyer, l.variant_id, 2).await;
+    // Make saving the payment page fail after a successful initiate.
+    sqlx::raw_sql(
+        "CREATE FUNCTION fail_payment_url() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$; \
+         CREATE TRIGGER fail_payment_url BEFORE UPDATE OF payment_url ON checkouts \
+         FOR EACH ROW WHEN (NEW.payment_url IS NOT NULL) EXECUTE FUNCTION fail_payment_url();",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let res = app.checkout(&buyer, METHOD).await;
+    assert_eq!(app.fake.calls("initiate"), 1);
+    assert_failed_and_restored(&app, &l, &res).await;
 }
