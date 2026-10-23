@@ -5,6 +5,15 @@ use axum::{
 };
 use serde_json::json;
 
+/// A value that must never appear in logs or `Debug` output (e.g. a verification id).
+pub struct Redacted(pub String);
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("validation failed: {0}")]
@@ -15,6 +24,9 @@ pub enum AppError {
     InvalidCredentials,
     #[error("forbidden: {0}")]
     Forbidden(&'static str),
+    /// 403 `phone_unverified`, carrying the verification id to use with the code sent by SMS.
+    #[error("phone unverified")]
+    PhoneUnverified(Redacted),
     #[error("not found")]
     NotFound,
     #[error("conflict: {0}")]
@@ -40,6 +52,11 @@ impl IntoResponse for AppError {
                 (StatusCode::UNAUTHORIZED, body("invalid_credentials", "Phone number or password is incorrect"))
             }
             AppError::Forbidden(code) => (StatusCode::FORBIDDEN, body(code, "You are not allowed to do this")),
+            AppError::PhoneUnverified(Redacted(verification_id)) => {
+                let mut payload = body("phone_unverified", "Verify your phone number to continue");
+                payload["verification_id"] = json!(verification_id);
+                (StatusCode::FORBIDDEN, payload)
+            }
             AppError::NotFound => (StatusCode::NOT_FOUND, body("not_found", "Not found")),
             AppError::Conflict(code) => (StatusCode::CONFLICT, body(code, "Conflict with existing data")),
             AppError::Unprocessable(code, msg) => (StatusCode::UNPROCESSABLE_ENTITY, body(code, &msg)),

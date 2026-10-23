@@ -1,7 +1,8 @@
 use async_trait::async_trait;
-use rand::{Rng, rngs::OsRng};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use rand::{Rng, RngCore, rngs::OsRng};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -17,7 +18,7 @@ pub trait OtpSender: Send + Sync {
 }
 
 /// Development sender. Never logs the phone or the code; when `echo` is on
-/// (OTP_DEV_ECHO=1, refused in production) the code alone is written to stdout.
+/// (OTP_DEV_ECHO=1, development/test only) the code alone is written to stdout.
 pub struct LogOtpSender {
     pub echo: bool,
 }
@@ -32,6 +33,36 @@ impl OtpSender for LogOtpSender {
     }
 }
 
+/// Why a code is being issued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IssueReason {
+    /// Credentials were just set (sign-up, or a reclaim of an unverified account).
+    /// Earlier codes and verification ids are always superseded, even when throttled.
+    NewCredentials,
+    /// Sign-in with the correct password on an unverified account (credentials unchanged).
+    Resend,
+}
+
+/// The result of issuing a code. Holds secrets, so it has no `Debug`.
+pub struct Issued {
+    /// Returned to the client; only its SHA-256 is stored.
+    pub verification_id: String,
+    /// `Some` when the throttle allowed a send.
+    code_to_send: Option<String>,
+}
+
+impl Issued {
+    /// Hands the code to the SMS sender if this issuance was not throttled.
+    /// Call only after the issuing transaction has committed.
+    pub async fn deliver(&self, sender: &dyn OtpSender, user_id: Uuid, phone_e164: &str) -> Result<(), AppError> {
+        if let Some(code) = &self.code_to_send {
+            sender.send(phone_e164, code).await?;
+            tracing::info!(user_id = %user_id, "OTP sent to user");
+        }
+        Ok(())
+    }
+}
+
 fn hash_code(user_id: Uuid, code: &str) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(user_id.as_bytes());
@@ -39,59 +70,91 @@ fn hash_code(user_id: Uuid, code: &str) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
+fn hash_verification_id(verification_id: &str) -> Vec<u8> {
+    Sha256::digest(verification_id.as_bytes()).to_vec()
+}
+
+fn new_verification_id() -> String {
+    let mut raw = [0u8; 32];
+    OsRng.fill_bytes(&mut raw);
+    URL_SAFE_NO_PAD.encode(raw)
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Supersedes any live code for the user, stores a hash of a new 6-digit code and sends it.
-pub async fn issue_otp(
-    db: &PgPool,
-    sender: &dyn OtpSender,
-    user_id: Uuid,
-    phone_e164: &str,
-) -> Result<(), AppError> {
-    let code = format!("{:06}", OsRng.gen_range(0..1_000_000u32));
-    let mut tx = db.begin().await.map_err(anyhow::Error::from)?;
+/// Retires every outstanding code (and with it every verification id) for the user.
+pub async fn invalidate_otps(conn: &mut PgConnection, user_id: Uuid) -> Result<(), AppError> {
+    sqlx::query("UPDATE otp_codes SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL")
+        .bind(user_id)
+        .execute(conn)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
+/// Issues a verification inside the caller's transaction (which must also hold any
+/// credential change it is bound to). Deliver the code with [`Issued::deliver`] after commit.
+///
+/// - `NewCredentials`: always supersedes earlier codes and creates a new code + id.
+///   The send throttle only decides whether the sender is called.
+/// - `Resend`: when a send is allowed, same as above. When throttled, the live code
+///   is re-bound to a fresh verification id (the code already on the phone stays valid,
+///   the previous id stops working); if there is no live code, an unsent one is created.
+pub async fn issue_otp(conn: &mut PgConnection, user_id: Uuid, reason: IssueReason) -> Result<Issued, AppError> {
     // Serialise issuance per user so concurrent calls cannot slip past the throttle.
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
         .bind(user_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(anyhow::Error::from)?;
     let (recent, hourly): (i64, i64) = sqlx::query_as(
-        "SELECT count(*) FILTER (WHERE created_at > now() - make_interval(secs => $2)), \
-                count(*) FILTER (WHERE created_at > now() - interval '1 hour') \
+        "SELECT count(*) FILTER (WHERE sent_at > now() - make_interval(secs => $2)), \
+                count(*) FILTER (WHERE sent_at > now() - interval '1 hour') \
          FROM otp_codes WHERE user_id = $1",
     )
     .bind(user_id)
     .bind(OTP_MIN_INTERVAL_SECS)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await
     .map_err(anyhow::Error::from)?;
-    if recent > 0 || hourly >= OTP_MAX_PER_HOUR {
-        // Throttled: callers keep their normal response, nothing new is sent.
-        return Ok(());
-    }
-    sqlx::query("UPDATE otp_codes SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL")
+    let sendable = recent == 0 && hourly < OTP_MAX_PER_HOUR;
+    let verification_id = new_verification_id();
+
+    if reason == IssueReason::Resend && !sendable {
+        let rebound: Option<Uuid> = sqlx::query_scalar(
+            "UPDATE otp_codes SET verification_hash = $2 WHERE id = ( \
+                 SELECT id FROM otp_codes \
+                 WHERE user_id = $1 AND consumed_at IS NULL AND expires_at > now() \
+                 ORDER BY created_at DESC LIMIT 1) \
+             RETURNING id",
+        )
         .bind(user_id)
-        .execute(&mut *tx)
+        .bind(hash_verification_id(&verification_id))
+        .fetch_optional(&mut *conn)
         .await
         .map_err(anyhow::Error::from)?;
+        if rebound.is_some() {
+            return Ok(Issued { verification_id, code_to_send: None });
+        }
+    }
+
+    invalidate_otps(conn, user_id).await?;
+    let code = format!("{:06}", OsRng.gen_range(0..1_000_000u32));
     sqlx::query(
-        "INSERT INTO otp_codes (user_id, code_hash, expires_at) \
-         VALUES ($1, $2, now() + make_interval(mins => $3))",
+        "INSERT INTO otp_codes (user_id, code_hash, verification_hash, expires_at, sent_at) \
+         VALUES ($1, $2, $3, now() + make_interval(mins => $4), CASE WHEN $5 THEN now() END)",
     )
     .bind(user_id)
     .bind(hash_code(user_id, &code))
+    .bind(hash_verification_id(&verification_id))
     .bind(OTP_MINUTES)
-    .execute(&mut *tx)
+    .bind(sendable)
+    .execute(&mut *conn)
     .await
     .map_err(anyhow::Error::from)?;
-    tx.commit().await.map_err(anyhow::Error::from)?;
-
-    sender.send(phone_e164, &code).await?;
-    tracing::info!(user_id = %user_id, "OTP sent to user");
-    Ok(())
+    Ok(Issued { verification_id, code_to_send: sendable.then_some(code) })
 }
 
 fn invalid() -> AppError {
@@ -102,18 +165,19 @@ fn locked() -> AppError {
     AppError::Unprocessable("otp_locked", "Too many wrong codes. Request a new code".into())
 }
 
-/// Checks `code` against the user's live OTP. On success the code is consumed and
-/// the phone is marked verified. Every guess counts toward the 5-attempt cap.
-pub async fn verify_otp(db: &PgPool, user_id: Uuid, code: &str) -> Result<(), AppError> {
-    let row: Option<(Uuid, Vec<u8>, i32, bool)> = sqlx::query_as(
-        "SELECT id, code_hash, attempts, expires_at < now() FROM otp_codes \
-         WHERE user_id = $1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1",
+/// Checks `code` against the live, sent OTP bound to `verification_id`. On success the
+/// code is consumed, the phone is marked verified and the user's id is returned.
+/// Every guess counts toward the 5-attempt cap.
+pub async fn verify_otp(db: &PgPool, verification_id: &str, code: &str) -> Result<Uuid, AppError> {
+    let row: Option<(Uuid, Uuid, Vec<u8>, i32, bool)> = sqlx::query_as(
+        "SELECT id, user_id, code_hash, attempts, expires_at < now() FROM otp_codes \
+         WHERE verification_hash = $1 AND consumed_at IS NULL AND sent_at IS NOT NULL",
     )
-    .bind(user_id)
+    .bind(hash_verification_id(verification_id))
     .fetch_optional(db)
     .await
     .map_err(anyhow::Error::from)?;
-    let Some((otp_id, code_hash, attempts, expired)) = row else {
+    let Some((otp_id, user_id, code_hash, attempts, expired)) = row else {
         return Err(invalid());
     };
     if attempts >= OTP_MAX_ATTEMPTS {
@@ -139,6 +203,13 @@ pub async fn verify_otp(db: &PgPool, user_id: Uuid, code: &str) -> Result<(), Ap
     }
 
     let mut tx = db.begin().await.map_err(anyhow::Error::from)?;
+    // Same lock as credential changes: a concurrent reclaim either commits first (and this
+    // code is already superseded) or waits until the phone is verified (and then fails).
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
     let consumed = sqlx::query("UPDATE otp_codes SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL")
         .bind(otp_id)
         .execute(&mut *tx)
@@ -154,5 +225,5 @@ pub async fn verify_otp(db: &PgPool, user_id: Uuid, code: &str) -> Result<(), Ap
         .await
         .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
-    Ok(())
+    Ok(user_id)
 }

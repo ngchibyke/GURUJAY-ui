@@ -120,11 +120,14 @@ impl TestApp {
 
     /// Makes outstanding OTPs look older so the issue throttle window passes.
     pub async fn age_otps(&self, secs: i32) {
-        sqlx::query("UPDATE otp_codes SET created_at = created_at - make_interval(secs => $1)")
-            .bind(f64::from(secs))
-            .execute(&self.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE otp_codes SET created_at = created_at - make_interval(secs => $1), \
+                                  sent_at = sent_at - make_interval(secs => $1)",
+        )
+        .bind(f64::from(secs))
+        .execute(&self.pool)
+        .await
+        .unwrap();
     }
 
     /// The last OTP code sent to `phone` (any accepted format).
@@ -143,19 +146,28 @@ impl TestApp {
         .await
     }
 
+    pub async fn sign_in(&self, phone: &str, password: &str) -> TestResponse {
+        self.request(Method::POST, "/auth/sign-in", Some(json!({ "phone": phone, "password": password })), None)
+            .await
+    }
+
+    /// POST /auth/verify-phone with a verification id and code.
+    pub async fn verify(&self, verification_id: &Value, code: &str) -> TestResponse {
+        self.request(
+            Method::POST,
+            "/auth/verify-phone",
+            Some(json!({ "verification_id": verification_id, "code": code })),
+            None,
+        )
+        .await
+    }
+
     /// Signs up, verifies the phone with the emitted OTP, returns (user id, session token).
     pub async fn sign_up_verified(&self, phone: &str) -> (Uuid, String) {
         let res = self.sign_up(phone, TEST_PASSWORD).await;
         assert_eq!(res.status, 201, "sign-up failed: {}", res.json);
         let user_id: Uuid = res.json["user_id"].as_str().unwrap().parse().unwrap();
-        let verify = self
-            .request(
-                Method::POST,
-                "/auth/verify-phone",
-                Some(json!({ "user_id": user_id, "code": self.last_code(phone) })),
-                None,
-            )
-            .await;
+        let verify = self.verify(&res.json["verification_id"], &self.last_code(phone)).await;
         assert_eq!(verify.status, 200, "verify failed: {}", verify.json);
         (user_id, verify.json["token"].as_str().unwrap().to_string())
     }

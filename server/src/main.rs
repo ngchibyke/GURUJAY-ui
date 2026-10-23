@@ -63,11 +63,13 @@ async fn create_owner(state: AppState, args: &[String]) -> anyhow::Result<()> {
 
     let hash = blocking(move || hash_password(&password)).await.map_err(|e| anyhow::anyhow!("{e}"))?
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let id = insert_user(&state, &phone, &name, &hash).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut tx = state.db.begin().await?;
+    let id = insert_user(&mut tx, &state, &phone, &name, &hash).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     sqlx::query("UPDATE users SET role = 'owner', phone_verified_at = now() WHERE id = $1")
         .bind(id)
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     println!("{id}");
     Ok(())
 }
