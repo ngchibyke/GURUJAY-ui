@@ -325,3 +325,34 @@ async fn malformed_body_is_json_422(pool: PgPool) {
         .await;
     assert_err(&old_shape, 422, "validation_failed");
 }
+
+#[sqlx::test]
+async fn sign_in_locked_after_10_failures(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    app.sign_up_verified(PHONE).await;
+    app.sign_up_verified("08022222222").await;
+    for _ in 0..10 {
+        assert_err(&app.sign_in(PHONE, "not-the-password").await, 401, "invalid_credentials");
+    }
+    // The 11th attempt is refused before the password is checked, even when it is right.
+    assert_err(&app.sign_in(PHONE, TEST_PASSWORD).await, 429, "too_many_attempts");
+    // Any accepted format of the same phone shares the counter; other phones do not.
+    assert_err(&app.sign_in("+234 803 123 4567", TEST_PASSWORD).await, 429, "too_many_attempts");
+    assert_eq!(app.sign_in("08022222222", TEST_PASSWORD).await.status, 200);
+
+    // The window is a rolling hour.
+    sqlx::query("UPDATE sign_in_failures SET at = at - interval '61 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(app.sign_in(PHONE, TEST_PASSWORD).await.status, 200);
+}
+
+#[sqlx::test]
+async fn sign_in_unknown_phone_is_capped_too(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    for _ in 0..10 {
+        assert_err(&app.sign_in("08077777777", "not-the-password").await, 401, "invalid_credentials");
+    }
+    assert_err(&app.sign_in("08077777777", "not-the-password").await, 429, "too_many_attempts");
+}

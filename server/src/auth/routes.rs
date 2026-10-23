@@ -14,7 +14,7 @@ use super::{
     password::{blocking, dummy_verify, hash_password, validate_password, verify_password},
     sessions::{create_session, revoke_session},
 };
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 
 use crate::{
     AppState,
@@ -120,13 +120,63 @@ async fn verify_phone(State(state): State<AppState>, AppJson(req): AppJson<Verif
     Ok(Json(json!({ "token": token })))
 }
 
+/// Failed sign-ins allowed per phone in a rolling hour.
+pub const MAX_SIGN_IN_FAILURES_PER_HOUR: i64 = 10;
+
+/// Checks the per-phone failure cap and, if under it, records this attempt as a failure up
+/// front (returns its row id). Serialised per phone with an advisory lock, so a parallel
+/// burst cannot overshoot the cap. The caller clears the row if the password turns out right.
+async fn reserve_sign_in_attempt(db: &PgPool, phone_idx: &[u8]) -> Result<i64, AppError> {
+    let mut tx = db.begin().await.map_err(anyhow::Error::from)?;
+    let lock_key = i64::from_be_bytes(phone_idx[..8].try_into().expect("blind index is 32 bytes"));
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(lock_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+    // Retention: failures only matter for an hour; drop older ones.
+    sqlx::query("DELETE FROM sign_in_failures WHERE at <= now() - interval '1 hour'")
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let failures: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sign_in_failures WHERE phone_idx = $1 AND at > now() - interval '1 hour'",
+    )
+    .bind(phone_idx)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?;
+    if failures >= MAX_SIGN_IN_FAILURES_PER_HOUR {
+        return Err(AppError::TooManyRequests("too_many_attempts"));
+    }
+    let id: i64 = sqlx::query_scalar("INSERT INTO sign_in_failures (phone_idx) VALUES ($1) RETURNING id")
+        .bind(phone_idx)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
+    Ok(id)
+}
+
+async fn clear_sign_in_attempt(db: &PgPool, attempt_id: i64) -> Result<(), AppError> {
+    sqlx::query("DELETE FROM sign_in_failures WHERE id = $1")
+        .bind(attempt_id)
+        .execute(db)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(())
+}
+
 async fn sign_in(State(state): State<AppState>, AppJson(req): AppJson<SignIn>) -> Result<Json<Value>, AppError> {
     let phone = normalize_ng_phone(&req.phone)?;
+    let phone_idx = blind_index(&state.index_key, &phone);
+    // Checked before any Argon2 work.
+    let attempt_id = reserve_sign_in_attempt(&state.db, &phone_idx).await?;
     let row: Option<(Uuid, String, bool)> = sqlx::query_as(
         "SELECT id, password_hash, phone_verified_at IS NOT NULL FROM users \
          WHERE phone_idx = $1 AND deleted_at IS NULL",
     )
-    .bind(blind_index(&state.index_key, &phone))
+    .bind(&phone_idx)
     .fetch_optional(&state.db)
     .await
     .map_err(anyhow::Error::from)?;
@@ -143,8 +193,10 @@ async fn sign_in(State(state): State<AppState>, AppJson(req): AppJson<SignIn>) -
         }
     };
     let Some((user_id, hash, verified)) = account else {
+        // The reserved row stays: it is this failure.
         return Err(AppError::InvalidCredentials);
     };
+    clear_sign_in_attempt(&state.db, attempt_id).await?;
 
     if !verified {
         let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
