@@ -1,0 +1,10 @@
+# cargo-audit settings for the server crate.
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (rsa, Marvin timing attack; no patched release exists).
+    # `rsa` appears in Cargo.lock only because sqlx lists its MySQL driver as an
+    # optional dependency. We enable only the Postgres driver, so `rsa` is never
+    # compiled: `cargo tree -i rsa --target all -e all` prints nothing.
+    # Revisit if a MySQL driver or any RSA usage is ever added.
+    "RUSTSEC-2023-0071",
+]
