@@ -48,29 +48,52 @@ fn body(code: &str, message: &str) -> serde_json::Value {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, payload) = match self {
-            AppError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, body("validation_failed", &msg)),
-            AppError::Unauthorized => (StatusCode::UNAUTHORIZED, body("unauthorized", "Authentication required")),
-            AppError::InvalidCredentials => {
-                (StatusCode::UNAUTHORIZED, body("invalid_credentials", "Phone number or password is incorrect"))
-            }
-            AppError::Forbidden(code) => (StatusCode::FORBIDDEN, body(code, "You are not allowed to do this")),
+            AppError::Validation(msg) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                body("validation_failed", &msg),
+            ),
+            AppError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                body("unauthorized", "Authentication required"),
+            ),
+            AppError::InvalidCredentials => (
+                StatusCode::UNAUTHORIZED,
+                body(
+                    "invalid_credentials",
+                    "Phone number or password is incorrect",
+                ),
+            ),
+            AppError::Forbidden(code) => (
+                StatusCode::FORBIDDEN,
+                body(code, "You are not allowed to do this"),
+            ),
             AppError::PhoneUnverified(Redacted(verification_id)) => {
                 let mut payload = body("phone_unverified", "Verify your phone number to continue");
                 payload["verification_id"] = json!(verification_id);
                 (StatusCode::FORBIDDEN, payload)
             }
             AppError::NotFound => (StatusCode::NOT_FOUND, body("not_found", "Not found")),
-            AppError::MethodNotAllowed => {
-                (StatusCode::METHOD_NOT_ALLOWED, body("method_not_allowed", "Method not allowed"))
+            AppError::MethodNotAllowed => (
+                StatusCode::METHOD_NOT_ALLOWED,
+                body("method_not_allowed", "Method not allowed"),
+            ),
+            AppError::Conflict(code) => (
+                StatusCode::CONFLICT,
+                body(code, "Conflict with existing data"),
+            ),
+            AppError::Unprocessable(code, msg) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, body(code, &msg))
             }
-            AppError::Conflict(code) => (StatusCode::CONFLICT, body(code, "Conflict with existing data")),
-            AppError::Unprocessable(code, msg) => (StatusCode::UNPROCESSABLE_ENTITY, body(code, &msg)),
-            AppError::TooManyRequests(code) => {
-                (StatusCode::TOO_MANY_REQUESTS, body(code, "Too many attempts, try again later"))
-            }
+            AppError::TooManyRequests(code) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                body(code, "Too many attempts, try again later"),
+            ),
             AppError::Internal(err) => {
                 tracing::error!(error = ?err, "internal error");
-                (StatusCode::INTERNAL_SERVER_ERROR, body("internal", "Something went wrong"))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    body("internal", "Something went wrong"),
+                )
             }
         };
         (status, Json(payload)).into_response()

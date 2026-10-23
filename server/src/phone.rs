@@ -1,7 +1,10 @@
 use crate::error::AppError;
 
 fn invalid() -> AppError {
-    AppError::Unprocessable("invalid_phone", "Enter a valid Nigerian phone number".to_string())
+    AppError::Unprocessable(
+        "invalid_phone",
+        "Enter a valid Nigerian phone number".to_string(),
+    )
 }
 
 /// Normalizes a Nigerian mobile number to E.164 (`+234XXXXXXXXXX`).
@@ -21,7 +24,11 @@ pub fn normalize_ng_phone(raw: &str) -> Result<String, AppError> {
     let valid = national.len() == 10
         && national.bytes().all(|b| b.is_ascii_digit())
         && matches!(national.as_bytes()[0], b'7' | b'8' | b'9');
-    if valid { Ok(format!("+234{national}")) } else { Err(invalid()) }
+    if valid {
+        Ok(format!("+234{national}"))
+    } else {
+        Err(invalid())
+    }
 }
 
 #[cfg(test)]
@@ -30,13 +37,27 @@ mod tests {
 
     #[test]
     fn normalizes_formats() {
-        for raw in ["08031234567", "+2348031234567", "2348031234567", "0803 123 4567", "0803-123-4567"] {
+        for raw in [
+            "08031234567",
+            "+2348031234567",
+            "2348031234567",
+            "0803 123 4567",
+            "0803-123-4567",
+        ] {
             assert_eq!(normalize_ng_phone(raw).unwrap(), "+2348031234567");
         }
     }
     #[test]
     fn rejects_bad_numbers() {
-        for raw in ["", "12345", "0803123456", "080312345678", "+447911123456", "08O31234567", "05031234567"] {
+        for raw in [
+            "",
+            "12345",
+            "0803123456",
+            "080312345678",
+            "+447911123456",
+            "08O31234567",
+            "05031234567",
+        ] {
             assert!(normalize_ng_phone(raw).is_err());
         }
     }

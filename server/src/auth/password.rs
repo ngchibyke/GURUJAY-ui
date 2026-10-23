@@ -14,10 +14,14 @@ pub const MAX_PASSWORD_LEN: usize = 128;
 pub fn validate_password(password: &str) -> Result<(), AppError> {
     let len = password.chars().count();
     if len < MIN_PASSWORD_LEN {
-        return Err(AppError::Validation(format!("Password must be at least {MIN_PASSWORD_LEN} characters")));
+        return Err(AppError::Validation(format!(
+            "Password must be at least {MIN_PASSWORD_LEN} characters"
+        )));
     }
     if len > MAX_PASSWORD_LEN {
-        return Err(AppError::Validation(format!("Password must be at most {MAX_PASSWORD_LEN} characters")));
+        return Err(AppError::Validation(format!(
+            "Password must be at most {MAX_PASSWORD_LEN} characters"
+        )));
     }
     Ok(())
 }
@@ -33,7 +37,9 @@ pub fn hash_password(password: &str) -> Result<String, AppError> {
 
 pub fn verify_password(password: &str, phc: &str) -> bool {
     match PasswordHash::new(phc) {
-        Ok(parsed) => Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok(),
+        Ok(parsed) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok(),
         Err(_) => false,
     }
 }
@@ -47,7 +53,9 @@ pub fn dummy_verify(password: &str) {
 }
 
 /// Runs a CPU-heavy closure off the async runtime threads.
-pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, AppError> {
+pub async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, AppError> {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| AppError::Internal(anyhow!("blocking task failed: {e}")))

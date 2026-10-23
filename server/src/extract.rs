@@ -20,7 +20,9 @@ where
     async fn from_request(req: Request, state: &S) -> Result<Self, AppError> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(AppJson(value)),
-            Err(_) => Err(AppError::Validation("Request body is missing or invalid".into())),
+            Err(_) => Err(AppError::Validation(
+                "Request body is missing or invalid".into(),
+            )),
         }
     }
 }

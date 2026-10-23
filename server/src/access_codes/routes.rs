@@ -47,11 +47,21 @@ async fn create(
     AppJson(body): AppJson<CreateBody>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     user.require_role(Role::Owner)?;
-    let (id, code) = service::create(&state.db, user.id, body.label, body.max_uses, body.expires_at).await?;
+    let (id, code) = service::create(
+        &state.db,
+        user.id,
+        body.label,
+        body.max_uses,
+        body.expires_at,
+    )
+    .await?;
     Ok((StatusCode::CREATED, Json(json!({ "id": id, "code": code }))))
 }
 
-async fn list(State(state): State<AppState>, user: AuthUser) -> Result<Json<Vec<AccessCodeSummary>>, AppError> {
+async fn list(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<Vec<AccessCodeSummary>>, AppError> {
     user.require_role(Role::Owner)?;
     Ok(Json(service::list(&state.db).await?))
 }

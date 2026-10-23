@@ -26,7 +26,9 @@ async fn sign_up_then_verify_returns_token(pool: PgPool) {
     let vid = signup.json["verification_id"].as_str().unwrap();
     assert_eq!(vid.len(), 43, "32 bytes, base64url without padding");
 
-    let verify = app.verify(&signup.json["verification_id"], &app.last_code(PHONE)).await;
+    let verify = app
+        .verify(&signup.json["verification_id"], &app.last_code(PHONE))
+        .await;
     assert_eq!(verify.status, 200, "body: {}", verify.json);
     let token = verify.json["token"].as_str().unwrap();
     assert!(!token.is_empty());
@@ -57,7 +59,10 @@ async fn verification_id_is_stored_only_as_hash(pool: PgPool) {
 async fn sign_up_stores_phone_encrypted(pool: PgPool) {
     let app = TestApp::new(pool.clone()).await;
     assert_eq!(app.sign_up(PHONE, TEST_PASSWORD).await.status, 201);
-    let enc: Vec<u8> = sqlx::query_scalar("SELECT phone_enc FROM users").fetch_one(&pool).await.unwrap();
+    let enc: Vec<u8> = sqlx::query_scalar("SELECT phone_enc FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(!enc.is_empty());
     let needle = b"8031234567";
     assert!(!enc.windows(needle.len()).any(|w| w == needle));
@@ -112,7 +117,9 @@ async fn sign_in_unverified_is_403(pool: PgPool) {
     assert_eq!(live, 1);
 
     // The sign-up id no longer works; the id from sign-in does, with the code already sent.
-    let stale = app.verify(&signup.json["verification_id"], &app.last_code(PHONE)).await;
+    let stale = app
+        .verify(&signup.json["verification_id"], &app.last_code(PHONE))
+        .await;
     assert_err(&stale, 422, "otp_invalid");
     let ok = app.verify(vid, &app.last_code(PHONE)).await;
     assert_eq!(ok.status, 200, "body: {}", ok.json);
@@ -148,7 +155,9 @@ async fn otp_expired_rejected(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let res = app.verify(&signup.json["verification_id"], &app.last_code(PHONE)).await;
+    let res = app
+        .verify(&signup.json["verification_id"], &app.last_code(PHONE))
+        .await;
     assert_err(&res, 422, "otp_expired");
 }
 
@@ -156,8 +165,15 @@ async fn otp_expired_rejected(pool: PgPool) {
 async fn sign_out_revokes_token(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let (_, token) = app.sign_up_verified(PHONE).await;
-    assert_eq!(app.request(Method::GET, "/me", None, Some(&token)).await.status, 200);
-    let out = app.request(Method::POST, "/auth/sign-out", None, Some(&token)).await;
+    assert_eq!(
+        app.request(Method::GET, "/me", None, Some(&token))
+            .await
+            .status,
+        200
+    );
+    let out = app
+        .request(Method::POST, "/auth/sign-out", None, Some(&token))
+        .await;
     assert_eq!(out.status, 204);
     let me = app.request(Method::GET, "/me", None, Some(&token)).await;
     assert_err(&me, 401, "unauthorized");
@@ -187,7 +203,10 @@ async fn password_never_in_logs(pool: PgPool) {
     app.verify(&res.json["verification_id"], &code).await;
     app.sign_in("08031234567", password).await;
 
-    assert!(logs_contain("response"), "expected request logs to be captured");
+    assert!(
+        logs_contain("response"),
+        "expected request logs to be captured"
+    );
     assert!(!logs_contain(password));
     assert!(!logs_contain("8031234567"));
     assert!(!logs_contain(&code));
@@ -203,13 +222,22 @@ async fn unverified_signup_can_be_reclaimed(pool: PgPool) {
     let second = app.sign_up("+234 803 123 4567", "second-password-2").await;
     assert_eq!(second.status, 201);
     assert_eq!(first.json["user_id"], second.json["user_id"]);
-    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users").fetch_one(&pool).await.unwrap();
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(users, 1);
 
-    let verify = app.verify(&second.json["verification_id"], &app.last_code(PHONE)).await;
+    let verify = app
+        .verify(&second.json["verification_id"], &app.last_code(PHONE))
+        .await;
     assert_eq!(verify.status, 200);
     assert_eq!(app.sign_in(PHONE, "second-password-2").await.status, 200);
-    assert_err(&app.sign_in(PHONE, "first-password-1").await, 401, "invalid_credentials");
+    assert_err(
+        &app.sign_in(PHONE, "first-password-1").await,
+        401,
+        "invalid_credentials",
+    );
 }
 
 #[sqlx::test]
@@ -226,14 +254,26 @@ async fn reclaim_invalidates_previous_verification(pool: PgPool) {
     assert_eq!(app.otp.sent_count(), 2);
     let code2 = app.last_code(PHONE);
 
-    assert_err(&app.verify(&a.json["verification_id"], &code1).await, 422, "otp_invalid");
+    assert_err(
+        &app.verify(&a.json["verification_id"], &code1).await,
+        422,
+        "otp_invalid",
+    );
     // The old id cannot be paired with the newest code either.
-    assert_err(&app.verify(&a.json["verification_id"], &code2).await, 422, "otp_invalid");
+    assert_err(
+        &app.verify(&a.json["verification_id"], &code2).await,
+        422,
+        "otp_invalid",
+    );
 
     let ok = app.verify(&b.json["verification_id"], &code2).await;
     assert_eq!(ok.status, 200, "body: {}", ok.json);
     assert_eq!(app.sign_in(PHONE, "attacker-password-2").await.status, 200);
-    assert_err(&app.sign_in(PHONE, "victim-password-1").await, 401, "invalid_credentials");
+    assert_err(
+        &app.sign_in(PHONE, "victim-password-1").await,
+        401,
+        "invalid_credentials",
+    );
 }
 
 #[sqlx::test]
@@ -246,15 +286,25 @@ async fn reclaim_during_throttle_invalidates_old_code(pool: PgPool) {
     assert_eq!(b.status, 201);
     assert_eq!(app.otp.sent_count(), 1);
     // ...but the victim's code and id are dead, and code1 does not unlock B's id either.
-    assert_err(&app.verify(&a.json["verification_id"], &code1).await, 422, "otp_invalid");
-    assert_err(&app.verify(&b.json["verification_id"], &code1).await, 422, "otp_invalid");
+    assert_err(
+        &app.verify(&a.json["verification_id"], &code1).await,
+        422,
+        "otp_invalid",
+    );
+    assert_err(
+        &app.verify(&b.json["verification_id"], &code1).await,
+        422,
+        "otp_invalid",
+    );
 
     // Once the throttle allows, signing in with B's password sends a fresh code.
     app.age_otps(120).await;
     let resend = app.sign_in(PHONE, "attacker-password-2").await;
     assert_err(&resend, 403, "phone_unverified");
     assert_eq!(app.otp.sent_count(), 2);
-    let ok = app.verify(&resend.json["verification_id"], &app.last_code(PHONE)).await;
+    let ok = app
+        .verify(&resend.json["verification_id"], &app.last_code(PHONE))
+        .await;
     assert_eq!(ok.status, 200, "body: {}", ok.json);
 }
 
@@ -267,11 +317,25 @@ async fn cross_user_code_is_invalid(pool: PgPool) {
     let y_code = app.last_code("08022222222");
     // Codes are random; a 1-in-a-million collision would make the pairing legitimately valid.
     assert_ne!(x_code, y_code, "random codes collided; re-run");
-    assert_err(&app.verify(&y.json["verification_id"], &x_code).await, 422, "otp_invalid");
-    assert_err(&app.verify(&x.json["verification_id"], &y_code).await, 422, "otp_invalid");
+    assert_err(
+        &app.verify(&y.json["verification_id"], &x_code).await,
+        422,
+        "otp_invalid",
+    );
+    assert_err(
+        &app.verify(&x.json["verification_id"], &y_code).await,
+        422,
+        "otp_invalid",
+    );
     // Each id still verifies with its own code.
-    assert_eq!(app.verify(&x.json["verification_id"], &x_code).await.status, 200);
-    assert_eq!(app.verify(&y.json["verification_id"], &y_code).await.status, 200);
+    assert_eq!(
+        app.verify(&x.json["verification_id"], &x_code).await.status,
+        200
+    );
+    assert_eq!(
+        app.verify(&y.json["verification_id"], &y_code).await.status,
+        200
+    );
 }
 
 #[sqlx::test]
@@ -280,7 +344,11 @@ async fn otp_issue_is_throttled(pool: PgPool) {
     assert_eq!(app.sign_up(PHONE, TEST_PASSWORD).await.status, 201);
     assert_eq!(app.otp.sent_count(), 1);
     for _ in 0..3 {
-        assert_err(&app.sign_in(PHONE, TEST_PASSWORD).await, 403, "phone_unverified");
+        assert_err(
+            &app.sign_in(PHONE, TEST_PASSWORD).await,
+            403,
+            "phone_unverified",
+        );
     }
     assert_eq!(app.otp.sent_count(), 1, "sign-ins within 60s must not send");
 
@@ -298,20 +366,36 @@ async fn otp_issue_is_throttled(pool: PgPool) {
     app.age_otps(120).await;
     let res = app.sign_in(PHONE, TEST_PASSWORD).await;
     assert_err(&res, 403, "phone_unverified");
-    assert_eq!(app.otp.sent_count(), 5, "6th OTP within an hour must be skipped");
+    assert_eq!(
+        app.otp.sent_count(),
+        5,
+        "6th OTP within an hour must be skipped"
+    );
 }
 
 #[sqlx::test]
 async fn malformed_body_is_json_422(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let missing = app
-        .request(Method::POST, "/auth/sign-up", Some(json!({ "phone": PHONE, "display_name": "Ada" })), None)
+        .request(
+            Method::POST,
+            "/auth/sign-up",
+            Some(json!({ "phone": PHONE, "display_name": "Ada" })),
+            None,
+        )
         .await;
     assert_err(&missing, 422, "validation_failed");
-    let garbage = app.request_raw(Method::POST, "/auth/sign-up", "not json{").await;
+    let garbage = app
+        .request_raw(Method::POST, "/auth/sign-up", "not json{")
+        .await;
     assert_err(&garbage, 422, "validation_failed");
     let no_vid = app
-        .request(Method::POST, "/auth/verify-phone", Some(json!({ "code": "123456" })), None)
+        .request(
+            Method::POST,
+            "/auth/verify-phone",
+            Some(json!({ "code": "123456" })),
+            None,
+        )
         .await;
     assert_err(&no_vid, 422, "validation_failed");
     // The old body shape is refused: user_id no longer identifies the attempt.
@@ -332,12 +416,24 @@ async fn sign_in_locked_after_10_failures(pool: PgPool) {
     app.sign_up_verified(PHONE).await;
     app.sign_up_verified("08022222222").await;
     for _ in 0..10 {
-        assert_err(&app.sign_in(PHONE, "not-the-password").await, 401, "invalid_credentials");
+        assert_err(
+            &app.sign_in(PHONE, "not-the-password").await,
+            401,
+            "invalid_credentials",
+        );
     }
     // The 11th attempt is refused before the password is checked, even when it is right.
-    assert_err(&app.sign_in(PHONE, TEST_PASSWORD).await, 429, "too_many_attempts");
+    assert_err(
+        &app.sign_in(PHONE, TEST_PASSWORD).await,
+        429,
+        "too_many_attempts",
+    );
     // Any accepted format of the same phone shares the counter; other phones do not.
-    assert_err(&app.sign_in("+234 803 123 4567", TEST_PASSWORD).await, 429, "too_many_attempts");
+    assert_err(
+        &app.sign_in("+234 803 123 4567", TEST_PASSWORD).await,
+        429,
+        "too_many_attempts",
+    );
     assert_eq!(app.sign_in("08022222222", TEST_PASSWORD).await.status, 200);
 
     // The window is a rolling hour.
@@ -352,7 +448,15 @@ async fn sign_in_locked_after_10_failures(pool: PgPool) {
 async fn sign_in_unknown_phone_is_capped_too(pool: PgPool) {
     let app = TestApp::new(pool).await;
     for _ in 0..10 {
-        assert_err(&app.sign_in("08077777777", "not-the-password").await, 401, "invalid_credentials");
+        assert_err(
+            &app.sign_in("08077777777", "not-the-password").await,
+            401,
+            "invalid_credentials",
+        );
     }
-    assert_err(&app.sign_in("08077777777", "not-the-password").await, 429, "too_many_attempts");
+    assert_err(
+        &app.sign_in("08077777777", "not-the-password").await,
+        429,
+        "too_many_attempts",
+    );
 }

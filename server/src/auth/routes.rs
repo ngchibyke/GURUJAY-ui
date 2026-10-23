@@ -103,7 +103,15 @@ pub async fn create_owner_account(
         .await
         .map_err(anyhow::Error::from)?;
     // No actor: the CLI runs with database access, not as a signed-in user. No PII in detail.
-    audit::record(&mut tx, None, "user.owner_created", "user", Some(id), json!({ "via": "cli" })).await?;
+    audit::record(
+        &mut tx,
+        None,
+        "user.owner_created",
+        "user",
+        Some(id),
+        json!({ "via": "cli" }),
+    )
+    .await?;
     tx.commit().await.map_err(anyhow::Error::from)?;
     Ok(id)
 }
@@ -111,7 +119,9 @@ pub async fn create_owner_account(
 pub fn validate_display_name(name: &str) -> Result<String, AppError> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 80 {
-        return Err(AppError::Validation("Display name must be 1 to 80 characters".into()));
+        return Err(AppError::Validation(
+            "Display name must be 1 to 80 characters".into(),
+        ));
     }
     Ok(name.to_string())
 }
@@ -132,10 +142,16 @@ async fn sign_up(
     let issued = issue_otp(&mut tx, user_id, IssueReason::NewCredentials).await?;
     tx.commit().await.map_err(anyhow::Error::from)?;
     issued.deliver(state.otp.as_ref(), user_id, &phone).await?;
-    Ok((StatusCode::CREATED, Json(json!({ "user_id": user_id, "verification_id": issued.verification_id }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "user_id": user_id, "verification_id": issued.verification_id })),
+    ))
 }
 
-async fn verify_phone(State(state): State<AppState>, AppJson(req): AppJson<VerifyPhone>) -> Result<Json<Value>, AppError> {
+async fn verify_phone(
+    State(state): State<AppState>,
+    AppJson(req): AppJson<VerifyPhone>,
+) -> Result<Json<Value>, AppError> {
     let user_id = verify_otp(&state.db, req.verification_id.trim(), req.code.trim()).await?;
     let token = create_session(&state.db, user_id).await?;
     Ok(Json(json!({ "token": token })))
@@ -170,11 +186,12 @@ async fn reserve_sign_in_attempt(db: &PgPool, phone_idx: &[u8]) -> Result<i64, A
     if failures >= MAX_SIGN_IN_FAILURES_PER_HOUR {
         return Err(AppError::TooManyRequests("too_many_attempts"));
     }
-    let id: i64 = sqlx::query_scalar("INSERT INTO sign_in_failures (phone_idx) VALUES ($1) RETURNING id")
-        .bind(phone_idx)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let id: i64 =
+        sqlx::query_scalar("INSERT INTO sign_in_failures (phone_idx) VALUES ($1) RETURNING id")
+            .bind(phone_idx)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
     Ok(id)
 }
@@ -188,7 +205,10 @@ async fn clear_sign_in_attempt(db: &PgPool, attempt_id: i64) -> Result<(), AppEr
     Ok(())
 }
 
-async fn sign_in(State(state): State<AppState>, AppJson(req): AppJson<SignIn>) -> Result<Json<Value>, AppError> {
+async fn sign_in(
+    State(state): State<AppState>,
+    AppJson(req): AppJson<SignIn>,
+) -> Result<Json<Value>, AppError> {
     let phone = normalize_ng_phone(&req.phone)?;
     let phone_idx = blind_index(&state.index_key, &phone);
     // Checked before any Argon2 work.
@@ -206,7 +226,9 @@ async fn sign_in(State(state): State<AppState>, AppJson(req): AppJson<SignIn>) -
     let account = match row {
         Some((id, hash, verified)) => {
             let checked = hash.clone();
-            blocking(move || verify_password(&password, &checked)).await?.then_some((id, hash, verified))
+            blocking(move || verify_password(&password, &checked))
+                .await?
+                .then_some((id, hash, verified))
         }
         None => {
             blocking(move || dummy_verify(&password)).await?;
@@ -223,12 +245,13 @@ async fn sign_in(State(state): State<AppState>, AppJson(req): AppJson<SignIn>) -
         let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
         // Only hand out a verification id if the credentials just checked are still current
         // (a concurrent reclaim may have replaced them).
-        let current: Option<String> =
-            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
-                .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(anyhow::Error::from)?;
+        let current: Option<String> = sqlx::query_scalar(
+            "SELECT password_hash FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
         if current.as_deref() != Some(hash.as_str()) {
             return Err(AppError::InvalidCredentials);
         }
@@ -241,7 +264,11 @@ async fn sign_in(State(state): State<AppState>, AppJson(req): AppJson<SignIn>) -
     Ok(Json(json!({ "token": token })))
 }
 
-async fn sign_out(State(state): State<AppState>, _user: AuthUser, headers: HeaderMap) -> Result<StatusCode, AppError> {
+async fn sign_out(
+    State(state): State<AppState>,
+    _user: AuthUser,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
     if let Some(token) = bearer_token(&headers) {
         revoke_session(&state.db, token).await?;
     }

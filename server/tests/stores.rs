@@ -17,7 +17,8 @@ fn store_body(name: &str) -> Value {
 }
 
 async fn create(app: &TestApp, token: &str, name: &str) -> common::TestResponse {
-    app.request(Method::POST, "/stores", Some(store_body(name)), Some(token)).await
+    app.request(Method::POST, "/stores", Some(store_body(name)), Some(token))
+        .await
 }
 
 #[sqlx::test]
@@ -28,15 +29,21 @@ async fn seller_creates_store(pool: PgPool) {
     assert_eq!(res.status, 201, "{}", res.json);
     assert_eq!(res.json["status"], "pending");
     let slug = res.json["slug"].as_str().unwrap();
-    let got = app.request(Method::GET, &format!("/stores/{slug}"), None, Some(&token)).await;
+    let got = app
+        .request(Method::GET, &format!("/stores/{slug}"), None, Some(&token))
+        .await;
     assert_eq!(got.status, 200);
     assert_eq!(got.json["name"], "Mama Put");
     assert!(got.json.get("pickup_address").is_none());
     // Pending stores are hidden from the public.
-    let public = app.request(Method::GET, &format!("/stores/{slug}"), None, None).await;
+    let public = app
+        .request(Method::GET, &format!("/stores/{slug}"), None, None)
+        .await;
     assert_eq!(public.status, 404);
     // The owner's own list includes the decrypted address.
-    let mine = app.request(Method::GET, "/stores/mine", None, Some(&token)).await;
+    let mine = app
+        .request(Method::GET, "/stores/mine", None, Some(&token))
+        .await;
     assert_eq!(mine.status, 200);
     assert_eq!(mine.json[0]["pickup_address"], "12 Unique Street, Wuse 2");
 }
@@ -68,7 +75,9 @@ async fn deleted_store_frees_slot(pool: PgPool) {
     let first = create(&app, &token, "One").await;
     assert_eq!(create(&app, &token, "Two").await.status, 201);
     let id = first.json["id"].as_str().unwrap();
-    let del = app.request(Method::DELETE, &format!("/stores/{id}"), None, Some(&token)).await;
+    let del = app
+        .request(Method::DELETE, &format!("/stores/{id}"), None, Some(&token))
+        .await;
     assert_eq!(del.status, 204);
     assert_eq!(create(&app, &token, "Three").await.status, 201);
 }
@@ -95,7 +104,9 @@ async fn non_fct_rejected(pool: PgPool) {
     let (_, token) = app.make_seller("08011111111").await;
     let mut body = store_body("Lagos Shop");
     body["pickup_state"] = json!("Lagos");
-    let res = app.request(Method::POST, "/stores", Some(body), Some(&token)).await;
+    let res = app
+        .request(Method::POST, "/stores", Some(body), Some(&token))
+        .await;
     assert_eq!(res.status, 422);
     assert_eq!(res.json["error"]["code"], "outside_service_area");
 }
@@ -107,7 +118,9 @@ async fn needs_a_delivery_method(pool: PgPool) {
     let mut body = store_body("No Delivery");
     body["delivery_courier"] = json!(false);
     body["delivery_self"] = json!(false);
-    let res = app.request(Method::POST, "/stores", Some(body), Some(&token)).await;
+    let res = app
+        .request(Method::POST, "/stores", Some(body), Some(&token))
+        .await;
     assert_eq!(res.status, 422);
     assert_eq!(res.json["error"]["code"], "validation_failed");
 }
@@ -120,19 +133,36 @@ async fn only_owner_can_edit(pool: PgPool) {
     let store = create(&app, &token, "Mine").await;
     let id = store.json["id"].as_str().unwrap();
     let patch = app
-        .request(Method::PATCH, &format!("/stores/{id}"), Some(json!({ "name": "Stolen" })), Some(&other))
+        .request(
+            Method::PATCH,
+            &format!("/stores/{id}"),
+            Some(json!({ "name": "Stolen" })),
+            Some(&other),
+        )
         .await;
     assert_eq!(patch.status, 404);
-    let del = app.request(Method::DELETE, &format!("/stores/{id}"), None, Some(&other)).await;
+    let del = app
+        .request(Method::DELETE, &format!("/stores/{id}"), None, Some(&other))
+        .await;
     assert_eq!(del.status, 404);
     // Owner can edit.
     let ok = app
-        .request(Method::PATCH, &format!("/stores/{id}"), Some(json!({ "name": "Renamed" })), Some(&token))
+        .request(
+            Method::PATCH,
+            &format!("/stores/{id}"),
+            Some(json!({ "name": "Renamed" })),
+            Some(&token),
+        )
         .await;
     assert_eq!(ok.status, 200, "{}", ok.json);
     assert_eq!(ok.json["name"], "Renamed");
     let bad = app
-        .request(Method::PATCH, &format!("/stores/{id}"), Some(json!({ "pickup_state": "Kano" })), Some(&token))
+        .request(
+            Method::PATCH,
+            &format!("/stores/{id}"),
+            Some(json!({ "pickup_state": "Kano" })),
+            Some(&token),
+        )
         .await;
     assert_eq!(bad.status, 422);
     assert_eq!(bad.json["error"]["code"], "outside_service_area");
@@ -143,7 +173,10 @@ async fn pickup_address_encrypted(pool: PgPool) {
     let app = TestApp::new(pool.clone()).await;
     let (_, token) = app.make_seller("08011111111").await;
     assert_eq!(create(&app, &token, "Secret").await.status, 201);
-    let raw: Vec<u8> = sqlx::query_scalar("SELECT pickup_address_enc FROM stores").fetch_one(&pool).await.unwrap();
+    let raw: Vec<u8> = sqlx::query_scalar("SELECT pickup_address_enc FROM stores")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let needle = b"Unique Street";
     assert!(!raw.windows(needle.len()).any(|w| w == needle));
 }
@@ -154,7 +187,10 @@ async fn slug_collision_suffixed(pool: PgPool) {
     let (_, a) = app.make_seller("08011111111").await;
     let (_, b) = app.make_seller("08022222222").await;
     assert_eq!(create(&app, &a, "Mama Put").await.json["slug"], "mama-put");
-    assert_eq!(create(&app, &b, "Mama  Put!").await.json["slug"], "mama-put-2");
+    assert_eq!(
+        create(&app, &b, "Mama  Put!").await.json["slug"],
+        "mama-put-2"
+    );
 }
 
 #[sqlx::test]
@@ -167,11 +203,18 @@ async fn revoked_code_keeps_existing_store(pool: PgPool) {
     let store = create(&app, &token, "Survivor").await;
     assert_eq!(store.status, 201);
     let revoke = app
-        .request(Method::POST, &format!("/admin/access-codes/{code_id}/revoke"), None, Some(&owner))
+        .request(
+            Method::POST,
+            &format!("/admin/access-codes/{code_id}/revoke"),
+            None,
+            Some(&owner),
+        )
         .await;
     assert_eq!(revoke.status, 204);
     let slug = store.json["slug"].as_str().unwrap();
-    let got = app.request(Method::GET, &format!("/stores/{slug}"), None, Some(&token)).await;
+    let got = app
+        .request(Method::GET, &format!("/stores/{slug}"), None, Some(&token))
+        .await;
     assert_eq!(got.status, 200);
     assert!(got.json.get("pickup_address").is_none());
 }
@@ -200,7 +243,9 @@ async fn reserved_slug_is_skipped(pool: PgPool) {
     let res = create(&app, &token, "Mine").await;
     assert_eq!(res.status, 201, "{}", res.json);
     assert_eq!(res.json["slug"], "mine-2");
-    let got = app.request(Method::GET, "/stores/mine-2", None, Some(&token)).await;
+    let got = app
+        .request(Method::GET, "/stores/mine-2", None, Some(&token))
+        .await;
     assert_eq!(got.status, 200);
     assert_eq!(got.json["name"], "Mine");
 }

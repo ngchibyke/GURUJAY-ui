@@ -45,18 +45,25 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = parse_command(&args)?;
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let config = Config::from_env()?;
-    let db = PgPoolOptions::new().max_connections(10).connect(&config.database_url).await?;
+    let db = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&config.database_url)
+        .await?;
     sqlx::migrate!("./migrations").run(&db).await?;
 
     let state = AppState {
         db,
         cipher: Arc::new(FieldCipher::new(config.field_key)),
         index_key: Arc::new(config.index_key),
-        otp: Arc::new(LogOtpSender { echo: config.otp_dev_echo }),
+        otp: Arc::new(LogOtpSender {
+            echo: config.otp_dev_echo,
+        }),
     };
 
     match command {
@@ -73,8 +80,13 @@ async fn serve(state: AppState, config: &Config) -> anyhow::Result<()> {
 }
 
 fn flag(args: &[String], name: &str) -> anyhow::Result<String> {
-    let pos = args.iter().position(|a| a == name).with_context(|| format!("missing {name}"))?;
-    args.get(pos + 1).cloned().with_context(|| format!("missing value for {name}"))
+    let pos = args
+        .iter()
+        .position(|a| a == name)
+        .with_context(|| format!("missing {name}"))?;
+    args.get(pos + 1)
+        .cloned()
+        .with_context(|| format!("missing value for {name}"))
 }
 
 /// `server create-owner --phone <phone> --name <name>`; password is read without echo.
@@ -84,9 +96,13 @@ async fn create_owner(state: AppState, args: &[String]) -> anyhow::Result<()> {
     let password = rpassword::prompt_password("Password: ")?;
     validate_password(&password).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let hash = blocking(move || hash_password(&password)).await.map_err(|e| anyhow::anyhow!("{e}"))?
+    let hash = blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let id = create_owner_account(&state, &phone, &name, &hash).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let id = create_owner_account(&state, &phone, &name, &hash)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("{id}");
     Ok(())
 }
@@ -102,13 +118,18 @@ mod tests {
     #[test]
     fn no_argument_and_serve_both_start_the_server() {
         assert!(matches!(parse_command(&args(&[])).unwrap(), Command::Serve));
-        assert!(matches!(parse_command(&args(&["serve"])).unwrap(), Command::Serve));
+        assert!(matches!(
+            parse_command(&args(&["serve"])).unwrap(),
+            Command::Serve
+        ));
     }
 
     #[test]
     fn create_owner_keeps_its_flags() {
         let cmd = parse_command(&args(&["create-owner", "--phone", "080", "--name", "N"])).unwrap();
-        let Command::CreateOwner(rest) = cmd else { panic!("expected create-owner") };
+        let Command::CreateOwner(rest) = cmd else {
+            panic!("expected create-owner")
+        };
         assert_eq!(rest, args(&["--phone", "080", "--name", "N"]));
     }
 

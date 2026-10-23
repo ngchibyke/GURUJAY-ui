@@ -58,6 +58,11 @@ impl FromRequestParts<AppState> for AuthUser {
         .await
         .map_err(anyhow::Error::from)?;
         let (id, role, is_seller, phone_verified) = row.ok_or(AppError::Unauthorized)?;
-        Ok(AuthUser { id, role, is_seller, phone_verified })
+        Ok(AuthUser {
+            id,
+            role,
+            is_seller,
+            phone_verified,
+        })
     }
 }

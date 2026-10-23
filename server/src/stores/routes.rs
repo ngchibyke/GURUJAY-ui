@@ -32,12 +32,18 @@ impl FromRequestParts<AppState> for MaybeAuth {
         if bearer_token(&parts.headers).is_none() {
             return Ok(MaybeAuth(None));
         }
-        Ok(MaybeAuth(Some(AuthUser::from_request_parts(parts, state).await?)))
+        Ok(MaybeAuth(Some(
+            AuthUser::from_request_parts(parts, state).await?,
+        )))
     }
 }
 
 pub(crate) fn require_seller(user: &AuthUser) -> Result<(), AppError> {
-    if user.is_seller { Ok(()) } else { Err(AppError::Forbidden("not_a_seller")) }
+    if user.is_seller {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden("not_a_seller"))
+    }
 }
 
 fn parse_id(key: &str) -> Result<Uuid, AppError> {
@@ -54,10 +60,18 @@ async fn create(
     Ok((StatusCode::CREATED, Json(store.owner_view(&state.cipher)?)))
 }
 
-async fn mine(State(state): State<AppState>, user: AuthUser) -> Result<Json<Vec<OwnerStore>>, AppError> {
+async fn mine(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<Vec<OwnerStore>>, AppError> {
     require_seller(&user)?;
     let stores = service::list_mine(&state.db, user.id).await?;
-    Ok(Json(stores.iter().map(|s| s.owner_view(&state.cipher)).collect::<Result<_, _>>()?))
+    Ok(Json(
+        stores
+            .iter()
+            .map(|s| s.owner_view(&state.cipher))
+            .collect::<Result<_, _>>()?,
+    ))
 }
 
 async fn show(
@@ -76,7 +90,8 @@ async fn update(
     AppJson(patch): AppJson<StorePatch>,
 ) -> Result<Json<OwnerStore>, AppError> {
     require_seller(&user)?;
-    let store = service::update_store(&state.db, &state.cipher, user.id, parse_id(&key)?, patch).await?;
+    let store =
+        service::update_store(&state.db, &state.cipher, user.id, parse_id(&key)?, patch).await?;
     Ok(Json(store.owner_view(&state.cipher)?))
 }
 

@@ -45,7 +45,10 @@ impl RecordingOtpSender {
 #[async_trait]
 impl OtpSender for RecordingOtpSender {
     async fn send(&self, phone_e164: &str, code: &str) -> Result<(), AppError> {
-        self.codes.lock().unwrap().insert(phone_e164.to_string(), code.to_string());
+        self.codes
+            .lock()
+            .unwrap()
+            .insert(phone_e164.to_string(), code.to_string());
         *self.sent.lock().unwrap() += 1;
         Ok(())
     }
@@ -72,7 +75,12 @@ impl TestApp {
             index_key: Arc::new(TEST_INDEX_KEY),
             otp: otp.clone(),
         };
-        Self { router: build_app(state.clone()), state, pool, otp }
+        Self {
+            router: build_app(state.clone()),
+            state,
+            pool,
+            otp,
+        }
     }
 
     pub async fn request(
@@ -116,7 +124,10 @@ impl TestApp {
         let res = self.router.clone().oneshot(req).await.expect("infallible");
         let status = res.status().as_u16();
         let bytes = res.into_body().collect().await.expect("body").to_bytes();
-        TestResponse { status, json: serde_json::from_slice(&bytes).unwrap_or(Value::Null) }
+        TestResponse {
+            status,
+            json: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        }
     }
 
     /// Makes outstanding OTPs look older so the issue throttle window passes.
@@ -148,8 +159,13 @@ impl TestApp {
     }
 
     pub async fn sign_in(&self, phone: &str, password: &str) -> TestResponse {
-        self.request(Method::POST, "/auth/sign-in", Some(json!({ "phone": phone, "password": password })), None)
-            .await
+        self.request(
+            Method::POST,
+            "/auth/sign-in",
+            Some(json!({ "phone": phone, "password": password })),
+            None,
+        )
+        .await
     }
 
     /// POST /auth/verify-phone with a verification id and code.
@@ -168,7 +184,9 @@ impl TestApp {
         let res = self.sign_up(phone, TEST_PASSWORD).await;
         assert_eq!(res.status, 201, "sign-up failed: {}", res.json);
         let user_id: Uuid = res.json["user_id"].as_str().unwrap().parse().unwrap();
-        let verify = self.verify(&res.json["verification_id"], &self.last_code(phone)).await;
+        let verify = self
+            .verify(&res.json["verification_id"], &self.last_code(phone))
+            .await;
         assert_eq!(verify.status, 200, "verify failed: {}", verify.json);
         (user_id, verify.json["token"].as_str().unwrap().to_string())
     }
@@ -198,7 +216,12 @@ impl TestApp {
     /// Owner creates an access code; returns (code id, plain code).
     pub async fn create_access_code(&self, owner_token: &str, body: Value) -> (Uuid, String) {
         let res = self
-            .request(Method::POST, "/admin/access-codes", Some(body), Some(owner_token))
+            .request(
+                Method::POST,
+                "/admin/access-codes",
+                Some(body),
+                Some(owner_token),
+            )
             .await;
         assert_eq!(res.status, 201, "create code failed: {}", res.json);
         (
@@ -208,8 +231,13 @@ impl TestApp {
     }
 
     pub async fn redeem(&self, token: &str, code: &str) -> TestResponse {
-        self.request(Method::POST, "/seller/redeem", Some(json!({ "code": code })), Some(token))
-            .await
+        self.request(
+            Method::POST,
+            "/seller/redeem",
+            Some(json!({ "code": code })),
+            Some(token),
+        )
+        .await
     }
 
     /// The owner's session token: signs in if the owner already exists, else creates it.

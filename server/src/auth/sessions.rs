@@ -31,10 +31,12 @@ pub async fn create_session(db: &PgPool, user_id: Uuid) -> Result<String, AppErr
 }
 
 pub async fn revoke_session(db: &PgPool, token: &str) -> Result<(), AppError> {
-    sqlx::query("UPDATE sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL")
-        .bind(hash_token(token))
-        .execute(db)
-        .await
-        .map_err(anyhow::Error::from)?;
+    sqlx::query(
+        "UPDATE sessions SET revoked_at = now() WHERE token_hash = $1 AND revoked_at IS NULL",
+    )
+    .bind(hash_token(token))
+    .execute(db)
+    .await
+    .map_err(anyhow::Error::from)?;
     Ok(())
 }

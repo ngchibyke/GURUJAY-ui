@@ -18,7 +18,9 @@ fn is_code_shape(code: &str) -> bool {
 async fn owner_creates_code_and_user_redeems(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let owner = app.make_owner().await;
-    let (_, code) = app.create_access_code(&owner, json!({ "label": "launch" })).await;
+    let (_, code) = app
+        .create_access_code(&owner, json!({ "label": "launch" }))
+        .await;
     assert!(is_code_shape(&code), "bad shape: {code}");
 
     let (_, token) = app.sign_up_verified("08011111111").await;
@@ -48,7 +50,12 @@ async fn non_owner_cannot_create_codes(pool: PgPool) {
     let (_, user) = app.sign_up_verified("08011111111").await;
     for token in [&user, &support] {
         let res = app
-            .request(Method::POST, "/admin/access-codes", Some(json!({})), Some(token))
+            .request(
+                Method::POST,
+                "/admin/access-codes",
+                Some(json!({})),
+                Some(token),
+            )
             .await;
         assert_eq!(res.status, 403);
         assert_eq!(res.json["error"]["code"], "forbidden");
@@ -59,8 +66,12 @@ async fn non_owner_cannot_create_codes(pool: PgPool) {
 async fn list_never_returns_plain_code(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let owner = app.make_owner().await;
-    let (_, code) = app.create_access_code(&owner, json!({ "label": "x" })).await;
-    let res = app.request(Method::GET, "/admin/access-codes", None, Some(&owner)).await;
+    let (_, code) = app
+        .create_access_code(&owner, json!({ "label": "x" }))
+        .await;
+    let res = app
+        .request(Method::GET, "/admin/access-codes", None, Some(&owner))
+        .await;
     assert_eq!(res.status, 200);
     let item = &res.json.as_array().unwrap()[0];
     assert!(item.get("code").is_none());
@@ -105,7 +116,12 @@ async fn revoked_code_rejected(pool: PgPool) {
     let owner = app.make_owner().await;
     let (id, code) = app.create_access_code(&owner, json!({})).await;
     let revoke = app
-        .request(Method::POST, &format!("/admin/access-codes/{id}/revoke"), None, Some(&owner))
+        .request(
+            Method::POST,
+            &format!("/admin/access-codes/{id}/revoke"),
+            None,
+            Some(&owner),
+        )
         .await;
     assert_eq!(revoke.status, 204);
     let (_, token) = app.sign_up_verified("08011111111").await;
@@ -118,7 +134,9 @@ async fn revoked_code_rejected(pool: PgPool) {
 async fn single_use_code_exhausted(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let owner = app.make_owner().await;
-    let (_, code) = app.create_access_code(&owner, json!({ "max_uses": 1 })).await;
+    let (_, code) = app
+        .create_access_code(&owner, json!({ "max_uses": 1 }))
+        .await;
     let (_, a) = app.sign_up_verified("08011111111").await;
     let (_, b) = app.sign_up_verified("08022222222").await;
     assert_eq!(app.redeem(&a, &code).await.status, 200);
@@ -159,7 +177,9 @@ async fn already_seller_redeem_is_idempotent(pool: PgPool) {
 async fn concurrent_single_use_redeem_one_wins(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let owner = app.make_owner().await;
-    let (id, code) = app.create_access_code(&owner, json!({ "max_uses": 1 })).await;
+    let (id, code) = app
+        .create_access_code(&owner, json!({ "max_uses": 1 }))
+        .await;
     let (_, a) = app.sign_up_verified("08011111111").await;
     let (_, b) = app.sign_up_verified("08022222222").await;
     let (ra, rb) = tokio::join!(app.redeem(&a, &code), app.redeem(&b, &code));
@@ -183,9 +203,18 @@ async fn redeem_and_create_are_audited(pool: PgPool) {
     let (id, code) = app.create_access_code(&owner, json!({})).await;
     let (_, token) = app.sign_up_verified("08011111111").await;
     assert_eq!(app.redeem(&token, &code).await.status, 200);
-    app.request(Method::POST, &format!("/admin/access-codes/{id}/revoke"), None, Some(&owner))
-        .await;
-    for action in ["access_code.created", "access_code.redeemed", "access_code.revoked"] {
+    app.request(
+        Method::POST,
+        &format!("/admin/access-codes/{id}/revoke"),
+        None,
+        Some(&owner),
+    )
+    .await;
+    for action in [
+        "access_code.created",
+        "access_code.redeemed",
+        "access_code.revoked",
+    ] {
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = $1")
             .bind(action)
             .fetch_one(&app.pool)
@@ -221,11 +250,19 @@ async fn revoke_non_uuid_id_is_json_404(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let owner = app.make_owner().await;
     let res = app
-        .request(Method::POST, "/admin/access-codes/not-a-uuid/revoke", None, Some(&owner))
+        .request(
+            Method::POST,
+            "/admin/access-codes/not-a-uuid/revoke",
+            None,
+            Some(&owner),
+        )
         .await;
     assert_eq!(res.status, 404);
     assert_eq!(res.json["error"]["code"], "not_found");
-    assert!(!res.json.to_string().contains("not-a-uuid"), "path value must not be echoed");
+    assert!(
+        !res.json.to_string().contains("not-a-uuid"),
+        "path value must not be echoed"
+    );
 }
 
 #[sqlx::test]
@@ -252,19 +289,27 @@ async fn non_owner_cannot_list_or_revoke_codes(pool: PgPool) {
     let support = app.make_support().await;
     let (_, user) = app.sign_up_verified("08011111111").await;
     for token in [&user, &support] {
-        let list = app.request(Method::GET, "/admin/access-codes", None, Some(token)).await;
+        let list = app
+            .request(Method::GET, "/admin/access-codes", None, Some(token))
+            .await;
         assert_eq!(list.status, 403);
         assert_eq!(list.json["error"]["code"], "forbidden");
         let revoke = app
-            .request(Method::POST, &format!("/admin/access-codes/{id}/revoke"), None, Some(token))
+            .request(
+                Method::POST,
+                &format!("/admin/access-codes/{id}/revoke"),
+                None,
+                Some(token),
+            )
             .await;
         assert_eq!(revoke.status, 403);
         assert_eq!(revoke.json["error"]["code"], "forbidden");
     }
-    let revoked: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM access_codes WHERE id = $1")
-        .bind(id)
-        .fetch_one(&app.pool)
-        .await
-        .unwrap();
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM access_codes WHERE id = $1")
+            .bind(id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
     assert!(!revoked);
 }

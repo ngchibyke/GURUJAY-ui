@@ -28,7 +28,9 @@ fn hash(normalized: &str) -> Vec<u8> {
 
 fn generate() -> String {
     let mut rng = OsRng;
-    (0..CODE_LEN).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
+    (0..CODE_LEN)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
 }
 
 /// Creates a code; returns (id, display code `XXXXX-XXXXX`). The plain code is never stored.
@@ -43,11 +45,17 @@ pub async fn create(
         return Err(AppError::Validation("max_uses must be at least 1".into()));
     }
     if matches!(expires_at, Some(t) if t <= OffsetDateTime::now_utc()) {
-        return Err(AppError::Validation("expires_at must be in the future".into()));
+        return Err(AppError::Validation(
+            "expires_at must be in the future".into(),
+        ));
     }
-    let label = label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty());
+    let label = label
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
     if matches!(&label, Some(l) if l.chars().count() > 80) {
-        return Err(AppError::Validation("label must be at most 80 characters".into()));
+        return Err(AppError::Validation(
+            "label must be at most 80 characters".into(),
+        ));
     }
 
     let plain = generate();
@@ -116,7 +124,15 @@ pub async fn revoke(db: &PgPool, actor: Uuid, id: Uuid) -> Result<(), AppError> 
     if found.is_none() {
         return Err(AppError::NotFound);
     }
-    audit::record(&mut tx, Some(actor), "access_code.revoked", "access_code", Some(id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(actor),
+        "access_code.revoked",
+        "access_code",
+        Some(id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     Ok(())
 }
@@ -140,11 +156,12 @@ async fn redeem_tx(db: &PgPool, user_id: Uuid, normalized: &str) -> Result<(), A
 
     // Lock the user first (consistent order: user, then code) so a double submit by the
     // same user serializes instead of hitting the unique redemption constraint.
-    let is_seller: bool = sqlx::query_scalar("SELECT is_seller FROM users WHERE id = $1 FOR UPDATE")
-        .bind(user_id)
-        .fetch_one(&mut *tx)
-        .await
-        .context("lock user")?;
+    let is_seller: bool =
+        sqlx::query_scalar("SELECT is_seller FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await
+            .context("lock user")?;
     if is_seller {
         return Ok(());
     }
@@ -179,15 +196,26 @@ async fn redeem_tx(db: &PgPool, user_id: Uuid, normalized: &str) -> Result<(), A
     .await
     .context("lock access_code")?;
 
-    let row = row.ok_or_else(|| AppError::Unprocessable("code_invalid", "Access code is not valid".into()))?;
+    let row = row.ok_or_else(|| {
+        AppError::Unprocessable("code_invalid", "Access code is not valid".into())
+    })?;
     if row.revoked {
-        return Err(AppError::Unprocessable("code_revoked", "Access code has been revoked".into()));
+        return Err(AppError::Unprocessable(
+            "code_revoked",
+            "Access code has been revoked".into(),
+        ));
     }
     if row.expired {
-        return Err(AppError::Unprocessable("code_expired", "Access code has expired".into()));
+        return Err(AppError::Unprocessable(
+            "code_expired",
+            "Access code has expired".into(),
+        ));
     }
     if matches!(row.max_uses, Some(max) if row.uses >= max) {
-        return Err(AppError::Unprocessable("code_exhausted", "Access code has no uses left".into()));
+        return Err(AppError::Unprocessable(
+            "code_exhausted",
+            "Access code has no uses left".into(),
+        ));
     }
 
     sqlx::query("UPDATE access_codes SET uses = uses + 1 WHERE id = $1")
@@ -206,7 +234,15 @@ async fn redeem_tx(db: &PgPool, user_id: Uuid, normalized: &str) -> Result<(), A
         .execute(&mut *tx)
         .await
         .context("set is_seller")?;
-    audit::record(&mut tx, Some(user_id), "access_code.redeemed", "access_code", Some(row.id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(user_id),
+        "access_code.redeemed",
+        "access_code",
+        Some(row.id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     Ok(())
 }

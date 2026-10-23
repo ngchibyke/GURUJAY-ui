@@ -55,7 +55,10 @@ impl std::fmt::Debug for StorePatch {
         f.debug_struct("StorePatch")
             .field("name", &self.name)
             .field("description", &self.description)
-            .field("pickup_address", &self.pickup_address.as_ref().map(|_| REDACTED))
+            .field(
+                "pickup_address",
+                &self.pickup_address.as_ref().map(|_| REDACTED),
+            )
             .field("pickup_state", &self.pickup_state)
             .field("delivery_courier", &self.delivery_courier)
             .field("delivery_self", &self.delivery_self)
@@ -107,7 +110,10 @@ pub struct OwnerStore {
 
 impl std::fmt::Debug for OwnerStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnerStore").field("store", &self.store).field("pickup_address", &REDACTED).finish()
+        f.debug_struct("OwnerStore")
+            .field("store", &self.store)
+            .field("pickup_address", &REDACTED)
+            .finish()
     }
 }
 
@@ -127,7 +133,10 @@ impl Store {
     }
 
     pub fn owner_view(&self, cipher: &FieldCipher) -> Result<OwnerStore, AppError> {
-        Ok(OwnerStore { store: self.public(), pickup_address: cipher.decrypt(&self.pickup_address_enc)? })
+        Ok(OwnerStore {
+            store: self.public(),
+            pickup_address: cipher.decrypt(&self.pickup_address_enc)?,
+        })
     }
 }
 
@@ -141,20 +150,28 @@ fn slugify(name: &str) -> String {
         }
     }
     let out = out.trim_end_matches('-');
-    if out.is_empty() { "store".to_string() } else { out.to_string() }
+    if out.is_empty() {
+        "store".to_string()
+    } else {
+        out.to_string()
+    }
 }
 
 fn validate_name(name: &str) -> Result<String, AppError> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 80 {
-        return Err(AppError::Validation("name must be 1 to 80 characters".into()));
+        return Err(AppError::Validation(
+            "name must be 1 to 80 characters".into(),
+        ));
     }
     Ok(name.to_string())
 }
 
 fn validate_description(description: &str) -> Result<(), AppError> {
     if description.chars().count() > 2000 {
-        return Err(AppError::Validation("description must be at most 2000 characters".into()));
+        return Err(AppError::Validation(
+            "description must be at most 2000 characters".into(),
+        ));
     }
     Ok(())
 }
@@ -162,7 +179,9 @@ fn validate_description(description: &str) -> Result<(), AppError> {
 fn validate_address(address: &str) -> Result<String, AppError> {
     let address = address.trim();
     if address.is_empty() || address.chars().count() > 300 {
-        return Err(AppError::Validation("pickup_address must be 1 to 300 characters".into()));
+        return Err(AppError::Validation(
+            "pickup_address must be 1 to 300 characters".into(),
+        ));
     }
     Ok(address.to_string())
 }
@@ -179,7 +198,9 @@ fn validate_state(state: &str) -> Result<(), AppError> {
 
 fn validate_delivery(courier: bool, own: bool) -> Result<(), AppError> {
     if !courier && !own {
-        return Err(AppError::Validation("at least one delivery method is required".into()));
+        return Err(AppError::Validation(
+            "at least one delivery method is required".into(),
+        ));
     }
     Ok(())
 }
@@ -204,11 +225,13 @@ pub async fn create_store(
         .fetch_one(&mut *tx)
         .await
         .context("lock user")?;
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM stores WHERE owner_id = $1 AND deleted_at IS NULL")
-        .bind(owner)
-        .fetch_one(&mut *tx)
-        .await
-        .context("count stores")?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM stores WHERE owner_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(owner)
+    .fetch_one(&mut *tx)
+    .await
+    .context("count stores")?;
     if count >= MAX_STORES_PER_USER {
         return Err(AppError::Conflict("store_limit_reached"));
     }
@@ -219,7 +242,11 @@ pub async fn create_store(
         if n == 1 && RESERVED_SLUGS.contains(&base.as_str()) {
             continue;
         }
-        let slug = if n == 1 { base.clone() } else { format!("{base}-{n}") };
+        let slug = if n == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{n}")
+        };
         // The unique index decides; a taken slug (even a deleted store's) yields no row.
         let inserted: Option<Store> = sqlx::query_as(&format!(
             "INSERT INTO stores (owner_id, name, slug, description, pickup_address_enc, pickup_state, \
@@ -244,7 +271,15 @@ pub async fn create_store(
         }
     }
     let store = store.ok_or_else(|| anyhow::anyhow!("could not allocate a store slug"))?;
-    audit::record(&mut tx, Some(owner), "store.created", "store", Some(store.id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(owner),
+        "store.created",
+        "store",
+        Some(store.id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     Ok(store)
 }
@@ -290,13 +325,19 @@ pub async fn update_store(
         Some(n) => validate_name(n)?,
         None => current.name.clone(),
     };
-    let description = patch.description.clone().unwrap_or_else(|| current.description.clone());
+    let description = patch
+        .description
+        .clone()
+        .unwrap_or_else(|| current.description.clone());
     validate_description(&description)?;
     let address_enc = match &patch.pickup_address {
         Some(a) => cipher.encrypt(&validate_address(a)?),
         None => current.pickup_address_enc.clone(),
     };
-    let state = patch.pickup_state.clone().unwrap_or_else(|| current.pickup_state.clone());
+    let state = patch
+        .pickup_state
+        .clone()
+        .unwrap_or_else(|| current.pickup_state.clone());
     let courier = patch.delivery_courier.unwrap_or(current.delivery_courier);
     let own = patch.delivery_self.unwrap_or(current.delivery_self);
     validate_delivery(courier, own)?;
@@ -316,7 +357,15 @@ pub async fn update_store(
     .fetch_one(&mut *tx)
     .await
     .context("update store")?;
-    audit::record(&mut tx, Some(owner), "store.updated", "store", Some(id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(owner),
+        "store.updated",
+        "store",
+        Some(id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     Ok(store)
 }
@@ -329,13 +378,25 @@ pub async fn delete_store(db: &PgPool, owner: Uuid, id: Uuid) -> Result<(), AppE
         .execute(&mut *tx)
         .await
         .context("soft delete store")?;
-    audit::record(&mut tx, Some(owner), "store.deleted", "store", Some(id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(owner),
+        "store.deleted",
+        "store",
+        Some(id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     Ok(())
 }
 
 /// Locks a live store row owned by `owner`; anything else is NotFound (existence is not revealed).
-async fn lock_owned(tx: &mut Transaction<'_, Postgres>, owner: Uuid, id: Uuid) -> Result<Store, AppError> {
+async fn lock_owned(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: Uuid,
+    id: Uuid,
+) -> Result<Store, AppError> {
     sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM stores WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL FOR UPDATE"
     ))
@@ -373,7 +434,10 @@ mod debug_tests {
             delivery_courier: true,
             delivery_self: false,
         };
-        let patch = StorePatch { pickup_address: Some("12 Secret Close, Wuse".into()), ..Default::default() };
+        let patch = StorePatch {
+            pickup_address: Some("12 Secret Close, Wuse".into()),
+            ..Default::default()
+        };
         for printed in [format!("{new:?}"), format!("{patch:?}")] {
             assert!(!printed.contains("Secret"), "{printed}");
             assert!(printed.contains("[redacted]"), "{printed}");

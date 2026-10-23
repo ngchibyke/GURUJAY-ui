@@ -120,13 +120,18 @@ fn invalid(msg: &str) -> AppError {
 }
 
 fn duplicate_variant() -> AppError {
-    AppError::Unprocessable("duplicate_variant", "Two variants share the same attributes".into())
+    AppError::Unprocessable(
+        "duplicate_variant",
+        "Two variants share the same attributes".into(),
+    )
 }
 
 fn validate_text(value: &str, max: usize, field: &str) -> Result<(), AppError> {
     let n = value.trim().chars().count();
     if n == 0 || n > max {
-        return Err(AppError::Validation(format!("{field} must be 1 to {max} characters")));
+        return Err(AppError::Validation(format!(
+            "{field} must be 1 to {max} characters"
+        )));
     }
     Ok(())
 }
@@ -139,7 +144,11 @@ fn validate_brand(brand: &Option<String>) -> Result<(), AppError> {
 }
 
 fn validate_condition(condition: &str) -> Result<(), AppError> {
-    if CONDITIONS.contains(&condition) { Ok(()) } else { Err(invalid("condition must be new, used or refurbished")) }
+    if CONDITIONS.contains(&condition) {
+        Ok(())
+    } else {
+        Err(invalid("condition must be new, used or refurbished"))
+    }
 }
 
 fn validate_photos(keys: &[String]) -> Result<(), AppError> {
@@ -153,7 +162,13 @@ fn validate_photos(keys: &[String]) -> Result<(), AppError> {
 }
 
 fn validate_positive(value: i64, field: &str) -> Result<(), AppError> {
-    if value > 0 { Ok(()) } else { Err(AppError::Validation(format!("{field} must be greater than 0"))) }
+    if value > 0 {
+        Ok(())
+    } else {
+        Err(AppError::Validation(format!(
+            "{field} must be greater than 0"
+        )))
+    }
 }
 
 fn validate_dimensions(l: Option<i32>, w: Option<i32>, h: Option<i32>) -> Result<(), AppError> {
@@ -186,7 +201,9 @@ fn validate_variants(variants: &[VariantInput]) -> Result<(), AppError> {
         }
     }
     if variants.len() > 1 && variants.iter().any(|v| v.attributes.is_empty()) {
-        return Err(invalid("a variant without attributes cannot be combined with other variants"));
+        return Err(invalid(
+            "a variant without attributes cannot be combined with other variants",
+        ));
     }
     for (i, v) in variants.iter().enumerate() {
         if variants[..i].iter().any(|o| o.attributes == v.attributes) {
@@ -250,7 +267,11 @@ async fn view(db: &PgPool, product: Product) -> Result<ProductView, AppError> {
 }
 
 /// Locks a live product whose live store belongs to `owner`; anything else is NotFound.
-async fn lock_owned(tx: &mut Transaction<'_, Postgres>, owner: Uuid, id: Uuid) -> Result<Product, AppError> {
+async fn lock_owned(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: Uuid,
+    id: Uuid,
+) -> Result<Product, AppError> {
     sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p WHERE p.id = $1 AND p.deleted_at IS NULL \
          AND EXISTS (SELECT 1 FROM stores s WHERE s.id = p.store_id AND s.owner_id = $2 AND s.deleted_at IS NULL) \
@@ -314,7 +335,15 @@ pub async fn create_product(
     .await
     .context("insert product")?;
     insert_variants(&mut tx, product.id, &input.variants).await?;
-    audit::record(&mut tx, Some(owner), "product.created", "product", Some(product.id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(owner),
+        "product.created",
+        "product",
+        Some(product.id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     view(db, product).await
 }
@@ -375,7 +404,15 @@ pub async fn update_product(
     .fetch_one(&mut *tx)
     .await
     .context("update product")?;
-    audit::record(&mut tx, Some(owner), "product.updated", "product", Some(id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(owner),
+        "product.updated",
+        "product",
+        Some(id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     view(db, product).await
 }
@@ -400,7 +437,15 @@ pub async fn replace_variants(
         .execute(&mut *tx)
         .await
         .context("touch product")?;
-    audit::record(&mut tx, Some(owner), "product.variants_replaced", "product", Some(id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(owner),
+        "product.variants_replaced",
+        "product",
+        Some(id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     view(db, product).await
 }
@@ -413,13 +458,25 @@ pub async fn delete_product(db: &PgPool, owner: Uuid, id: Uuid) -> Result<(), Ap
         .execute(&mut *tx)
         .await
         .context("soft delete product")?;
-    audit::record(&mut tx, Some(owner), "product.deleted", "product", Some(id), json!({})).await?;
+    audit::record(
+        &mut tx,
+        Some(owner),
+        "product.deleted",
+        "product",
+        Some(id),
+        json!({}),
+    )
+    .await?;
     tx.commit().await.context("commit")?;
     Ok(())
 }
 
 /// Public when published and in an active store; the store owner also sees their own products.
-pub async fn get_product(db: &PgPool, id: Uuid, viewer: Option<Uuid>) -> Result<ProductView, AppError> {
+pub async fn get_product(
+    db: &PgPool,
+    id: Uuid,
+    viewer: Option<Uuid>,
+) -> Result<ProductView, AppError> {
     let product: Product = sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p WHERE p.id = $1 AND p.deleted_at IS NULL AND EXISTS ( \
            SELECT 1 FROM stores s WHERE s.id = p.store_id AND s.deleted_at IS NULL AND ( \
@@ -485,7 +542,13 @@ mod tests {
     }
 
     fn variant(price: Option<i64>) -> Variant {
-        Variant { id: Uuid::nil(), attributes: BTreeMap::new(), stock: 1, price_kobo: price, sku: None }
+        Variant {
+            id: Uuid::nil(),
+            attributes: BTreeMap::new(),
+            stock: 1,
+            price_kobo: price,
+            sku: None,
+        }
     }
 
     #[test]

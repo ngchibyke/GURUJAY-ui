@@ -23,7 +23,9 @@ impl std::fmt::Debug for FieldCipher {
 
 impl FieldCipher {
     pub fn new(key: [u8; 32]) -> Self {
-        Self { cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)) }
+        Self {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)),
+        }
     }
 
     pub fn encrypt(&self, plain: &str) -> Vec<u8> {
@@ -47,7 +49,8 @@ impl FieldCipher {
             .cipher
             .decrypt(Nonce::from_slice(nonce), ct)
             .map_err(|_| anyhow::anyhow!("encrypted field failed authentication"))?;
-        String::from_utf8(plain).map_err(|_| anyhow::anyhow!("decrypted field is not valid UTF-8").into())
+        String::from_utf8(plain)
+            .map_err(|_| anyhow::anyhow!("decrypted field is not valid UTF-8").into())
     }
 }
 
@@ -62,11 +65,42 @@ pub fn blind_index(key: &[u8; 32], value: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    #[test] fn round_trips() { let c = FieldCipher::new([7; 32]); let b = c.encrypt("+2348031234567"); assert_eq!(c.decrypt(&b).unwrap(), "+2348031234567"); }
-    #[test] fn same_plain_different_ciphertext() { let c = FieldCipher::new([7; 32]); assert_ne!(c.encrypt("x"), c.encrypt("x")); }
-    #[test] fn tampered_blob_fails() { let c = FieldCipher::new([7; 32]); let mut b = c.encrypt("x"); *b.last_mut().unwrap() ^= 1; assert!(c.decrypt(&b).is_err()); }
-    #[test] fn short_blob_fails() { let c = FieldCipher::new([7; 32]); assert!(c.decrypt(&[1, 2, 3]).is_err()); }
-    #[test] fn wrong_key_fails() { let b = FieldCipher::new([7; 32]).encrypt("x"); assert!(FieldCipher::new([8; 32]).decrypt(&b).is_err()); }
-    #[test] fn debug_does_not_leak_key() { let s = format!("{:?}", FieldCipher::new([7; 32])); assert!(s.contains("redacted")); }
-    #[test] fn index_is_deterministic() { assert_eq!(blind_index(&[1; 32], "a"), blind_index(&[1; 32], "a")); assert_ne!(blind_index(&[1; 32], "a"), blind_index(&[2; 32], "a")); }
+    #[test]
+    fn round_trips() {
+        let c = FieldCipher::new([7; 32]);
+        let b = c.encrypt("+2348031234567");
+        assert_eq!(c.decrypt(&b).unwrap(), "+2348031234567");
+    }
+    #[test]
+    fn same_plain_different_ciphertext() {
+        let c = FieldCipher::new([7; 32]);
+        assert_ne!(c.encrypt("x"), c.encrypt("x"));
+    }
+    #[test]
+    fn tampered_blob_fails() {
+        let c = FieldCipher::new([7; 32]);
+        let mut b = c.encrypt("x");
+        *b.last_mut().unwrap() ^= 1;
+        assert!(c.decrypt(&b).is_err());
+    }
+    #[test]
+    fn short_blob_fails() {
+        let c = FieldCipher::new([7; 32]);
+        assert!(c.decrypt(&[1, 2, 3]).is_err());
+    }
+    #[test]
+    fn wrong_key_fails() {
+        let b = FieldCipher::new([7; 32]).encrypt("x");
+        assert!(FieldCipher::new([8; 32]).decrypt(&b).is_err());
+    }
+    #[test]
+    fn debug_does_not_leak_key() {
+        let s = format!("{:?}", FieldCipher::new([7; 32]));
+        assert!(s.contains("redacted"));
+    }
+    #[test]
+    fn index_is_deterministic() {
+        assert_eq!(blind_index(&[1; 32], "a"), blind_index(&[1; 32], "a"));
+        assert_ne!(blind_index(&[1; 32], "a"), blind_index(&[2; 32], "a"));
+    }
 }

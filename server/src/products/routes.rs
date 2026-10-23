@@ -43,7 +43,9 @@ async fn list(
     MaybeAuth(viewer): MaybeAuth,
     Path(slug): Path<String>,
 ) -> Result<Json<Vec<ProductView>>, AppError> {
-    Ok(Json(service::list_store_products(&state.db, &slug, viewer.map(|u| u.id)).await?))
+    Ok(Json(
+        service::list_store_products(&state.db, &slug, viewer.map(|u| u.id)).await?,
+    ))
 }
 
 async fn show(
@@ -51,7 +53,9 @@ async fn show(
     MaybeAuth(viewer): MaybeAuth,
     Path(id): Path<String>,
 ) -> Result<Json<ProductView>, AppError> {
-    Ok(Json(service::get_product(&state.db, parse_id(&id)?, viewer.map(|u| u.id)).await?))
+    Ok(Json(
+        service::get_product(&state.db, parse_id(&id)?, viewer.map(|u| u.id)).await?,
+    ))
 }
 
 async fn update(
@@ -61,7 +65,9 @@ async fn update(
     AppJson(patch): AppJson<ProductPatch>,
 ) -> Result<Json<ProductView>, AppError> {
     require_seller(&user)?;
-    Ok(Json(service::update_product(&state.db, user.id, parse_id(&id)?, patch).await?))
+    Ok(Json(
+        service::update_product(&state.db, user.id, parse_id(&id)?, patch).await?,
+    ))
 }
 
 async fn replace_variants(
@@ -71,7 +77,9 @@ async fn replace_variants(
     AppJson(variants): AppJson<Vec<VariantInput>>,
 ) -> Result<Json<ProductView>, AppError> {
     require_seller(&user)?;
-    Ok(Json(service::replace_variants(&state.db, user.id, parse_id(&id)?, variants).await?))
+    Ok(Json(
+        service::replace_variants(&state.db, user.id, parse_id(&id)?, variants).await?,
+    ))
 }
 
 async fn remove(

@@ -9,12 +9,7 @@ pub mod phone;
 pub mod products;
 pub mod stores;
 
-use axum::{
-    Json, Router,
-    extract::MatchedPath,
-    http::Request,
-    routing::get,
-};
+use axum::{Json, Router, extract::MatchedPath, http::Request, routing::get};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -59,8 +54,14 @@ pub fn build_app(state: AppState) -> Router {
         })
         .on_request(())
         .on_response(
-            |res: &axum::response::Response, latency: std::time::Duration, _span: &tracing::Span| {
-                tracing::info!(status = res.status().as_u16(), latency_ms = latency.as_millis() as u64, "response");
+            |res: &axum::response::Response,
+             latency: std::time::Duration,
+             _span: &tracing::Span| {
+                tracing::info!(
+                    status = res.status().as_u16(),
+                    latency_ms = latency.as_millis() as u64,
+                    "response"
+                );
             },
         );
 

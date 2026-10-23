@@ -22,8 +22,11 @@ impl std::fmt::Debug for Config {
 
 /// Decodes a standard-base64 string that must be exactly 32 bytes.
 fn key_from_b64(name: &str, raw: &str) -> Result<[u8; 32]> {
-    let bytes = STANDARD.decode(raw.trim()).with_context(|| format!("{name} must be base64"))?;
-    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| anyhow::anyhow!("{name} must decode to exactly 32 bytes"))
+    let bytes = STANDARD
+        .decode(raw.trim())
+        .with_context(|| format!("{name} must be base64"))?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow::anyhow!("{name} must decode to exactly 32 bytes"))
 }
 
 /// Environments in which OTP codes may be echoed to stdout.
@@ -36,12 +39,20 @@ impl Config {
 
     /// Builds the config from any variable source (the process environment in production).
     pub fn from_lookup(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let app_env = var("APP_ENV").unwrap_or_else(|| "development".into()).trim().to_lowercase();
+        let app_env = var("APP_ENV")
+            .unwrap_or_else(|| "development".into())
+            .trim()
+            .to_lowercase();
         let otp_dev_echo = var("OTP_DEV_ECHO").is_some_and(|v| v.trim() == "1");
         if otp_dev_echo && !DEV_ECHO_ENVS.contains(&app_env.as_str()) {
             bail!("OTP_DEV_ECHO=1 is only allowed when APP_ENV is development or test");
         }
-        let key = |name: &str| key_from_b64(name, &var(name).with_context(|| format!("{name} is required"))?);
+        let key = |name: &str| {
+            key_from_b64(
+                name,
+                &var(name).with_context(|| format!("{name} is required"))?,
+            )
+        };
         let field_key = key("FIELD_KEY")?;
         let index_key = key("INDEX_KEY")?;
         if field_key == index_key {
@@ -68,8 +79,12 @@ mod tests {
     const KEY_B: &str = "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk="; // 32 x 0x09
 
     fn load(pairs: &[(&str, &str)]) -> Result<Config> {
-        let mut env: HashMap<&str, &str> =
-            [("DATABASE_URL", "postgres://x"), ("FIELD_KEY", KEY_A), ("INDEX_KEY", KEY_B)].into();
+        let mut env: HashMap<&str, &str> = [
+            ("DATABASE_URL", "postgres://x"),
+            ("FIELD_KEY", KEY_A),
+            ("INDEX_KEY", KEY_B),
+        ]
+        .into();
         env.extend(pairs.iter().copied());
         Config::from_lookup(|k| env.get(k).map(|v| v.to_string()))
     }
@@ -90,13 +105,20 @@ mod tests {
 
     #[test]
     fn app_env_is_trimmed_and_lowercased() {
-        assert_eq!(load(&[("APP_ENV", " Production ")]).unwrap().app_env, "production");
+        assert_eq!(
+            load(&[("APP_ENV", " Production ")]).unwrap().app_env,
+            "production"
+        );
         assert_eq!(load(&[]).unwrap().app_env, "development");
     }
 
     #[test]
     fn identical_field_and_index_keys_refused() {
         let err = load(&[("INDEX_KEY", KEY_A)]).unwrap_err();
-        assert!(err.to_string().contains("FIELD_KEY and INDEX_KEY must differ"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("FIELD_KEY and INDEX_KEY must differ"),
+            "{err}"
+        );
     }
 }

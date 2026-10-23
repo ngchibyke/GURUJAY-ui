@@ -54,7 +54,12 @@ pub struct Issued {
 impl Issued {
     /// Hands the code to the SMS sender if this issuance was not throttled.
     /// Call only after the issuing transaction has committed.
-    pub async fn deliver(&self, sender: &dyn OtpSender, user_id: Uuid, phone_e164: &str) -> Result<(), AppError> {
+    pub async fn deliver(
+        &self,
+        sender: &dyn OtpSender,
+        user_id: Uuid,
+        phone_e164: &str,
+    ) -> Result<(), AppError> {
         if let Some(code) = &self.code_to_send {
             sender.send(phone_e164, code).await?;
             tracing::info!(user_id = %user_id, "OTP sent to user");
@@ -86,11 +91,13 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Retires every outstanding code (and with it every verification id) for the user.
 pub async fn invalidate_otps(conn: &mut PgConnection, user_id: Uuid) -> Result<(), AppError> {
-    sqlx::query("UPDATE otp_codes SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL")
-        .bind(user_id)
-        .execute(conn)
-        .await
-        .map_err(anyhow::Error::from)?;
+    sqlx::query(
+        "UPDATE otp_codes SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(conn)
+    .await
+    .map_err(anyhow::Error::from)?;
     Ok(())
 }
 
@@ -102,7 +109,11 @@ pub async fn invalidate_otps(conn: &mut PgConnection, user_id: Uuid) -> Result<(
 /// - `Resend`: when a send is allowed, same as above. When throttled, the live code
 ///   is re-bound to a fresh verification id (the code already on the phone stays valid,
 ///   the previous id stops working); if there is no live code, an unsent one is created.
-pub async fn issue_otp(conn: &mut PgConnection, user_id: Uuid, reason: IssueReason) -> Result<Issued, AppError> {
+pub async fn issue_otp(
+    conn: &mut PgConnection,
+    user_id: Uuid,
+    reason: IssueReason,
+) -> Result<Issued, AppError> {
     // Serialise issuance per user so concurrent calls cannot slip past the throttle.
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
         .bind(user_id)
@@ -136,7 +147,10 @@ pub async fn issue_otp(conn: &mut PgConnection, user_id: Uuid, reason: IssueReas
         .await
         .map_err(anyhow::Error::from)?;
         if rebound.is_some() {
-            return Ok(Issued { verification_id, code_to_send: None });
+            return Ok(Issued {
+                verification_id,
+                code_to_send: None,
+            });
         }
     }
 
@@ -154,7 +168,10 @@ pub async fn issue_otp(conn: &mut PgConnection, user_id: Uuid, reason: IssueReas
     .execute(&mut *conn)
     .await
     .map_err(anyhow::Error::from)?;
-    Ok(Issued { verification_id, code_to_send: sendable.then_some(code) })
+    Ok(Issued {
+        verification_id,
+        code_to_send: sendable.then_some(code),
+    })
 }
 
 fn invalid() -> AppError {
@@ -162,7 +179,10 @@ fn invalid() -> AppError {
 }
 
 fn locked() -> AppError {
-    AppError::Unprocessable("otp_locked", "Too many wrong codes. Request a new code".into())
+    AppError::Unprocessable(
+        "otp_locked",
+        "Too many wrong codes. Request a new code".into(),
+    )
 }
 
 /// Checks `code` against the live, sent OTP bound to `verification_id`. On success the
@@ -184,7 +204,10 @@ pub async fn verify_otp(db: &PgPool, verification_id: &str, code: &str) -> Resul
         return Err(locked());
     }
     if expired {
-        return Err(AppError::Unprocessable("otp_expired", "That code has expired. Request a new code".into()));
+        return Err(AppError::Unprocessable(
+            "otp_expired",
+            "That code has expired. Request a new code".into(),
+        ));
     }
     // Atomically count this guess so a concurrent burst cannot exceed the cap.
     let counted: Option<i32> = sqlx::query_scalar(
@@ -210,20 +233,24 @@ pub async fn verify_otp(db: &PgPool, verification_id: &str, code: &str) -> Resul
         .fetch_optional(&mut *tx)
         .await
         .map_err(anyhow::Error::from)?;
-    let consumed = sqlx::query("UPDATE otp_codes SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL")
-        .bind(otp_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(anyhow::Error::from)?
-        .rows_affected();
+    let consumed = sqlx::query(
+        "UPDATE otp_codes SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL",
+    )
+    .bind(otp_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?
+    .rows_affected();
     if consumed == 0 {
         return Err(invalid());
     }
-    sqlx::query("UPDATE users SET phone_verified_at = COALESCE(phone_verified_at, now()) WHERE id = $1")
-        .bind(user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(anyhow::Error::from)?;
+    sqlx::query(
+        "UPDATE users SET phone_verified_at = COALESCE(phone_verified_at, now()) WHERE id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?;
     tx.commit().await.map_err(anyhow::Error::from)?;
     Ok(user_id)
 }
