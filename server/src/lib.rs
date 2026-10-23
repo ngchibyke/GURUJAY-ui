@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod error;
 pub mod extract;
 pub mod limits;
+pub mod money;
 pub mod phone;
 pub mod products;
 pub mod stores;
