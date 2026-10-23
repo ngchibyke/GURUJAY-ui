@@ -58,7 +58,7 @@ async fn sign_up_stores_phone_encrypted(pool: PgPool) {
 #[sqlx::test]
 async fn duplicate_phone_any_format_conflicts(pool: PgPool) {
     let app = TestApp::new(pool).await;
-    assert_eq!(app.sign_up("08031234567", TEST_PASSWORD).await.status, 201);
+    app.sign_up_verified("08031234567").await;
     let dup = app.sign_up("+234 803 123 4567", TEST_PASSWORD).await;
     assert_err(&dup, 409, "phone_taken");
 }
@@ -193,4 +193,79 @@ async fn password_never_in_logs(pool: PgPool) {
     assert!(!logs_contain(password));
     assert!(!logs_contain("8031234567"));
     assert!(!logs_contain(&code));
+}
+
+#[sqlx::test]
+async fn unverified_signup_can_be_reclaimed(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    let first = app.sign_up("08031234567", "first-password-1").await;
+    assert_eq!(first.status, 201);
+    app.age_otps(120).await;
+    let second = app.sign_up("+234 803 123 4567", "second-password-2").await;
+    assert_eq!(second.status, 201);
+    assert_eq!(first.json["user_id"], second.json["user_id"]);
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users").fetch_one(&pool).await.unwrap();
+    assert_eq!(users, 1);
+
+    let verify = app
+        .request(
+            Method::POST,
+            "/auth/verify-phone",
+            Some(json!({ "user_id": second.json["user_id"], "code": app.last_code(PHONE) })),
+            None,
+        )
+        .await;
+    assert_eq!(verify.status, 200);
+    let ok = app
+        .request(Method::POST, "/auth/sign-in", Some(json!({ "phone": PHONE, "password": "second-password-2" })), None)
+        .await;
+    assert_eq!(ok.status, 200);
+    let old = app
+        .request(Method::POST, "/auth/sign-in", Some(json!({ "phone": PHONE, "password": "first-password-1" })), None)
+        .await;
+    assert_err(&old, 401, "invalid_credentials");
+}
+
+#[sqlx::test]
+async fn otp_issue_is_throttled(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let body = json!({ "phone": PHONE, "password": TEST_PASSWORD });
+    assert_eq!(app.sign_up(PHONE, TEST_PASSWORD).await.status, 201);
+    assert_eq!(app.otp.sent_count(), 1);
+    for _ in 0..3 {
+        let res = app.request(Method::POST, "/auth/sign-in", Some(body.clone()), None).await;
+        assert_err(&res, 403, "phone_unverified");
+    }
+    assert_eq!(app.otp.sent_count(), 1, "sign-ins within 60s must not send");
+
+    // Past the 60s window a new code goes out (2nd of the hour).
+    app.age_otps(120).await;
+    app.request(Method::POST, "/auth/sign-in", Some(body.clone()), None).await;
+    assert_eq!(app.otp.sent_count(), 2);
+
+    // Reach 5 in the hour, then the 6th is skipped even after the 60s window.
+    for expected in 3..=5 {
+        app.age_otps(120).await;
+        app.request(Method::POST, "/auth/sign-in", Some(body.clone()), None).await;
+        assert_eq!(app.otp.sent_count(), expected);
+    }
+    app.age_otps(120).await;
+    let res = app.request(Method::POST, "/auth/sign-in", Some(body), None).await;
+    assert_err(&res, 403, "phone_unverified");
+    assert_eq!(app.otp.sent_count(), 5, "6th OTP within an hour must be skipped");
+}
+
+#[sqlx::test]
+async fn malformed_body_is_json_422(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let missing = app
+        .request(Method::POST, "/auth/sign-up", Some(json!({ "phone": PHONE, "display_name": "Ada" })), None)
+        .await;
+    assert_err(&missing, 422, "validation_failed");
+    let garbage = app.request_raw(Method::POST, "/auth/sign-up", "not json{").await;
+    assert_err(&garbage, 422, "validation_failed");
+    let bad_uuid = app
+        .request(Method::POST, "/auth/verify-phone", Some(json!({ "user_id": "nope", "code": "123456" })), None)
+        .await;
+    assert_err(&bad_uuid, 422, "validation_failed");
 }

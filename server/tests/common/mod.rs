@@ -29,9 +29,14 @@ pub const TEST_PASSWORD: &str = "correct-horse-1";
 #[derive(Default)]
 pub struct RecordingOtpSender {
     codes: Mutex<HashMap<String, String>>,
+    sent: Mutex<usize>,
 }
 
 impl RecordingOtpSender {
+    pub fn sent_count(&self) -> usize {
+        *self.sent.lock().unwrap()
+    }
+
     pub fn last_code(&self, phone_e164: &str) -> Option<String> {
         self.codes.lock().unwrap().get(phone_e164).cloned()
     }
@@ -41,6 +46,7 @@ impl RecordingOtpSender {
 impl OtpSender for RecordingOtpSender {
     async fn send(&self, phone_e164: &str, code: &str) -> Result<(), AppError> {
         self.codes.lock().unwrap().insert(phone_e164.to_string(), code.to_string());
+        *self.sent.lock().unwrap() += 1;
         Ok(())
     }
 }
@@ -96,6 +102,29 @@ impl TestApp {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
         TestResponse { status, json }
+    }
+
+    /// Sends a raw (possibly non-JSON) body with a JSON content type.
+    pub async fn request_raw(&self, method: Method, path: &str, body: &str) -> TestResponse {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("valid request");
+        let res = self.router.clone().oneshot(req).await.expect("infallible");
+        let status = res.status().as_u16();
+        let bytes = res.into_body().collect().await.expect("body").to_bytes();
+        TestResponse { status, json: serde_json::from_slice(&bytes).unwrap_or(Value::Null) }
+    }
+
+    /// Makes outstanding OTPs look older so the issue throttle window passes.
+    pub async fn age_otps(&self, secs: i32) {
+        sqlx::query("UPDATE otp_codes SET created_at = created_at - make_interval(secs => $1)")
+            .bind(f64::from(secs))
+            .execute(&self.pool)
+            .await
+            .unwrap();
     }
 
     /// The last OTP code sent to `phone` (any accepted format).

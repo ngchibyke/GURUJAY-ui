@@ -8,6 +8,8 @@ use crate::error::AppError;
 
 pub const OTP_MINUTES: i32 = 10;
 pub const OTP_MAX_ATTEMPTS: i32 = 5;
+pub const OTP_MIN_INTERVAL_SECS: f64 = 60.0;
+pub const OTP_MAX_PER_HOUR: i64 = 5;
 
 #[async_trait]
 pub trait OtpSender: Send + Sync {
@@ -50,6 +52,26 @@ pub async fn issue_otp(
 ) -> Result<(), AppError> {
     let code = format!("{:06}", OsRng.gen_range(0..1_000_000u32));
     let mut tx = db.begin().await.map_err(anyhow::Error::from)?;
+    // Serialise issuance per user so concurrent calls cannot slip past the throttle.
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let (recent, hourly): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE created_at > now() - make_interval(secs => $2)), \
+                count(*) FILTER (WHERE created_at > now() - interval '1 hour') \
+         FROM otp_codes WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .bind(OTP_MIN_INTERVAL_SECS)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(anyhow::Error::from)?;
+    if recent > 0 || hourly >= OTP_MAX_PER_HOUR {
+        // Throttled: callers keep their normal response, nothing new is sent.
+        return Ok(());
+    }
     sqlx::query("UPDATE otp_codes SET consumed_at = now() WHERE user_id = $1 AND consumed_at IS NULL")
         .bind(user_id)
         .execute(&mut *tx)

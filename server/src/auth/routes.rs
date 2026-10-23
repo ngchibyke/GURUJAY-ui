@@ -14,7 +14,7 @@ use super::{
     password::{blocking, dummy_verify, hash_password, validate_password, verify_password},
     sessions::{create_session, revoke_session},
 };
-use crate::{AppState, crypto::blind_index, error::AppError, phone::normalize_ng_phone};
+use crate::{AppState, crypto::blind_index, error::AppError, extract::AppJson, phone::normalize_ng_phone};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -51,21 +51,27 @@ pub async fn insert_user(
     display_name: &str,
     password_hash: &str,
 ) -> Result<Uuid, AppError> {
-    let result = sqlx::query_scalar::<_, Uuid>(
+    // Single statement: a fresh phone inserts; an existing UNVERIFIED, undeleted account is
+    // reclaimed (new credentials, same id); a verified/deleted one yields no row => conflict.
+    // ON CONFLICT makes concurrent sign-ups safe (no duplicate rows, no unique-violation 500).
+    let id: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO users (phone_enc, phone_idx, display_name, password_hash) \
-         VALUES ($1, $2, $3, $4) RETURNING id",
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (phone_idx) DO UPDATE SET \
+             phone_enc = EXCLUDED.phone_enc, \
+             display_name = EXCLUDED.display_name, \
+             password_hash = EXCLUDED.password_hash \
+         WHERE users.phone_verified_at IS NULL AND users.deleted_at IS NULL \
+         RETURNING id",
     )
     .bind(state.cipher.encrypt(phone_e164))
     .bind(blind_index(&state.index_key, phone_e164))
     .bind(display_name)
     .bind(password_hash)
-    .fetch_one(&state.db)
-    .await;
-    match result {
-        Ok(id) => Ok(id),
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err(AppError::Conflict("phone_taken")),
-        Err(e) => Err(anyhow::Error::from(e).into()),
-    }
+    .fetch_optional(&state.db)
+    .await
+    .map_err(anyhow::Error::from)?;
+    id.ok_or(AppError::Conflict("phone_taken"))
 }
 
 pub fn validate_display_name(name: &str) -> Result<String, AppError> {
@@ -78,7 +84,7 @@ pub fn validate_display_name(name: &str) -> Result<String, AppError> {
 
 async fn sign_up(
     State(state): State<AppState>,
-    Json(req): Json<SignUp>,
+    AppJson(req): AppJson<SignUp>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let phone = normalize_ng_phone(&req.phone)?;
     validate_password(&req.password)?;
@@ -91,13 +97,13 @@ async fn sign_up(
     Ok((StatusCode::CREATED, Json(json!({ "user_id": user_id }))))
 }
 
-async fn verify_phone(State(state): State<AppState>, Json(req): Json<VerifyPhone>) -> Result<Json<Value>, AppError> {
+async fn verify_phone(State(state): State<AppState>, AppJson(req): AppJson<VerifyPhone>) -> Result<Json<Value>, AppError> {
     verify_otp(&state.db, req.user_id, req.code.trim()).await?;
     let token = create_session(&state.db, req.user_id).await?;
     Ok(Json(json!({ "token": token })))
 }
 
-async fn sign_in(State(state): State<AppState>, Json(req): Json<SignIn>) -> Result<Json<Value>, AppError> {
+async fn sign_in(State(state): State<AppState>, AppJson(req): AppJson<SignIn>) -> Result<Json<Value>, AppError> {
     let phone = normalize_ng_phone(&req.phone)?;
     let row: Option<(Uuid, String, bool)> = sqlx::query_as(
         "SELECT id, password_hash, phone_verified_at IS NOT NULL FROM users \
