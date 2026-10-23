@@ -170,4 +170,32 @@ impl TestApp {
             .expect("promote to owner");
         token
     }
+
+    /// Creates a verified user, promotes it to support, returns its session token.
+    pub async fn make_support(&self) -> String {
+        let (user_id, token) = self.sign_up_verified("08088888888").await;
+        sqlx::query("UPDATE users SET role = 'support' WHERE id = $1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .expect("promote to support");
+        token
+    }
+
+    /// Owner creates an access code; returns (code id, plain code).
+    pub async fn create_access_code(&self, owner_token: &str, body: Value) -> (Uuid, String) {
+        let res = self
+            .request(Method::POST, "/admin/access-codes", Some(body), Some(owner_token))
+            .await;
+        assert_eq!(res.status, 201, "create code failed: {}", res.json);
+        (
+            res.json["id"].as_str().unwrap().parse().unwrap(),
+            res.json["code"].as_str().unwrap().to_string(),
+        )
+    }
+
+    pub async fn redeem(&self, token: &str, code: &str) -> TestResponse {
+        self.request(Method::POST, "/seller/redeem", Some(json!({ "code": code })), Some(token))
+            .await
+    }
 }

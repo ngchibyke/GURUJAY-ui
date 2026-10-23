@@ -1,3 +1,4 @@
+pub mod access_codes;
 pub mod audit;
 pub mod auth;
 pub mod config;
@@ -55,6 +56,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(auth::routes::router())
+        .merge(access_codes::routes::router())
         .layer(trace)
         .with_state(state)
 }

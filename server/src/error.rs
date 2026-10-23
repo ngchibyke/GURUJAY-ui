@@ -21,6 +21,8 @@ pub enum AppError {
     Conflict(&'static str),
     #[error("unprocessable: {0}")]
     Unprocessable(&'static str, String),
+    #[error("too many requests: {0}")]
+    TooManyRequests(&'static str),
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -41,6 +43,9 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, body("not_found", "Not found")),
             AppError::Conflict(code) => (StatusCode::CONFLICT, body(code, "Conflict with existing data")),
             AppError::Unprocessable(code, msg) => (StatusCode::UNPROCESSABLE_ENTITY, body(code, &msg)),
+            AppError::TooManyRequests(code) => {
+                (StatusCode::TOO_MANY_REQUESTS, body(code, "Too many attempts, try again later"))
+            }
             AppError::Internal(err) => {
                 tracing::error!(error = ?err, "internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, body("internal", "Something went wrong"))
