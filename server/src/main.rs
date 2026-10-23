@@ -6,7 +6,7 @@ use server::{
     auth::{
         otp::LogOtpSender,
         password::{blocking, hash_password, validate_password},
-        routes::{insert_user, validate_display_name},
+        routes::{create_owner_account, validate_display_name},
     },
     build_app,
     config::Config,
@@ -16,9 +16,34 @@ use server::{
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
+#[derive(Debug)]
+enum Command {
+    /// `server` or `server serve`
+    Serve,
+    /// `server create-owner --phone <phone> --name <name>` (flags kept as given)
+    CreateOwner(Vec<String>),
+}
+
+fn parse_command(args: &[String]) -> anyhow::Result<Command> {
+    match args.split_first() {
+        None => Ok(Command::Serve),
+        Some((cmd, rest)) if cmd == "serve" => {
+            if !rest.is_empty() {
+                bail!("serve takes no arguments");
+            }
+            Ok(Command::Serve)
+        }
+        Some((cmd, rest)) if cmd == "create-owner" => Ok(Command::CreateOwner(rest.to_vec())),
+        // The value is not echoed: it could be anything a user typed.
+        Some(_) => bail!("unknown command (expected: serve, create-owner)"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = parse_command(&args)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
@@ -34,11 +59,9 @@ async fn main() -> anyhow::Result<()> {
         otp: Arc::new(LogOtpSender { echo: config.otp_dev_echo }),
     };
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        None => serve(state, &config).await,
-        Some("create-owner") => create_owner(state, &args[1..]).await,
-        Some(other) => bail!("unknown command: {other}"),
+    match command {
+        Command::Serve => serve(state, &config).await,
+        Command::CreateOwner(flags) => create_owner(state, &flags).await,
     }
 }
 
@@ -63,13 +86,35 @@ async fn create_owner(state: AppState, args: &[String]) -> anyhow::Result<()> {
 
     let hash = blocking(move || hash_password(&password)).await.map_err(|e| anyhow::anyhow!("{e}"))?
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut tx = state.db.begin().await?;
-    let id = insert_user(&mut tx, &state, &phone, &name, &hash).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-    sqlx::query("UPDATE users SET role = 'owner', phone_verified_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
+    let id = create_owner_account(&state, &phone, &name, &hash).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("{id}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_argument_and_serve_both_start_the_server() {
+        assert!(matches!(parse_command(&args(&[])).unwrap(), Command::Serve));
+        assert!(matches!(parse_command(&args(&["serve"])).unwrap(), Command::Serve));
+    }
+
+    #[test]
+    fn create_owner_keeps_its_flags() {
+        let cmd = parse_command(&args(&["create-owner", "--phone", "080", "--name", "N"])).unwrap();
+        let Command::CreateOwner(rest) = cmd else { panic!("expected create-owner") };
+        assert_eq!(rest, args(&["--phone", "080", "--name", "N"]));
+    }
+
+    #[test]
+    fn unknown_command_and_extra_serve_args_rejected() {
+        assert!(parse_command(&args(&["bogus"])).is_err());
+        assert!(parse_command(&args(&["serve", "now"])).is_err());
+    }
 }

@@ -58,6 +58,7 @@ pub struct TestResponse {
 
 pub struct TestApp {
     router: Router,
+    pub state: AppState,
     pub pool: PgPool,
     pub otp: Arc<RecordingOtpSender>,
 }
@@ -71,7 +72,7 @@ impl TestApp {
             index_key: Arc::new(TEST_INDEX_KEY),
             otp: otp.clone(),
         };
-        Self { router: build_app(state), pool, otp }
+        Self { router: build_app(state.clone()), state, pool, otp }
     }
 
     pub async fn request(

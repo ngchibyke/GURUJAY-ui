@@ -17,7 +17,7 @@ use super::{
 use sqlx::{PgConnection, PgPool};
 
 use crate::{
-    AppState,
+    AppState, audit,
     crypto::blind_index,
     error::{AppError, Redacted},
     extract::AppJson,
@@ -84,6 +84,27 @@ pub async fn insert_user(
     .map_err(anyhow::Error::from)?;
     let id = id.ok_or(AppError::Conflict("phone_taken"))?;
     invalidate_otps(conn, id).await?;
+    Ok(id)
+}
+
+/// Creates (or reclaims an unverified account as) a verified owner, in one transaction
+/// with its audit entry. Used by the `create-owner` CLI command.
+pub async fn create_owner_account(
+    state: &AppState,
+    phone_e164: &str,
+    display_name: &str,
+    password_hash: &str,
+) -> Result<Uuid, AppError> {
+    let mut tx = state.db.begin().await.map_err(anyhow::Error::from)?;
+    let id = insert_user(&mut tx, state, phone_e164, display_name, password_hash).await?;
+    sqlx::query("UPDATE users SET role = 'owner', phone_verified_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
+    // No actor: the CLI runs with database access, not as a signed-in user. No PII in detail.
+    audit::record(&mut tx, None, "user.owner_created", "user", Some(id), json!({ "via": "cli" })).await?;
+    tx.commit().await.map_err(anyhow::Error::from)?;
     Ok(id)
 }
 
