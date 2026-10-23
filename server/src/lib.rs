@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod error;
@@ -9,13 +10,20 @@ use axum::{
     http::Request,
     routing::get,
 };
+use std::sync::Arc;
+
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
+use crate::{auth::otp::OtpSender, crypto::FieldCipher};
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
+    pub cipher: Arc<FieldCipher>,
+    pub index_key: Arc<[u8; 32]>,
+    pub otp: Arc<dyn OtpSender>,
 }
 
 async fn health() -> Json<Value> {
@@ -44,6 +52,7 @@ pub fn build_app(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .merge(auth::routes::router())
         .layer(trace)
         .with_state(state)
 }

@@ -1,15 +1,49 @@
 #![allow(dead_code)]
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
     http::{Method, Request, header},
 };
 use http_body_util::BodyExt;
-use serde_json::Value;
-use server::{AppState, build_app};
+use serde_json::{Value, json};
+use server::{
+    AppState, auth::otp::OtpSender, build_app, crypto::FieldCipher, error::AppError,
+    phone::normalize_ng_phone,
+};
 use sqlx::PgPool;
 use tower::ServiceExt;
+use uuid::Uuid;
+
+pub const TEST_FIELD_KEY: [u8; 32] = [7u8; 32];
+pub const TEST_INDEX_KEY: [u8; 32] = [9u8; 32];
+pub const TEST_PASSWORD: &str = "correct-horse-1";
+
+/// Captures the last OTP code sent to each (E.164) phone number.
+#[derive(Default)]
+pub struct RecordingOtpSender {
+    codes: Mutex<HashMap<String, String>>,
+}
+
+impl RecordingOtpSender {
+    pub fn last_code(&self, phone_e164: &str) -> Option<String> {
+        self.codes.lock().unwrap().get(phone_e164).cloned()
+    }
+}
+
+#[async_trait]
+impl OtpSender for RecordingOtpSender {
+    async fn send(&self, phone_e164: &str, code: &str) -> Result<(), AppError> {
+        self.codes.lock().unwrap().insert(phone_e164.to_string(), code.to_string());
+        Ok(())
+    }
+}
 
 pub struct TestResponse {
     pub status: u16,
@@ -18,12 +52,20 @@ pub struct TestResponse {
 
 pub struct TestApp {
     router: Router,
+    pub pool: PgPool,
+    pub otp: Arc<RecordingOtpSender>,
 }
 
 impl TestApp {
     pub async fn new(pool: PgPool) -> Self {
-        let state = AppState { db: pool };
-        Self { router: build_app(state) }
+        let otp = Arc::new(RecordingOtpSender::default());
+        let state = AppState {
+            db: pool.clone(),
+            cipher: Arc::new(FieldCipher::new(TEST_FIELD_KEY)),
+            index_key: Arc::new(TEST_INDEX_KEY),
+            otp: otp.clone(),
+        };
+        Self { router: build_app(state), pool, otp }
     }
 
     pub async fn request(
@@ -54,5 +96,49 @@ impl TestApp {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
         TestResponse { status, json }
+    }
+
+    /// The last OTP code sent to `phone` (any accepted format).
+    pub fn last_code(&self, phone: &str) -> String {
+        let e164 = normalize_ng_phone(phone).expect("valid test phone");
+        self.otp.last_code(&e164).expect("an OTP was sent")
+    }
+
+    pub async fn sign_up(&self, phone: &str, password: &str) -> TestResponse {
+        self.request(
+            Method::POST,
+            "/auth/sign-up",
+            Some(json!({ "phone": phone, "password": password, "display_name": "Ada" })),
+            None,
+        )
+        .await
+    }
+
+    /// Signs up, verifies the phone with the emitted OTP, returns (user id, session token).
+    pub async fn sign_up_verified(&self, phone: &str) -> (Uuid, String) {
+        let res = self.sign_up(phone, TEST_PASSWORD).await;
+        assert_eq!(res.status, 201, "sign-up failed: {}", res.json);
+        let user_id: Uuid = res.json["user_id"].as_str().unwrap().parse().unwrap();
+        let verify = self
+            .request(
+                Method::POST,
+                "/auth/verify-phone",
+                Some(json!({ "user_id": user_id, "code": self.last_code(phone) })),
+                None,
+            )
+            .await;
+        assert_eq!(verify.status, 200, "verify failed: {}", verify.json);
+        (user_id, verify.json["token"].as_str().unwrap().to_string())
+    }
+
+    /// Creates a verified user, promotes it to owner, returns its session token.
+    pub async fn make_owner(&self) -> String {
+        let (user_id, token) = self.sign_up_verified("08099999999").await;
+        sqlx::query("UPDATE users SET role = 'owner' WHERE id = $1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .expect("promote to owner");
+        token
     }
 }

@@ -11,6 +11,8 @@ pub enum AppError {
     Validation(String),
     #[error("unauthorized")]
     Unauthorized,
+    #[error("invalid credentials")]
+    InvalidCredentials,
     #[error("forbidden: {0}")]
     Forbidden(&'static str),
     #[error("not found")]
@@ -30,8 +32,11 @@ fn body(code: &str, message: &str) -> serde_json::Value {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, payload) = match self {
-            AppError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, body("validation", &msg)),
+            AppError::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, body("validation_failed", &msg)),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, body("unauthorized", "Authentication required")),
+            AppError::InvalidCredentials => {
+                (StatusCode::UNAUTHORIZED, body("invalid_credentials", "Phone number or password is incorrect"))
+            }
             AppError::Forbidden(code) => (StatusCode::FORBIDDEN, body(code, "You are not allowed to do this")),
             AppError::NotFound => (StatusCode::NOT_FOUND, body("not_found", "Not found")),
             AppError::Conflict(code) => (StatusCode::CONFLICT, body(code, "Conflict with existing data")),
