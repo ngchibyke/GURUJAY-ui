@@ -8,6 +8,7 @@ pub mod extract;
 pub mod limits;
 pub mod money;
 pub mod payments;
+pub mod payout_accounts;
 pub mod phone;
 pub mod products;
 pub mod settings;
@@ -80,6 +81,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(stores::routes::router())
         .merge(products::routes::router())
         .merge(settings::routes::router())
+        .merge(payout_accounts::routes::router())
         // Must follow every route: it applies to the method routers registered so far.
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
