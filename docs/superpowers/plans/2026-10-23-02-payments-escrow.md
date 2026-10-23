@@ -372,6 +372,12 @@ impl ProviderRegistry {
 - **Ledger accounts:** `buyer_funds`, `escrow`, `platform_revenue`, `provider_fees`, `seller_payable`, `seller_paid`, `refunds`.
   - Every `ledger::post` asserts a zero sum.
   - Signs: an inflow to the platform's books is positive on the internal account and negative on the external one.
+- **Reserved-stock model (ruling during Task 4).** `product_variants` has `stock` (on hand) and `reserved_quantity`. Available stock is `stock - reserved_quantity`.
+  - Checkout reserves stock (`reserved_quantity += q`).
+  - **Payment commits it:** `stock -= q`, `reserved_quantity -= q`, under the variant locks.
+  - Expiry releases it (`reserved_quantity -= q`).
+  - Paid-after-expiry re-reserves and commits only if available stock covers every line; otherwise it refunds.
+  - `refund_order(.., restore_stock: true)` on a paid order adds the committed units back to `stock`.
 - When marking orders paid, set `ship_by = paid_at + ship_deadline_hours` and `backstop_at = paid_at + backstop_days`, using the settings read at that moment.
 - `enabled_methods` is checked **only** at `POST /checkout`. Webhooks, polls and refunds always use the checkout's stored `provider`, even if the owner has since disabled the method. Test: `disabled_method_still_settles`.
 - Migration 0012 creates `provider_events`, `payouts`, `refunds` and `seller_strikes`, so Tasks 8 and 9 add no migration. `payouts` gets the extra columns from the Task 8 amendment.
