@@ -3,13 +3,20 @@
 
 use crate::error::AppError;
 
-/// Payout fee schedule in kobo. The fee is `small_fee` up to and including
-/// `threshold`, and `large_fee` above it.
+/// Payout fee schedule in kobo. The base fee is `small_fee` up to and including
+/// `threshold`, and `large_fee` above it. On top of that, `stamp_duty_kobo` is
+/// added when the payout is at or above `stamp_duty_threshold`.
+///
+/// The stamp duty (flat NGN 50 on transfers of NGN 10,000 or more from 1 Jan
+/// 2026) is configurable because its source is news reports, not the statute;
+/// confirm the rule and who bears it with a tax adviser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeeSchedule {
     pub small_fee: i64,
     pub large_fee: i64,
     pub threshold: i64,
+    pub stamp_duty_kobo: i64,
+    pub stamp_duty_threshold: i64,
 }
 
 impl Default for FeeSchedule {
@@ -18,6 +25,8 @@ impl Default for FeeSchedule {
             small_fee: 3_500,
             large_fee: 5_000,
             threshold: 5_000_000,
+            stamp_duty_kobo: 5_000,
+            stamp_duty_threshold: 1_000_000,
         }
     }
 }
@@ -42,13 +51,21 @@ pub fn cut_kobo(items_total: i64, bps: i32) -> i64 {
 }
 
 /// Fee for paying out `payout_before_fee`: `small_fee` when it is at or below
-/// the threshold (inclusive), otherwise `large_fee`.
+/// the threshold (inclusive), otherwise `large_fee`; plus `stamp_duty_kobo`
+/// when it is at or above `stamp_duty_threshold`. The seller bears this fee.
+/// Example with defaults: 5_000_000 -> 3_500 + 5_000 = 8_500.
 pub fn payout_fee_kobo(payout_before_fee: i64, s: &FeeSchedule) -> i64 {
-    if payout_before_fee <= s.threshold {
+    let base = if payout_before_fee <= s.threshold {
         s.small_fee
     } else {
         s.large_fee
-    }
+    };
+    let duty = if payout_before_fee >= s.stamp_duty_threshold {
+        s.stamp_duty_kobo
+    } else {
+        0
+    };
+    base.saturating_add(duty)
 }
 
 /// Splits `total` across `weights` by the largest-remainder method, so the
@@ -95,6 +112,7 @@ mod tests {
         assert_eq!(cut_kobo(1_000_000, 500), 50_000);
         assert_eq!(cut_kobo(1_001, 500), 50);
         assert_eq!(cut_kobo(1_010, 500), 51);
+        assert_eq!(cut_kobo(1_050, 500), 53); // 52.5 rounds up
     }
 
     #[test]
@@ -107,9 +125,18 @@ mod tests {
     #[test]
     fn payout_fee_boundary_is_inclusive() {
         let s = FeeSchedule::default();
-        assert_eq!(payout_fee_kobo(5_000_000, &s), 3_500);
-        assert_eq!(payout_fee_kobo(5_000_001, &s), 5_000);
+        // small fee 3_500 + stamp duty 5_000
+        assert_eq!(payout_fee_kobo(5_000_000, &s), 8_500);
+        // large fee 5_000 + stamp duty 5_000
+        assert_eq!(payout_fee_kobo(5_000_001, &s), 10_000);
         assert_eq!(payout_fee_kobo(0, &s), 3_500);
+    }
+
+    #[test]
+    fn stamp_duty_applies_from_threshold() {
+        let s = FeeSchedule::default();
+        assert_eq!(payout_fee_kobo(999_999, &s), 3_500);
+        assert_eq!(payout_fee_kobo(1_000_000, &s), 8_500);
     }
 
     #[test]

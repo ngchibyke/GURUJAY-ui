@@ -36,3 +36,6 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
+
+[profile.release]
+overflow-checks = true
