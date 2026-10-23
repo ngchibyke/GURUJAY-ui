@@ -453,6 +453,8 @@ impl ProviderRegistry {
   3. Otherwise call `create_payout` with the **same** reference. `Ok` → `pending` with the id. `Rejected` → `failed`. `Unavailable` → `scheduled` with `next_attempt_at` set by backoff. `Timeout` → `unknown`.
 - `mark_delivered` sets `orders.release_at = delivered_at + release_after_hours`, reading the setting at that moment.
 - The payout fee is computed from the fee schedule **at release**, and is stored on the payout row as `fee_kobo`.
+- **Account-change hold (research, Task 3):** `send_payout` re-checks that the store's payout account is still `verified`. It also refuses to send within 48h of `payout_accounts.changed_at` when that change replaced an earlier account. In that case the payout stays `scheduled`, with `next_attempt_at = changed_at + 48h`. Test: `payout_held_48h_after_account_change`.
+- `ProviderError::Timeout` is never propagated with `?`. Match on it explicitly and persist `unknown` (Task 5 review).
 - **Do not send** while the order is held or its checkout is `provider_flagged`. The payout stays `scheduled`.
 - **Release ledger** (at release): `escrow −(items + delivery)`, `platform_revenue +(cut + delivery)`, `provider_fees +collection_fee_share`, `platform_revenue +payout_fee_charged`, `seller_payable +payout`.
   - The payout fee charged to the seller is platform revenue; the real provider fee is booked when it is known.
