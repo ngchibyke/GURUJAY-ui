@@ -253,6 +253,7 @@ server/tests/
 - **Variant locks are always taken ordered by variant id** (`... WHERE id = ANY($1) ORDER BY id FOR UPDATE`), so two checkouts never deadlock.
 - `orders` gains `held_at timestamptz null` and `hold_reason text null`. A held order never auto-releases. Plan 5 sets these from complaints; Task 10 lets the owner set and clear them.
 - `checkouts` gains `provider_flagged boolean not null default false` (set in Task 6).
+- **No retroactive settings changes (research, Task 2).** `orders` gains three nullable `timestamptz` columns: `ship_by`, `release_at` and `backstop_at`. Task 6 sets `ship_by` and `backstop_at` when the order is paid. Task 8's `mark_delivered` sets `release_at`. Task 9's jobs compare against these stored columns, never against live settings.
 - Wire the Task 0 caps: line quantity ≤ `limits::MAX_LINE_QUANTITY` (422), and checkout total ≤ `limits::MAX_CHECKOUT_TOTAL_KOBO` (422 `amount_too_large`). Each gets a cap+1 test.
 
 ---
@@ -371,6 +372,8 @@ impl ProviderRegistry {
 - **Ledger accounts:** `buyer_funds`, `escrow`, `platform_revenue`, `provider_fees`, `seller_payable`, `seller_paid`, `refunds`.
   - Every `ledger::post` asserts a zero sum.
   - Signs: an inflow to the platform's books is positive on the internal account and negative on the external one.
+- When marking orders paid, set `ship_by = paid_at + ship_deadline_hours` and `backstop_at = paid_at + backstop_days`, using the settings read at that moment.
+- `enabled_methods` is checked **only** at `POST /checkout`. Webhooks, polls and refunds always use the checkout's stored `provider`, even if the owner has since disabled the method. Test: `disabled_method_still_settles`.
 - Migration 0012 creates `provider_events`, `payouts`, `refunds` and `seller_strikes`, so Tasks 8 and 9 add no migration. `payouts` gets the extra columns from the Task 8 amendment.
 
 ---
@@ -448,6 +451,8 @@ impl ProviderRegistry {
   1. Claim the row: `scheduled|unknown → sending` in its own short transaction.
   2. If the status was `unknown`, call `find_payout(reference)` first. If the payout is found, adopt its id → `pending`.
   3. Otherwise call `create_payout` with the **same** reference. `Ok` → `pending` with the id. `Rejected` → `failed`. `Unavailable` → `scheduled` with `next_attempt_at` set by backoff. `Timeout` → `unknown`.
+- `mark_delivered` sets `orders.release_at = delivered_at + release_after_hours`, reading the setting at that moment.
+- The payout fee is computed from the fee schedule **at release**, and is stored on the payout row as `fee_kobo`.
 - **Do not send** while the order is held or its checkout is `provider_flagged`. The payout stays `scheduled`.
 - **Release ledger** (at release): `escrow −(items + delivery)`, `platform_revenue +(cut + delivery)`, `provider_fees +collection_fee_share`, `platform_revenue +payout_fee_charged`, `seller_payable +payout`.
   - The payout fee charged to the seller is platform revenue; the real provider fee is booked when it is known.
@@ -494,6 +499,7 @@ impl ProviderRegistry {
   - Stuck `sending` older than 10 minutes moves to `unknown`.
   - Backoff is `next_attempt_at = now + min(2^attempts minutes, 6h) ± 20% jitter`. After 8 attempts → `manual`.
   - A definite `failed` → `manual` in the same job, with an audit row.
+- The ship-deadline, auto-release and backstop jobs compare `now` against the stored `orders.ship_by`, `release_at` and `backstop_at`. Checkout expiry uses the stored `checkouts.expires_at`. Live settings are never used, so a settings change never moves an existing deadline. Test: `settings_change_does_not_move_existing_deadlines`.
 - Auto-release skips held orders and orders whose checkout is `provider_flagged`.
 - Test added: `received_and_job_race_one_payout`, which runs the T7 received route and `run_due_jobs` concurrently and asserts one payout row and one provider call.
 
