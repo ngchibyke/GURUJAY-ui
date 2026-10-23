@@ -13,7 +13,7 @@ const MAX_SLUG_ATTEMPTS: u32 = 1000;
 /// Slugs that collide with static routes (e.g. `/stores/mine`); never allocated as-is.
 const RESERVED_SLUGS: &[&str] = &["mine", "new", "search", "id"];
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct NewStore {
     pub name: String,
     #[serde(default)]
@@ -24,7 +24,7 @@ pub struct NewStore {
     pub delivery_self: bool,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 pub struct StorePatch {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -32,6 +32,35 @@ pub struct StorePatch {
     pub pickup_state: Option<String>,
     pub delivery_courier: Option<bool>,
     pub delivery_self: Option<bool>,
+}
+
+const REDACTED: &str = "[redacted]";
+
+// Hand-written so the pickup address (personal data) never reaches logs or panics.
+impl std::fmt::Debug for NewStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewStore")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("pickup_address", &REDACTED)
+            .field("pickup_state", &self.pickup_state)
+            .field("delivery_courier", &self.delivery_courier)
+            .field("delivery_self", &self.delivery_self)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for StorePatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorePatch")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .field("pickup_address", &self.pickup_address.as_ref().map(|_| REDACTED))
+            .field("pickup_state", &self.pickup_state)
+            .field("delivery_courier", &self.delivery_courier)
+            .field("delivery_self", &self.delivery_self)
+            .finish()
+    }
 }
 
 /// A store as stored, with the pickup address still encrypted.
@@ -69,11 +98,17 @@ pub struct PublicStore {
 }
 
 /// The owner-only shape: the public shape plus the decrypted pickup address.
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct OwnerStore {
     #[serde(flatten)]
     pub store: PublicStore,
     pub pickup_address: String,
+}
+
+impl std::fmt::Debug for OwnerStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerStore").field("store", &self.store).field("pickup_address", &REDACTED).finish()
+    }
 }
 
 impl Store {
@@ -321,5 +356,31 @@ mod tests {
         assert_eq!(slugify("Mama  Put!"), "mama-put");
         assert_eq!(slugify("  --Abuja's Best--  "), "abuja-s-best");
         assert_eq!(slugify("!!!"), "store");
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn store_inputs_do_not_debug_print_the_address() {
+        let new = NewStore {
+            name: "Shop".into(),
+            description: String::new(),
+            pickup_address: "12 Secret Close, Wuse".into(),
+            pickup_state: "FCT".into(),
+            delivery_courier: true,
+            delivery_self: false,
+        };
+        let patch = StorePatch { pickup_address: Some("12 Secret Close, Wuse".into()), ..Default::default() };
+        for printed in [format!("{new:?}"), format!("{patch:?}")] {
+            assert!(!printed.contains("Secret"), "{printed}");
+            assert!(printed.contains("[redacted]"), "{printed}");
+        }
+        // Fields without personal data stay visible for debugging.
+        assert!(format!("{new:?}").contains("Shop"));
+        // An absent address is shown as absent.
+        assert!(format!("{:?}", StorePatch::default()).contains("pickup_address: None"));
     }
 }
