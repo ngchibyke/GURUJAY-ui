@@ -5,6 +5,7 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod extract;
+pub mod limits;
 pub mod phone;
 pub mod products;
 pub mod stores;

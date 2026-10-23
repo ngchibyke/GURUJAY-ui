@@ -246,7 +246,7 @@ async fn sign_in(
         // Only hand out a verification id if the credentials just checked are still current
         // (a concurrent reclaim may have replaced them).
         let current: Option<String> = sqlx::query_scalar(
-            "SELECT password_hash FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+            "SELECT password_hash FROM users WHERE id = $1 AND deleted_at IS NULL FOR NO KEY UPDATE",
         )
         .bind(user_id)
         .fetch_optional(&mut *tx)

@@ -157,7 +157,7 @@ async fn redeem_tx(db: &PgPool, user_id: Uuid, normalized: &str) -> Result<(), A
     // Lock the user first (consistent order: user, then code) so a double submit by the
     // same user serializes instead of hitting the unique redemption constraint.
     let is_seller: bool =
-        sqlx::query_scalar("SELECT is_seller FROM users WHERE id = $1 FOR UPDATE")
+        sqlx::query_scalar("SELECT is_seller FROM users WHERE id = $1 FOR NO KEY UPDATE")
             .bind(user_id)
             .fetch_one(&mut *tx)
             .await
@@ -189,7 +189,7 @@ async fn redeem_tx(db: &PgPool, user_id: Uuid, normalized: &str) -> Result<(), A
         "SELECT id, max_uses, uses, \
                 COALESCE(expires_at <= now(), false) AS expired, \
                 revoked_at IS NOT NULL AS revoked \
-         FROM access_codes WHERE code_hash = $1 FOR UPDATE",
+         FROM access_codes WHERE code_hash = $1 FOR NO KEY UPDATE",
     )
     .bind(hash(normalized))
     .fetch_optional(&mut *tx)

@@ -16,6 +16,9 @@ use server::{
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
+/// How long open connections get to finish after a shutdown signal.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug)]
 enum Command {
     /// `server` or `server serve`
@@ -75,8 +78,51 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(state: AppState, config: &Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "listening");
-    axum::serve(listener, build_app(state)).await?;
+    let db = state.db.clone();
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, build_app(state)).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received, draining connections");
+        let _ = signalled_tx.send(());
+    });
+    // Idle keep-alive connections can stall the drain forever, so bound it once the signal fires.
+    tokio::select! {
+        res = server => res?,
+        _ = async {
+            if signalled_rx.await.is_ok() {
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => tracing::warn!("drain timed out, shutting down with connections still open"),
+    }
+    db.close().await;
+    tracing::info!("shut down");
     Ok(())
+}
+
+/// Resolves on Ctrl-C or (on unix) SIGTERM so in-flight requests can finish.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn flag(args: &[String], name: &str) -> anyhow::Result<String> {

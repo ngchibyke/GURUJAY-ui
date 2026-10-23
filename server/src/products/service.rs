@@ -7,7 +7,11 @@ use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{audit, error::AppError};
+use crate::{
+    audit,
+    error::AppError,
+    limits::{MAX_PRICE_KOBO, MAX_STOCK},
+};
 
 const MAX_VARIANTS: usize = 50;
 const MAX_ATTRIBUTES: usize = 5;
@@ -171,6 +175,30 @@ fn validate_positive(value: i64, field: &str) -> Result<(), AppError> {
     }
 }
 
+fn validate_price(value: i64, field: &str) -> Result<(), AppError> {
+    validate_positive(value, field)?;
+    if value > MAX_PRICE_KOBO {
+        return Err(AppError::Validation(format!(
+            "{field} must be at most {MAX_PRICE_KOBO}"
+        )));
+    }
+    Ok(())
+}
+
+/// Trims attribute keys and values so "M" and "M " are the same variant, in Rust and in the DB.
+fn normalize_variants(variants: Vec<VariantInput>) -> Vec<VariantInput> {
+    variants
+        .into_iter()
+        .map(|mut v| {
+            v.attributes = std::mem::take(&mut v.attributes)
+                .into_iter()
+                .map(|(k, val)| (k.trim().to_string(), val.trim().to_string()))
+                .collect();
+            v
+        })
+        .collect()
+}
+
 fn validate_dimensions(l: Option<i32>, w: Option<i32>, h: Option<i32>) -> Result<(), AppError> {
     for (v, f) in [(l, "length_cm"), (w, "width_cm"), (h, "height_cm")] {
         if let Some(v) = v {
@@ -189,8 +217,13 @@ fn validate_variants(variants: &[VariantInput]) -> Result<(), AppError> {
         if v.stock < 0 {
             return Err(invalid("variant stock must not be negative"));
         }
+        if v.stock > MAX_STOCK {
+            return Err(AppError::Validation(format!(
+                "variant stock must be at most {MAX_STOCK}"
+            )));
+        }
         if let Some(p) = v.price_kobo {
-            validate_positive(p, "variant price_kobo")?;
+            validate_price(p, "variant price_kobo")?;
         }
         if v.attributes.len() > MAX_ATTRIBUTES {
             return Err(invalid("a variant can have at most 5 attributes"));
@@ -239,6 +272,43 @@ async fn insert_variants(
     Ok(())
 }
 
+/// Makes the product's variants match `variants`: those with the same attributes keep their id
+/// (stock, price and sku are updated), new ones are inserted, and missing ones are deleted.
+async fn upsert_variants(
+    tx: &mut Transaction<'_, Postgres>,
+    product_id: Uuid,
+    variants: &[VariantInput],
+) -> Result<(), AppError> {
+    let keep: Vec<serde_json::Value> = variants
+        .iter()
+        .map(|v| serde_json::to_value(&v.attributes).context("serialise attributes"))
+        .collect::<Result<_, _>>()?;
+    // The product row is locked by the caller for the whole diff, so concurrent replaces serialise.
+    // TODO(task 4): refuse with 409 `variant_in_use` when order_items reference a missing variant.
+    sqlx::query(
+        "DELETE FROM product_variants WHERE product_id = $1 AND NOT (attributes = ANY($2::jsonb[]))",
+    )
+    .bind(product_id)
+    .bind(&keep)
+    .execute(&mut **tx)
+    .await
+    .context("delete removed variants")?;
+    for (v, attrs) in variants.iter().zip(keep) {
+        sqlx::query(
+            "INSERT INTO product_variants (product_id, attributes, stock, price_kobo, sku)              VALUES ($1, $2, $3, $4, $5)              ON CONFLICT (product_id, attributes) DO UPDATE              SET stock = EXCLUDED.stock, price_kobo = EXCLUDED.price_kobo, sku = EXCLUDED.sku",
+        )
+        .bind(product_id)
+        .bind(attrs)
+        .bind(v.stock)
+        .bind(v.price_kobo)
+        .bind(&v.sku)
+        .execute(&mut **tx)
+        .await
+        .context("upsert variant")?;
+    }
+    Ok(())
+}
+
 async fn load_variants(db: &PgPool, product_id: Uuid) -> Result<Vec<Variant>, AppError> {
     let rows: Vec<VariantRow> = sqlx::query_as(
         "SELECT id, attributes, stock, price_kobo, sku FROM product_variants \
@@ -275,7 +345,7 @@ async fn lock_owned(
     sqlx::query_as(&format!(
         "SELECT {PRODUCT_COLUMNS} FROM products p WHERE p.id = $1 AND p.deleted_at IS NULL \
          AND EXISTS (SELECT 1 FROM stores s WHERE s.id = p.store_id AND s.owner_id = $2 AND s.deleted_at IS NULL) \
-         FOR UPDATE OF p"
+         FOR NO KEY UPDATE OF p"
     ))
     .bind(id)
     .bind(owner)
@@ -289,8 +359,9 @@ pub async fn create_product(
     db: &PgPool,
     owner: Uuid,
     store_id: Uuid,
-    input: NewProduct,
+    mut input: NewProduct,
 ) -> Result<ProductView, AppError> {
+    input.variants = normalize_variants(std::mem::take(&mut input.variants));
     validate_text(&input.name, 120, "name")?;
     validate_text(&input.description, 5000, "description")?;
     validate_text(&input.category, 60, "category")?;
@@ -299,7 +370,7 @@ pub async fn create_product(
     validate_photos(&input.photo_keys)?;
     validate_positive(input.weight_grams.into(), "weight_grams")?;
     validate_dimensions(input.length_cm, input.width_cm, input.height_cm)?;
-    validate_positive(input.base_price_kobo, "base_price_kobo")?;
+    validate_price(input.base_price_kobo, "base_price_kobo")?;
     validate_variants(&input.variants)?;
 
     let mut tx = db.begin().await.context("begin")?;
@@ -380,7 +451,7 @@ pub async fn update_product(
     validate_photos(&photo_keys)?;
     validate_positive(weight.into(), "weight_grams")?;
     validate_dimensions(l, w, h)?;
-    validate_positive(base, "base_price_kobo")?;
+    validate_price(base, "base_price_kobo")?;
 
     let product: Product = sqlx::query_as(&format!(
         "UPDATE products SET name = $2, description = $3, category = $4, brand = $5, \
@@ -423,15 +494,11 @@ pub async fn replace_variants(
     id: Uuid,
     variants: Vec<VariantInput>,
 ) -> Result<ProductView, AppError> {
+    let variants = normalize_variants(variants);
     validate_variants(&variants)?;
     let mut tx = db.begin().await.context("begin")?;
     let product = lock_owned(&mut tx, owner, id).await?;
-    sqlx::query("DELETE FROM product_variants WHERE product_id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .context("clear variants")?;
-    insert_variants(&mut tx, id, &variants).await?;
+    upsert_variants(&mut tx, id, &variants).await?;
     sqlx::query("UPDATE products SET updated_at = now() WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
