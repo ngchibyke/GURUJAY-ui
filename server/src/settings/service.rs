@@ -5,10 +5,8 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{audit, error::AppError, limits, money::FeeSchedule};
+use crate::{audit, error::AppError, limits, money::FeeSchedule, payments::ProviderRegistry};
 
-/// Payment methods the owner may enable. Task 5 replaces this with the provider registry.
-const KNOWN_METHODS: &[&str] = &["mono_directpay"];
 /// Payout providers the owner may select.
 const KNOWN_PAYOUT_PROVIDERS: &[&str] = &["mono"];
 
@@ -139,7 +137,9 @@ impl SettingsPatch {
                 ));
             }
             for (i, m) in methods.iter().enumerate() {
-                if !KNOWN_METHODS.contains(&m.as_str()) {
+                // Any method of a provider compiled into this build, configured or not,
+                // so the owner can enable a method before its keys exist.
+                if !ProviderRegistry::is_supported_method(m) {
                     return Err(AppError::Unprocessable(
                         "unknown_payment_method",
                         "a payment method is not registered".into(),

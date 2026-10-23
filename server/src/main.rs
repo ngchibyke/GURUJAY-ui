@@ -11,6 +11,7 @@ use server::{
     build_app,
     config::Config,
     crypto::FieldCipher,
+    payments::ProviderRegistry,
     phone::normalize_ng_phone,
 };
 use sqlx::postgres::PgPoolOptions;
@@ -67,6 +68,8 @@ async fn main() -> anyhow::Result<()> {
         otp: Arc::new(LogOtpSender {
             echo: config.otp_dev_echo,
         }),
+        // Mono is registered here once its keys are configured (Task 11).
+        providers: Arc::new(ProviderRegistry::new()),
     };
 
     match command {

@@ -7,6 +7,7 @@ pub mod error;
 pub mod extract;
 pub mod limits;
 pub mod money;
+pub mod payments;
 pub mod phone;
 pub mod products;
 pub mod settings;
@@ -19,7 +20,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
-use crate::{auth::otp::OtpSender, crypto::FieldCipher, error::AppError};
+use crate::{
+    auth::otp::OtpSender, crypto::FieldCipher, error::AppError, payments::ProviderRegistry,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -27,6 +30,8 @@ pub struct AppState {
     pub cipher: Arc<FieldCipher>,
     pub index_key: Arc<[u8; 32]>,
     pub otp: Arc<dyn OtpSender>,
+    /// Configured payment providers. Production never registers `FakeProvider`.
+    pub providers: Arc<ProviderRegistry>,
 }
 
 async fn health() -> Json<Value> {

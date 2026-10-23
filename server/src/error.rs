@@ -37,6 +37,12 @@ pub enum AppError {
     Unprocessable(&'static str, String),
     #[error("too many requests: {0}")]
     TooManyRequests(&'static str),
+    /// 502 `payment_provider_unavailable`: the payment provider failed or is not configured.
+    #[error("payment provider unavailable")]
+    ProviderUnavailable,
+    /// 501 `not_supported`: the provider does not offer this operation.
+    #[error("not supported")]
+    NotSupported,
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -87,6 +93,17 @@ impl IntoResponse for AppError {
             AppError::TooManyRequests(code) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 body(code, "Too many attempts, try again later"),
+            ),
+            AppError::ProviderUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                body(
+                    "payment_provider_unavailable",
+                    "The payment provider is unavailable, try again later",
+                ),
+            ),
+            AppError::NotSupported => (
+                StatusCode::NOT_IMPLEMENTED,
+                body("not_supported", "This operation is not supported"),
             ),
             AppError::Internal(err) => {
                 tracing::error!(error = ?err, "internal error");

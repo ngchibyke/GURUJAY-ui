@@ -14,7 +14,12 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use server::{
-    AppState, auth::otp::OtpSender, build_app, crypto::FieldCipher, error::AppError,
+    AppState,
+    auth::otp::OtpSender,
+    build_app,
+    crypto::FieldCipher,
+    error::AppError,
+    payments::{ProviderRegistry, fake::FakeProvider},
     phone::normalize_ng_phone,
 };
 use sqlx::PgPool;
@@ -64,22 +69,29 @@ pub struct TestApp {
     pub state: AppState,
     pub pool: PgPool,
     pub otp: Arc<RecordingOtpSender>,
+    /// The registered payment provider (name "fake", method "mono_directpay").
+    pub fake: Arc<FakeProvider>,
 }
 
 impl TestApp {
     pub async fn new(pool: PgPool) -> Self {
         let otp = Arc::new(RecordingOtpSender::default());
+        let fake = Arc::new(FakeProvider::new());
+        let mut providers = ProviderRegistry::new();
+        providers.register(fake.clone());
         let state = AppState {
             db: pool.clone(),
             cipher: Arc::new(FieldCipher::new(TEST_FIELD_KEY)),
             index_key: Arc::new(TEST_INDEX_KEY),
             otp: otp.clone(),
+            providers: Arc::new(providers),
         };
         Self {
             router: build_app(state.clone()),
             state,
             pool,
             otp,
+            fake,
         }
     }
 
