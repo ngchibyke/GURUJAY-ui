@@ -29,6 +29,17 @@ use uuid::Uuid;
 pub const TEST_FIELD_KEY: [u8; 32] = [7u8; 32];
 pub const TEST_INDEX_KEY: [u8; 32] = [9u8; 32];
 pub const TEST_PASSWORD: &str = "correct-horse-1";
+pub const TEST_REDIRECT_URL: &str = "http://localhost:8080/checkout/return";
+
+/// A published product with one variant in an active store; see
+/// [`TestApp::make_active_store_with_product`].
+pub struct Listing {
+    pub seller_id: Uuid,
+    pub seller_token: String,
+    pub store_id: Uuid,
+    pub product_id: Uuid,
+    pub variant_id: Uuid,
+}
 
 /// Captures the last OTP code sent to each (E.164) phone number.
 #[derive(Default)]
@@ -85,6 +96,7 @@ impl TestApp {
             index_key: Arc::new(TEST_INDEX_KEY),
             otp: otp.clone(),
             providers: Arc::new(providers),
+            payment_redirect_url: TEST_REDIRECT_URL.into(),
         };
         Self {
             router: build_app(state.clone()),
@@ -106,6 +118,33 @@ impl TestApp {
         if let Some(token) = token {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
+        self.send(builder, body).await
+    }
+
+    /// Like [`request`](Self::request), with extra headers.
+    pub async fn request_with_headers(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> TestResponse {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        self.send(builder, body).await
+    }
+
+    async fn send(
+        &self,
+        builder: axum::http::request::Builder,
+        body: Option<Value>,
+    ) -> TestResponse {
         let req = match body {
             Some(json) => builder
                 .header(header::CONTENT_TYPE, "application/json")
@@ -277,5 +316,150 @@ impl TestApp {
         let res = self.redeem(&token, &code).await;
         assert_eq!(res.status, 200, "redeem failed: {}", res.json);
         (id, token)
+    }
+
+    /// Seller (`phone`) with an active store named `store_name`, activated the real
+    /// way (a provider-verified payout account), holding one published product with
+    /// a single variant at `price_kobo` and `stock`.
+    pub async fn make_active_store_with_product(
+        &self,
+        phone: &str,
+        store_name: &str,
+        price_kobo: i64,
+        stock: i32,
+    ) -> Listing {
+        let (seller_id, seller_token) = self.make_seller(phone).await;
+        let res = self
+            .request(
+                Method::POST,
+                "/stores",
+                Some(json!({
+                    "name": store_name,
+                    "pickup_address": "12 Unique Street, Wuse 2",
+                    "pickup_state": "FCT",
+                    "delivery_courier": true,
+                    "delivery_self": false
+                })),
+                Some(&seller_token),
+            )
+            .await;
+        assert_eq!(res.status, 201, "create store: {}", res.json);
+        let store_id: Uuid = res.json["id"].as_str().unwrap().parse().unwrap();
+
+        sqlx::query("UPDATE platform_settings SET payout_provider = 'fake'")
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        // Sellers sign up as "Ada"; the resolved account name must match it.
+        self.fake.set_lookup(Ok("ADA OBI".into()));
+        let res = self
+            .request(
+                Method::PUT,
+                &format!("/stores/{store_id}/payout-account"),
+                Some(json!({
+                    "bank_code": "058",
+                    "account_number": "0123456785",
+                    "password": TEST_PASSWORD
+                })),
+                Some(&seller_token),
+            )
+            .await;
+        assert_eq!(res.status, 200, "payout account: {}", res.json);
+        assert_eq!(res.json["status"], "verified", "{}", res.json);
+
+        let product_id = self
+            .add_product(&seller_token, store_id, price_kobo, &[(json!({}), stock)])
+            .await;
+        let variant_id = self.variant_ids(product_id).await[0];
+        Listing {
+            seller_id,
+            seller_token,
+            store_id,
+            product_id,
+            variant_id,
+        }
+    }
+
+    /// Adds a published product to `store_id` with the given (attributes, stock)
+    /// variants at `price_kobo`; returns the product id.
+    pub async fn add_product(
+        &self,
+        seller_token: &str,
+        store_id: Uuid,
+        price_kobo: i64,
+        variants: &[(Value, i32)],
+    ) -> Uuid {
+        let variants: Vec<Value> = variants
+            .iter()
+            .map(|(attrs, stock)| json!({ "attributes": attrs, "stock": stock }))
+            .collect();
+        let res = self
+            .request(
+                Method::POST,
+                &format!("/stores/{store_id}/products"),
+                Some(json!({
+                    "name": "Ankara Shirt",
+                    "description": "Handmade shirt",
+                    "category": "fashion",
+                    "condition": "new",
+                    "photo_keys": ["photos/a.jpg"],
+                    "weight_grams": 300,
+                    "base_price_kobo": price_kobo,
+                    "variants": variants
+                })),
+                Some(seller_token),
+            )
+            .await;
+        assert_eq!(res.status, 201, "create product: {}", res.json);
+        let product_id: Uuid = res.json["id"].as_str().unwrap().parse().unwrap();
+        let res = self
+            .request(
+                Method::PATCH,
+                &format!("/products/{product_id}"),
+                Some(json!({ "is_published": true })),
+                Some(seller_token),
+            )
+            .await;
+        assert_eq!(res.status, 200, "publish: {}", res.json);
+        product_id
+    }
+
+    /// The product's variant ids, ordered by id.
+    pub async fn variant_ids(&self, product_id: Uuid) -> Vec<Uuid> {
+        sqlx::query_scalar("SELECT id FROM product_variants WHERE product_id = $1 ORDER BY id")
+            .bind(product_id)
+            .fetch_all(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    pub async fn stock(&self, variant_id: Uuid) -> i32 {
+        sqlx::query_scalar("SELECT stock FROM product_variants WHERE id = $1")
+            .bind(variant_id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    /// PUT /cart/items.
+    pub async fn set_cart(&self, token: &str, variant_id: Uuid, quantity: i64) -> TestResponse {
+        self.request(
+            Method::PUT,
+            "/cart/items",
+            Some(json!({ "variant_id": variant_id, "quantity": quantity })),
+            Some(token),
+        )
+        .await
+    }
+
+    /// POST /checkout with `method`.
+    pub async fn checkout(&self, token: &str, method: &str) -> TestResponse {
+        self.request(
+            Method::POST,
+            "/checkout",
+            Some(json!({ "method": method })),
+            Some(token),
+        )
+        .await
     }
 }

@@ -1,6 +1,8 @@
 pub mod access_codes;
 pub mod audit;
 pub mod auth;
+pub mod cart;
+pub mod checkout;
 pub mod config;
 pub mod crypto;
 pub mod error;
@@ -33,6 +35,8 @@ pub struct AppState {
     pub otp: Arc<dyn OtpSender>,
     /// Configured payment providers. Production never registers `FakeProvider`.
     pub providers: Arc<ProviderRegistry>,
+    /// Fixed return URL sent to the payment provider (config `PUBLIC_REDIRECT_URL`).
+    pub payment_redirect_url: String,
 }
 
 async fn health() -> Json<Value> {
@@ -82,6 +86,8 @@ pub fn build_app(state: AppState) -> Router {
         .merge(products::routes::router())
         .merge(settings::routes::router())
         .merge(payout_accounts::routes::router())
+        .merge(cart::routes::router())
+        .merge(checkout::routes::router())
         // Must follow every route: it applies to the method routers registered so far.
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)

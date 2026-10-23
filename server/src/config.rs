@@ -9,6 +9,9 @@ pub struct Config {
     pub field_key: [u8; 32],
     pub index_key: [u8; 32],
     pub otp_dev_echo: bool,
+    /// Where the payment provider sends the buyer after paying (`PUBLIC_REDIRECT_URL`).
+    /// Fixed by configuration, never taken from a request, and carries no personal data.
+    pub public_redirect_url: String,
 }
 
 impl std::fmt::Debug for Config {
@@ -31,6 +34,28 @@ fn key_from_b64(name: &str, raw: &str) -> Result<[u8; 32]> {
 
 /// Environments in which OTP codes may be echoed to stdout.
 const DEV_ECHO_ENVS: &[&str] = &["development", "test"];
+
+/// `PUBLIC_REDIRECT_URL` default, used only in development and test.
+pub const DEV_REDIRECT_URL: &str = "http://localhost:8080/checkout/return";
+
+/// The payment return URL: optional (with a localhost default) in development and
+/// test, required and https everywhere else.
+fn redirect_url(raw: Option<String>, dev: bool) -> Result<String> {
+    let url = match raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        Some(url) => url,
+        None if dev => return Ok(DEV_REDIRECT_URL.into()),
+        None => bail!("PUBLIC_REDIRECT_URL is required outside development and test"),
+    };
+    let ok = if dev {
+        url.starts_with("https://") || url.starts_with("http://")
+    } else {
+        url.starts_with("https://")
+    };
+    if !ok || url.contains(char::is_whitespace) || url.contains('?') {
+        bail!("PUBLIC_REDIRECT_URL must be an https URL without a query string");
+    }
+    Ok(url)
+}
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -58,7 +83,12 @@ impl Config {
         if field_key == index_key {
             bail!("FIELD_KEY and INDEX_KEY must differ");
         }
+        let public_redirect_url = redirect_url(
+            var("PUBLIC_REDIRECT_URL"),
+            DEV_ECHO_ENVS.contains(&app_env.as_str()),
+        )?;
         Ok(Self {
+            public_redirect_url,
             database_url: var("DATABASE_URL").context("DATABASE_URL is required")?,
             bind_addr: var("BIND_ADDR").unwrap_or_else(|| "127.0.0.1:8080".into()),
             app_env,
@@ -83,6 +113,10 @@ mod tests {
             ("DATABASE_URL", "postgres://x"),
             ("FIELD_KEY", KEY_A),
             ("INDEX_KEY", KEY_B),
+            (
+                "PUBLIC_REDIRECT_URL",
+                "https://shop.example/checkout/return",
+            ),
         ]
         .into();
         env.extend(pairs.iter().copied());
@@ -110,6 +144,31 @@ mod tests {
             "production"
         );
         assert_eq!(load(&[]).unwrap().app_env, "development");
+    }
+
+    #[test]
+    fn redirect_url_defaults_only_in_development() {
+        let dev = load(&[("PUBLIC_REDIRECT_URL", "")]).unwrap();
+        assert_eq!(dev.public_redirect_url, DEV_REDIRECT_URL);
+        let err = load(&[("APP_ENV", "production"), ("PUBLIC_REDIRECT_URL", "")]).unwrap_err();
+        assert!(err.to_string().contains("PUBLIC_REDIRECT_URL"), "{err}");
+        // Production needs https and no query string.
+        for bad in [
+            "http://shop.example/r",
+            "https://shop.example/r?x=1",
+            "ftp://x",
+        ] {
+            assert!(
+                load(&[("APP_ENV", "production"), ("PUBLIC_REDIRECT_URL", bad)]).is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            load(&[("APP_ENV", "production")])
+                .unwrap()
+                .public_redirect_url,
+            "https://shop.example/checkout/return"
+        );
     }
 
     #[test]

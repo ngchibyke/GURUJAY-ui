@@ -33,6 +33,9 @@ pub enum AppError {
     MethodNotAllowed,
     #[error("conflict: {0}")]
     Conflict(&'static str),
+    /// 409 with a specific message, e.g. `out_of_stock` naming the variant id.
+    #[error("conflict: {0}")]
+    ConflictDetail(&'static str, String),
     #[error("unprocessable: {0}")]
     Unprocessable(&'static str, String),
     #[error("too many requests: {0}")]
@@ -87,6 +90,7 @@ impl IntoResponse for AppError {
                 StatusCode::CONFLICT,
                 body(code, "Conflict with existing data"),
             ),
+            AppError::ConflictDetail(code, msg) => (StatusCode::CONFLICT, body(code, &msg)),
             AppError::Unprocessable(code, msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, body(code, &msg))
             }

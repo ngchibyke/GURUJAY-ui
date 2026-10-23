@@ -116,7 +116,13 @@ pub struct ProductView {
 
 /// The price a buyer pays for `variant`: its own override, else the product's base price.
 pub fn effective_price(product: &Product, variant: &Variant) -> i64 {
-    variant.price_kobo.unwrap_or(product.base_price_kobo)
+    unit_price(product.base_price_kobo, variant.price_kobo)
+}
+
+/// [`effective_price`] from the raw columns, for callers (cart, checkout) that load
+/// only the price fields: the variant's override, else the product's base price.
+pub fn unit_price(base_price_kobo: i64, variant_price_kobo: Option<i64>) -> i64 {
+    variant_price_kobo.unwrap_or(base_price_kobo)
 }
 
 fn invalid(msg: &str) -> AppError {
@@ -128,6 +134,10 @@ fn duplicate_variant() -> AppError {
         "duplicate_variant",
         "Two variants share the same attributes".into(),
     )
+}
+
+fn variant_in_use() -> AppError {
+    AppError::Conflict("variant_in_use")
 }
 
 fn validate_text(value: &str, max: usize, field: &str) -> Result<(), AppError> {
@@ -284,7 +294,26 @@ async fn upsert_variants(
         .map(|v| serde_json::to_value(&v.attributes).context("serialise attributes"))
         .collect::<Result<_, _>>()?;
     // The product row is locked by the caller for the whole diff, so concurrent replaces serialise.
-    // TODO(task 4): refuse with 409 `variant_in_use` when order_items reference a missing variant.
+    // Its variants are then locked in id order, the same order checkout uses, so a replace
+    // and a checkout touching the same variants cannot deadlock.
+    sqlx::query("SELECT id FROM product_variants WHERE product_id = $1 ORDER BY id FOR UPDATE")
+        .bind(product_id)
+        .fetch_all(&mut **tx)
+        .await
+        .context("lock variants")?;
+    // An ordered variant is part of an order's history and cannot be deleted.
+    let in_use: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM product_variants v JOIN order_items oi ON oi.variant_id = v.id \
+         WHERE v.product_id = $1 AND NOT (v.attributes = ANY($2::jsonb[])))",
+    )
+    .bind(product_id)
+    .bind(&keep)
+    .fetch_one(&mut **tx)
+    .await
+    .context("check ordered variants")?;
+    if in_use {
+        return Err(variant_in_use());
+    }
     sqlx::query(
         "DELETE FROM product_variants WHERE product_id = $1 AND NOT (attributes = ANY($2::jsonb[]))",
     )
@@ -292,7 +321,11 @@ async fn upsert_variants(
     .bind(&keep)
     .execute(&mut **tx)
     .await
-    .context("delete removed variants")?;
+    .map_err(|e| match &e {
+        // Backstop for the check above: order_items' foreign key refuses the delete.
+        sqlx::Error::Database(db) if db.is_foreign_key_violation() => variant_in_use(),
+        _ => AppError::Internal(anyhow::Error::new(e).context("delete removed variants")),
+    })?;
     for (v, attrs) in variants.iter().zip(keep) {
         sqlx::query(
             "INSERT INTO product_variants (product_id, attributes, stock, price_kobo, sku)              VALUES ($1, $2, $3, $4, $5)              ON CONFLICT (product_id, attributes) DO UPDATE              SET stock = EXCLUDED.stock, price_kobo = EXCLUDED.price_kobo, sku = EXCLUDED.sku",

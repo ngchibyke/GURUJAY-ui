@@ -54,6 +54,34 @@ pub fn new_reference(prefix: &str) -> String {
     out
 }
 
+/// Whether `url` may be given to a buyer as a payment page: `https`, no
+/// userinfo, no explicit port, and a host equal to one of `hosts` or a
+/// subdomain of one (case-insensitive). Guards against an open redirect from a
+/// compromised or misconfigured provider response (CWE-601).
+pub fn payment_url_allowed(url: &str, hosts: &[&str]) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if url
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains(['@', ':']) {
+        return false;
+    }
+    let host = authority.trim_end_matches('.').to_ascii_lowercase();
+    hosts.iter().any(|allowed| {
+        let allowed = allowed.to_ascii_lowercase();
+        host == allowed
+            || host
+                .strip_suffix(allowed.as_str())
+                .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
+    })
+}
+
 /// Constant-time equality for shared secrets. Both sides are hashed first so
 /// neither the content nor the length of the expected secret leaks through timing.
 pub fn secret_eq(given: &[u8], expected: &[u8]) -> bool {
@@ -250,6 +278,11 @@ pub trait PaymentProvider: Send + Sync {
     /// Payment methods this provider collects with, e.g. `["mono_directpay"]`.
     /// Each must be listed in [`ALL_METHODS`].
     fn methods(&self) -> &'static [&'static str];
+    /// Hosts the provider's hosted payment pages live on. A `payment_url` from
+    /// [`initiate`](Self::initiate) is handed to the buyer only when
+    /// [`payment_url_allowed`] accepts it against this list (exact host or a
+    /// subdomain of one); anything else counts as an initiate failure.
+    fn payment_url_hosts(&self) -> &'static [&'static str];
     async fn initiate(&self, req: InitiatePayment) -> Result<InitiatedPayment, ProviderError>;
     async fn verify_payment(&self, reference: &str) -> Result<PaymentStatus, ProviderError>;
     async fn create_payout(&self, req: PayoutRequest) -> Result<PayoutHandle, ProviderError>;
@@ -432,6 +465,36 @@ mod tests {
             narration: "n".into(),
         };
         assert!(!format!("{req:?}").contains("0123456789"));
+    }
+
+    #[test]
+    fn payment_url_must_be_https_on_an_allowed_host() {
+        let hosts = &["pay.fake.test", "withmono.com"];
+        for ok in [
+            "https://pay.fake.test/CK1",
+            "https://PAY.fake.test/CK1?x=1",
+            "https://checkout.withmono.com/abc",
+            "https://withmono.com",
+            "https://pay.fake.test./x",
+        ] {
+            assert!(payment_url_allowed(ok, hosts), "{ok}");
+        }
+        for bad in [
+            "http://pay.fake.test/CK1",
+            "https://pay.fake.test.evil.example/x",
+            "https://evilwithmono.com/x",
+            "https://user@pay.fake.test/x",
+            "https://pay.fake.test@evil.example/x",
+            "https://pay.fake.test:8443/x",
+            "https:///x",
+            "javascript:alert(1)",
+            "https://pay.fake.test\\@evil.example/",
+            "https://pay.fake.test /x",
+            "",
+        ] {
+            assert!(!payment_url_allowed(bad, hosts), "{bad}");
+        }
+        assert!(!payment_url_allowed("https://pay.fake.test/x", &[]));
     }
 
     #[test]

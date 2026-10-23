@@ -51,6 +51,7 @@ pub struct FakeProvider {
     payments: Mutex<HashMap<String, PaymentStatus>>,
     initiate_fails: Mutex<bool>,
     initiate_timeout_after_success: Mutex<bool>,
+    payment_url: Mutex<Option<String>>,
     payout_timeout_after_success: Mutex<bool>,
     verify_unavailable: Mutex<usize>,
     payout_failure: Mutex<Option<ProviderError>>,
@@ -94,6 +95,12 @@ impl FakeProvider {
     /// The next `initiate` call takes effect (is recorded) but returns `Timeout`.
     pub fn timeout_after_success_initiate(&self) {
         *self.initiate_timeout_after_success.lock().unwrap() = true;
+    }
+
+    /// The `payment_url` that `initiate` returns from now on (`None`: the default
+    /// `https://pay.fake.test/<reference>`). Lets tests return an untrusted URL.
+    pub fn set_payment_url(&self, url: Option<&str>) {
+        *self.payment_url.lock().unwrap() = url.map(str::to_string);
     }
 
     /// The next `create_payout` call takes effect but returns `Timeout`: the
@@ -184,6 +191,10 @@ impl PaymentProvider for FakeProvider {
         &["mono_directpay"]
     }
 
+    fn payment_url_hosts(&self) -> &'static [&'static str] {
+        &["pay.fake.test"]
+    }
+
     async fn initiate(&self, req: InitiatePayment) -> Result<InitiatedPayment, ProviderError> {
         self.record("initiate");
         let reference = req.reference.clone();
@@ -198,7 +209,12 @@ impl PaymentProvider for FakeProvider {
         }
         Ok(InitiatedPayment {
             provider_payment_id: format!("fake_{reference}"),
-            payment_url: format!("https://pay.fake.test/{reference}"),
+            payment_url: self
+                .payment_url
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| format!("https://pay.fake.test/{reference}")),
         })
     }
 
