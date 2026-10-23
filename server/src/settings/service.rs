@@ -85,6 +85,22 @@ fn in_range<T: PartialOrd>(field: &str, v: Option<T>, lo: T, hi: T) -> Result<()
 }
 
 impl SettingsPatch {
+    fn is_empty(&self) -> bool {
+        self.platform_cut_bps.is_none()
+            && self.fee_small_kobo.is_none()
+            && self.fee_large_kobo.is_none()
+            && self.fee_threshold_kobo.is_none()
+            && self.stamp_duty_kobo.is_none()
+            && self.stamp_duty_threshold_kobo.is_none()
+            && self.enabled_methods.is_none()
+            && self.payout_provider.is_none()
+            && self.checkout_ttl_minutes.is_none()
+            && self.ship_deadline_hours.is_none()
+            && self.release_after_hours.is_none()
+            && self.backstop_days.is_none()
+            && self.payout_settlement_buffer_hours.is_none()
+    }
+
     fn validate(&self) -> Result<(), AppError> {
         let max = limits::MAX_PRICE_KOBO;
         in_range("platform_cut_bps", self.platform_cut_bps, 0, 3000)?;
@@ -141,6 +157,11 @@ impl SettingsPatch {
 }
 
 pub async fn update(db: &PgPool, actor: Uuid, patch: SettingsPatch) -> Result<Settings, AppError> {
+    if patch.is_empty() {
+        return Err(AppError::Validation(
+            "at least one setting is required".into(),
+        ));
+    }
     patch.validate()?;
 
     // Lock the row so concurrent PATCHes serialise (last write wins, no lost partial updates),
@@ -209,17 +230,20 @@ pub async fn update(db: &PgPool, actor: Uuid, patch: SettingsPatch) -> Result<Se
     );
     let detail: serde_json::Map<String, serde_json::Value> = changed
         .iter()
+        .filter(|f| old_v[**f] != new_v[**f])
         .map(|f| (f.to_string(), json!({ "old": old_v[*f], "new": new_v[*f] })))
         .collect();
-    audit::record(
-        &mut tx,
-        Some(actor),
-        "settings.updated",
-        "platform_settings",
-        None,
-        serde_json::Value::Object(detail),
-    )
-    .await?;
+    if !detail.is_empty() {
+        audit::record(
+            &mut tx,
+            Some(actor),
+            "settings.updated",
+            "platform_settings",
+            None,
+            serde_json::Value::Object(detail),
+        )
+        .await?;
+    }
     tx.commit().await.context("commit")?;
     Ok(s)
 }

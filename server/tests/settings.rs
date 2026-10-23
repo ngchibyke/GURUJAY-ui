@@ -227,3 +227,74 @@ async fn load_builds_fee_schedule(pool: PgPool) {
     assert_eq!(s.fee_schedule(), server::money::FeeSchedule::default());
     assert_eq!(s.platform_cut_bps, 500);
 }
+
+async fn audit_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE action = 'settings.updated'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn backstop_must_strictly_outlast_release(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    let owner = app.make_owner().await;
+    // Stored release is 72h: a 1-day backstop alone is invalid.
+    let res = patch(&app, &owner, json!({ "backstop_days": 1 })).await;
+    assert_eq!(res.status, 422, "{}", res.json);
+    assert_eq!(res.json["error"]["code"], "invalid_settings");
+    // Rejected patches leave no audit row.
+    assert_eq!(audit_count(&pool).await, 0);
+
+    // Backstop is at its default of 30 days.
+    // 720h == 30 days: equal is not strictly greater.
+    let res = patch(&app, &owner, json!({ "release_after_hours": 720 })).await;
+    assert_eq!(res.status, 422, "{}", res.json);
+    assert_eq!(res.json["error"]["code"], "invalid_settings");
+    assert_eq!(get(&app, &owner).await.json["release_after_hours"], 72);
+    assert_eq!(audit_count(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn database_checks_reject_bad_rows(pool: PgPool) {
+    for sql in [
+        "UPDATE platform_settings SET platform_cut_bps = 3001",
+        "UPDATE platform_settings SET checkout_ttl_minutes = 4",
+        "UPDATE platform_settings SET backstop_days = 1",
+        "UPDATE platform_settings SET fee_small_kobo = -1",
+        "UPDATE platform_settings SET enabled_methods = '{}'",
+    ] {
+        assert!(sqlx::query(sql).execute(&pool).await.is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn migration_fee_cap_matches_limits_module() {
+    let sql = include_str!("../migrations/0008_platform_settings.sql");
+    let cap = server::limits::MAX_PRICE_KOBO.to_string();
+    for col in ["fee_small_kobo", "fee_large_kobo", "stamp_duty_kobo"] {
+        assert!(sql.contains(&format!("{col} BETWEEN 0 AND {cap}")), "{col}");
+    }
+}
+
+#[sqlx::test]
+async fn rejected_patch_writes_no_audit_row(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    let owner = app.make_owner().await;
+    assert_eq!(
+        patch(&app, &owner, json!({ "platform_cut_bps": 3001 }))
+            .await
+            .status,
+        422
+    );
+    assert_eq!(patch(&app, &owner, json!({})).await.status, 422);
+    assert_eq!(audit_count(&pool).await, 0);
+    // A no-op patch (same value) changes nothing, so audits nothing.
+    assert_eq!(
+        patch(&app, &owner, json!({ "platform_cut_bps": 500 }))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(audit_count(&pool).await, 0);
+}
