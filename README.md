@@ -1,34 +1,76 @@
 # Stock App
 
-A marketplace where sellers open numbered shops, list products, take orders and confirm bank-transfer payments.
+A mobile marketplace for Abuja. Individuals open up to two stores inside one shared market, and anyone can sign in to buy from them. Buyers pay in the app; the money is held by the payment provider and released to the seller after delivery is confirmed.
 
-## Features
+This repository holds the backend API. The Flutter phone app and the owner dashboard come in later parts of the build.
 
-- Seller accounts with numbered shop links (0001, 0002, …)
-- Products with photos, sizes, colours, price and stock
-- Stock management: low-stock warnings, quick restock (+1 / +5 / +10), per-product stock history
-- Shopping cart: several products in one order, paid in one transfer
-- Orders & payments: confirm payment, mark as sent, mark as delivered
-- Sales dashboard: revenue per day (last 30 days), best sellers, orders by status.
+## What works today
 
-## How it runs
+The server foundation (part 1 of 8):
 
-Everything is in one file, `index.html`, with plain HTML, CSS and JavaScript and no build step.
+- **Accounts:** sign up with a Nigerian phone number and password, confirmed by an SMS code. Sign-in sessions last 30 days and can be revoked. Roles: user, support, owner.
+- **Access codes:** the owner issues codes (single-use or shared, optional expiry and usage cap, revocable). Redeeming one turns a user into a seller.
+- **Stores:** up to 2 per seller, Abuja (FCT) only, with an encrypted pickup address. Stores stay hidden from the public until payouts are verified (part 2).
+- **Products:** photos, condition, brand, and variants such as size and colour, each with its own stock and optional price.
+- **Data protection:** phone numbers and addresses are encrypted at rest, lookups use a keyed hash, personal data is never logged, and an append-only audit log records sensitive actions.
 
-The data layer uses the claude.ai artifact runtime (`window.claude.use("db")` and `window.claude.use("user")`).
-If you open `index.html` directly in a browser or from GitHub Pages, it shows the
-"Open it from its claude.ai link" screen, because that storage isn't available outside claude.ai.
+## Roadmap
 
-To run it on its own, replace the `db` and `user` calls in the `boot()` function with a backend
-such as Firebase or Supabase. The app only uses `collection().onSnapshot()`, `collection().add()`,
-`doc().get()`, `doc().set()`, `doc().update()`, `doc().delete()` and `doc().acquire()`, so a small adapter is enough.
-
-## Data collections
-
-| Collection | What it holds |
+| Part | What it adds |
 |---|---|
-| `shops` | One document per shop, keyed by shop number |
-| `products` | Products, each with `shopNo`, `price`, `quantity`, `lowStock` |
-| `orders` | Orders, with an `items` array (older orders have a single `productId`) |
-| `stockLog` | Stock changes: `change`, `reason` (restock, sale, returned, edit), `after`, `at` |
-| `data/users/{uid}/profile` | Seller profile and bank details |
+| 1 | Server foundation (done) |
+| 2 | Payments and escrow (Paystack): cart, orders, held funds, release, refunds, 5% platform cut |
+| 3 | Delivery and tracking: NIPOST postcodes, Shipbubble couriers, self-delivery, handover codes |
+| 4 | Moderated chat and reviews |
+| 5 | Disputes and notifications |
+| 6 | Owner web dashboard |
+| 7 | Flutter phone app (Android and iPhone) |
+| 8 | Data export, deletion and retention |
+
+The design is in [docs/superpowers/specs/2026-10-22-abuja-marketplace-design.md](docs/superpowers/specs/2026-10-22-abuja-marketplace-design.md). The build plan and the items each later part must handle are in [docs/superpowers/plans/2026-10-23-00-roadmap.md](docs/superpowers/plans/2026-10-23-00-roadmap.md).
+
+## Running it locally
+
+You need Rust (stable) and Docker.
+
+1. Start the database (Postgres 17 on `localhost:5433`):
+
+   ```bash
+   docker compose up -d db
+   ```
+
+2. Copy `server/.env.example` to `server/.env` and fill in `FIELD_KEY` and `INDEX_KEY` with two different random 32-byte keys, base64-encoded:
+
+   ```bash
+   openssl rand -base64 32
+   ```
+
+3. Start the API (it listens on `127.0.0.1:8080`):
+
+   ```bash
+   cd server && cargo run -- serve
+   ```
+
+4. Create the owner account (you'll be asked for the password):
+
+   ```bash
+   cd server && cargo run -- create-owner --phone 0803XXXXXXX --name "Your Name"
+   ```
+
+## Tests
+
+The tests run against the local database:
+
+```bash
+cd server && DATABASE_URL=postgres://market:market@localhost:5433/market cargo test
+```
+
+Every push and pull request runs format, lint, the full test suite against Postgres, and a dependency security audit (`.github/workflows/ci.yml`).
+
+## Before going live
+
+These are tracked in the roadmap:
+
+- Rate limits per network address on sign-up and sign-in.
+- A restricted production database role.
+- Legal review of the escrow setup, and data-protection (DPO) review.
