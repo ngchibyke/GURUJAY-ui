@@ -192,3 +192,15 @@ async fn store_creation_audited(pool: PgPool) {
     assert_eq!(row.1, Some(id));
     assert!(!row.2.contains("Unique Street"));
 }
+
+#[sqlx::test]
+async fn reserved_slug_is_skipped(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (_, token) = app.make_seller("08011111111").await;
+    let res = create(&app, &token, "Mine").await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.json["slug"], "mine-2");
+    let got = app.request(Method::GET, "/stores/mine-2", None, Some(&token)).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json["name"], "Mine");
+}

@@ -10,6 +10,8 @@ use crate::{audit, crypto::FieldCipher, error::AppError};
 pub const MAX_STORES_PER_USER: i64 = 2;
 const SERVICE_STATE: &str = "FCT";
 const MAX_SLUG_ATTEMPTS: u32 = 1000;
+/// Slugs that collide with static routes (e.g. `/stores/mine`); never allocated as-is.
+const RESERVED_SLUGS: &[&str] = &["mine", "new", "search", "id"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewStore {
@@ -179,6 +181,9 @@ pub async fn create_store(
     let base = slugify(&name);
     let mut store = None;
     for n in 1..=MAX_SLUG_ATTEMPTS {
+        if n == 1 && RESERVED_SLUGS.contains(&base.as_str()) {
+            continue;
+        }
         let slug = if n == 1 { base.clone() } else { format!("{base}-{n}") };
         // The unique index decides; a taken slug (even a deleted store's) yields no row.
         let inserted: Option<Store> = sqlx::query_as(&format!(
