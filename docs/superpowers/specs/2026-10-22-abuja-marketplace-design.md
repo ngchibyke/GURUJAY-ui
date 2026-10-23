@@ -64,10 +64,14 @@ Stock is decremented at payment and restored on refund/cancellation.
 
 ## 5. Payments (escrow via provider)
 
-**Provider:** Paystack or Flutterwave *(builder to confirm which supports collect-to-platform + controlled payouts best; Paystack is the starting assumption)*. Card details never touch our servers.
+**Providers (owner decision, 2026-10-23):** payments sit behind a small **payment-provider layer**, so the escrow logic never depends on which company moves the money.
+- **Launch (Abuja pilot): Mono.** Buyers pay from their bank account with Mono **DirectPay**; sellers are paid with Mono **Disburse**.
+- **Before growing beyond the pilot: add Paystack** as a second checkout option (card, transfer, USSD). Payouts stay on Mono unless the owner switches them.
+- **Switching is a setting, not a code change:** the owner dashboard turns each payment method on or off and chooses the payout provider. An order always finishes with the provider it was paid through.
+- Card and bank-login details never touch our servers.
 
 **Flow:**
-1. Buyer pays in-app → money collected into the **platform's provider balance**.
+1. Buyer pays in-app → money is collected for the platform (with Mono it settles to the platform's business account the next working day).
 2. Seller notified: "Paid — please ship." Seller sees the order, **not** the money.
 3. Delivery happens (section 6).
 4. **Release** to the seller's verified bank account via provider payout, minus the platform cut, when either:
@@ -86,7 +90,7 @@ Stock is decremented at payment and restored on refund/cancellation.
 - **Seller payout = item total − 5% cut − provider fees.** The payout screen shows this breakdown.
 - **Refunds:** full refund returns item total + delivery to the buyer; the platform waives its cut on refunded orders. Provider fees that can't be recovered are charged to the side at fault, as decided by the owner.
 
-**Legal flag:** holding funds for third parties is regulated by the CBN. Design assumes the licensed provider holds funds; **a Nigerian lawyer/compliance adviser must confirm the setup before launch.**
+**Legal flag:** holding funds for third parties is regulated by the CBN. With Mono, held funds sit in the platform's own business account until released, which is the arrangement most in need of review. **A Nigerian lawyer/compliance adviser must confirm the setup before launch** (for example a dedicated escrow/trust account or a licensed escrow partner).
 
 All money movements are written to an **append-only ledger** (payment, hold, release, refund, cut) for audit.
 
@@ -183,7 +187,7 @@ Push (plus in-app inbox) for: payment received (seller), order status changes (b
 | Server/API | **Rust** (e.g. Axum) | Owner |
 | Database | **PostgreSQL** | My call |
 | Owner dashboard | Web app | My call; stack left to builder |
-| Payments | Paystack (Flutterwave fallback), 5% platform cut | Owner chose provider-held escrow and the 5% cut; provider is my call |
+| Payments | Provider layer; Mono (DirectPay + Disburse) at launch, Paystack added later; 5% platform cut | Owner chose escrow, the 5% cut, Mono first and easy switching |
 | Couriers | Shipbubble (Terminal Africa fallback) | My call from research |
 | Postcodes | NIPOST postcode API | Owner |
 | Chat moderation AI | Claude Haiku | My call |
@@ -198,7 +202,7 @@ Push (plus in-app inbox) for: payment received (seller), order status changes (b
 - **No PII in logs or URLs.**
 - **Audit:** append-only logs for money movements, admin actions and access to personal data in disputes.
 - **Data-subject rights:** users can download their data and request deletion; deletion is soft-delete followed by purge after the retention period, except records that must be kept for financial/legal reasons.
-- **Third parties:** Paystack, Shipbubble, NIPOST, AI moderation provider, push provider — all listed in the privacy notice.
+- **Third parties:** Mono (and later Paystack), Shipbubble, NIPOST, AI moderation provider, push provider — all listed in the privacy notice.
 - **Needs DPO/legal review:** escrow arrangement (CBN), AI processing of chats, retention periods.
 
 ## 14. Not in the first version (non-goals)

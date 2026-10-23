@@ -19,7 +19,7 @@ The server foundation (part 1 of 8):
 | Part | What it adds |
 |---|---|
 | 1 | Server foundation (done) |
-| 2 | Payments and escrow (Paystack): cart, orders, held funds, release, refunds, 5% platform cut |
+| 2 | Payments and escrow (Mono first, behind a switchable provider layer): cart, orders, held funds, release, refunds, 5% platform cut |
 | 3 | Delivery and tracking: NIPOST postcodes, Shipbubble couriers, self-delivery, handover codes |
 | 4 | Moderated chat and reviews |
 | 5 | Disputes and notifications |
