@@ -215,3 +215,56 @@ async fn redeem_attempts_are_rate_limited(pool: PgPool) {
     assert_eq!(res.status, 429);
     assert_eq!(res.json["error"]["code"], "too_many_attempts");
 }
+
+#[sqlx::test]
+async fn revoke_non_uuid_id_is_json_404(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let owner = app.make_owner().await;
+    let res = app
+        .request(Method::POST, "/admin/access-codes/not-a-uuid/revoke", None, Some(&owner))
+        .await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.json["error"]["code"], "not_found");
+    assert!(!res.json.to_string().contains("not-a-uuid"), "path value must not be echoed");
+}
+
+#[sqlx::test]
+async fn revoke_unknown_uuid_is_404(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let owner = app.make_owner().await;
+    let res = app
+        .request(
+            Method::POST,
+            &format!("/admin/access-codes/{}/revoke", uuid::Uuid::new_v4()),
+            None,
+            Some(&owner),
+        )
+        .await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.json["error"]["code"], "not_found");
+}
+
+#[sqlx::test]
+async fn non_owner_cannot_list_or_revoke_codes(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let owner = app.make_owner().await;
+    let (id, _) = app.create_access_code(&owner, json!({})).await;
+    let support = app.make_support().await;
+    let (_, user) = app.sign_up_verified("08011111111").await;
+    for token in [&user, &support] {
+        let list = app.request(Method::GET, "/admin/access-codes", None, Some(token)).await;
+        assert_eq!(list.status, 403);
+        assert_eq!(list.json["error"]["code"], "forbidden");
+        let revoke = app
+            .request(Method::POST, &format!("/admin/access-codes/{id}/revoke"), None, Some(token))
+            .await;
+        assert_eq!(revoke.status, 403);
+        assert_eq!(revoke.json["error"]["code"], "forbidden");
+    }
+    let revoked: bool = sqlx::query_scalar("SELECT revoked_at IS NOT NULL FROM access_codes WHERE id = $1")
+        .bind(id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert!(!revoked);
+}

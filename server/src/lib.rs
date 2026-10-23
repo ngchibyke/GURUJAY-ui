@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
 
-use crate::{auth::otp::OtpSender, crypto::FieldCipher};
+use crate::{auth::otp::OtpSender, crypto::FieldCipher, error::AppError};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +33,15 @@ pub struct AppState {
 
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// Unknown paths get the JSON envelope; the path is never echoed back.
+async fn not_found() -> AppError {
+    AppError::NotFound
+}
+
+async fn method_not_allowed() -> AppError {
+    AppError::MethodNotAllowed
 }
 
 /// Builds the application router. Request tracing records only the method,
@@ -61,6 +70,9 @@ pub fn build_app(state: AppState) -> Router {
         .merge(access_codes::routes::router())
         .merge(stores::routes::router())
         .merge(products::routes::router())
+        // Must follow every route: it applies to the method routers registered so far.
+        .method_not_allowed_fallback(method_not_allowed)
+        .fallback(not_found)
         .layer(trace)
         .with_state(state)
 }

@@ -29,6 +29,8 @@ pub enum AppError {
     PhoneUnverified(Redacted),
     #[error("not found")]
     NotFound,
+    #[error("method not allowed")]
+    MethodNotAllowed,
     #[error("conflict: {0}")]
     Conflict(&'static str),
     #[error("unprocessable: {0}")]
@@ -58,6 +60,9 @@ impl IntoResponse for AppError {
                 (StatusCode::FORBIDDEN, payload)
             }
             AppError::NotFound => (StatusCode::NOT_FOUND, body("not_found", "Not found")),
+            AppError::MethodNotAllowed => {
+                (StatusCode::METHOD_NOT_ALLOWED, body("method_not_allowed", "Method not allowed"))
+            }
             AppError::Conflict(code) => (StatusCode::CONFLICT, body(code, "Conflict with existing data")),
             AppError::Unprocessable(code, msg) => (StatusCode::UNPROCESSABLE_ENTITY, body(code, &msg)),
             AppError::TooManyRequests(code) => {

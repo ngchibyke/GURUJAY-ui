@@ -24,6 +24,10 @@ pub fn router() -> Router<AppState> {
         .route("/seller/redeem", post(redeem))
 }
 
+fn parse_id(key: &str) -> Result<Uuid, AppError> {
+    key.parse().map_err(|_| AppError::NotFound)
+}
+
 #[derive(Deserialize)]
 struct CreateBody {
     label: Option<String>,
@@ -55,10 +59,10 @@ async fn list(State(state): State<AppState>, user: AuthUser) -> Result<Json<Vec<
 async fn revoke(
     State(state): State<AppState>,
     user: AuthUser,
-    Path(id): Path<Uuid>,
+    Path(id): Path<String>,
 ) -> Result<StatusCode, AppError> {
     user.require_role(Role::Owner)?;
-    service::revoke(&state.db, user.id, id).await?;
+    service::revoke(&state.db, user.id, parse_id(&id)?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
