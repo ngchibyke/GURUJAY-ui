@@ -170,6 +170,13 @@ server/tests/
   - `unknown_method_rejected`: `["paystack_card"]` → 422 `unknown_payment_method` (Paystack isn't registered yet)
 - [ ] **Steps 2–5:** run → FAIL, implement, run → PASS, then commit `feat: add owner-controlled platform settings`
 
+**Research amendments (binding; they override the text above where they differ):**
+- Task 1 extended `FeeSchedule` with `stamp_duty_kobo` and `stamp_duty_threshold` (the ₦50 stamp duty on transfers ≥ ₦10,000). Add the columns `stamp_duty_kobo bigint default 5000` and `stamp_duty_threshold_kobo bigint default 1000000`, and let the owner PATCH them.
+  - All fee columns must be ≥ 0.
+  - Mono's published payout fee tiers contradict each other, so the fee fields must stay owner-editable.
+- Add `payout_settlement_buffer_hours int default 2` (used by Task 8's `send_after`).
+- Method validation uses `const KNOWN_METHODS: &[&str] = &["mono_directpay"]` until Task 5 replaces it with the registry.
+
 ---
 
 ### Task 3: Payout accounts and store activation
@@ -238,6 +245,16 @@ server/tests/
   - `quantity_cap`: 101 → 422
 - [ ] **Steps 2–5:** run → FAIL, implement, run → PASS, then commit `feat: add cart and checkout with stock reservation`
 
+**Research amendments (binding; they override the text above where they differ):**
+- **References are 24 characters or fewer, letters and digits only** (Mono changelog, 8 Oct 2026).
+  - A checkout reference is `"CK"` followed by 20 random uppercase letters and digits from `OsRng`. It has a unique index, and a collision retries generation.
+  - Add a shared helper `payments::new_reference(prefix: &str) -> String`, used again for payouts (`"PO"`) and refunds (`"RF"`).
+  - Because Task 5 is built before this task, put the helper in `src/payments/mod.rs` here if Task 5 did not already add it.
+- **Variant locks are always taken ordered by variant id** (`... WHERE id = ANY($1) ORDER BY id FOR UPDATE`), so two checkouts never deadlock.
+- `orders` gains `held_at timestamptz null` and `hold_reason text null`. A held order never auto-releases. Plan 5 sets these from complaints; Task 10 lets the owner set and clear them.
+- `checkouts` gains `provider_flagged boolean not null default false` (set in Task 6).
+- Wire the Task 0 caps: line quantity ≤ `limits::MAX_LINE_QUANTITY` (422), and checkout total ≤ `limits::MAX_CHECKOUT_TOTAL_KOBO` (422 `amount_too_large`). Each gets a cap+1 test.
+
 ---
 
 ### Task 5: PaymentProvider trait, registry, FakeProvider
@@ -287,6 +304,18 @@ impl ProviderRegistry {
 - [ ] **Step 1:** `ProviderRegistry` unit tests: method → provider lookup, unknown method → None.
 - [ ] **Steps 2–5:** run → FAIL, implement, run → PASS, then commit `feat: add payment provider layer and fake provider`
 
+**Research amendments to the trait (binding; they override the code above where they differ):**
+- `PaymentStatus::Successful { amount_kobo, fee_kobo, currency: String, held: bool }`
+  - `held` is true when the provider flags the payment or holds its settlement.
+  - Mono's verify returns `flagged` / `held_settlement`.
+- Payouts are identified by **our reference**, because Mono's Disburse webhooks carry no id.
+  - `payout_status(&self, reference: &str, provider_payout_id: Option<&str>) -> Result<PayoutState, ProviderError>`
+  - `find_payout(&self, reference: &str) -> Result<Option<PayoutHandle>, ProviderError>` looks up a payout that may exist after a timeout.
+  - `WebhookEvent::Payout { event_id, reference }`
+- `ProviderError` gains `Timeout`. An unknown outcome is different from `Unavailable`, which means the call definitely did not happen: a connect failure or a 5xx before sending.
+- `pub fn new_reference(prefix: &str) -> String`: the prefix plus 20 random uppercase letters and digits, 24 characters or fewer in total.
+- FakeProvider supports: `set_payment(ref, status)`, `fail_initiate()`, `set_lookup(result)`, `fail_payout_with(ProviderError)`, `set_payout_state(ref, state)`, `set_found_payout(ref, Option<id>)`, `verify_unavailable_n(n)` (the next n verify calls return Unavailable), and call counters.
+
 *(Build order note: Task 5's trait is needed by Tasks 3 and 4. Execute Task 5 before Task 3. The numbering follows the spec order, not the build order. See Build Order at the end.)*
 
 ---
@@ -325,6 +354,24 @@ impl ProviderRegistry {
   - `poll_settles_without_webhook`
   - `ledger_is_append_only`
 - [ ] **Steps 2–5:** run → FAIL, implement, run → PASS, then commit `feat: settle payments from verified webhooks into escrow`
+
+**Research amendments (binding; they override the text above where they differ):**
+- **Never lose an event.** Mono retries a non-200 up to 25 times over 48h with the same `event_id`.
+  - `provider_events` gains `processed_at timestamptz null`.
+  - On receipt, insert the row if it is missing. If it already exists **with** `processed_at`, answer 200 duplicate.
+  - Otherwise settle. Set `processed_at` in the **same transaction** as the state change, or after a confirmed no-op.
+  - If the verify call is unavailable or times out, answer **503** so Mono retries. Test: `verify_unavailable_then_retry_applies`.
+- **Lock order.** `settle_payment` first reads the checkout without a lock to get its variant ids. In one transaction it then locks the variants (ordered by id), then the checkout `FOR UPDATE`, then the orders. It re-checks status after locking.
+- Verify must also confirm `currency == "NGN"` and that the reference matches ours. A mismatch is treated as `amount_mismatch`.
+- `held: true` still marks the checkout paid, but sets `checkouts.provider_flagged = true` with an audit row. Task 8 will not pay out a flagged checkout until the owner clears it (Task 10).
+- **Refunds:** this task builds `escrow::refund::refund_order(state, order_id, restore_stock: bool)`, which Task 8 reuses.
+  - The refund is items + delivery, with no cut. It gets a refund row with reference `new_reference("RF")` and calls `provider.refund`. `NotSupported` sets the refund status to `manual`.
+  - Order → `refunded`. Ledger: `escrow −T`, `refunds +T`.
+  - The paid-after-expiry path uses `restore_stock = false`.
+- **Ledger accounts:** `buyer_funds`, `escrow`, `platform_revenue`, `provider_fees`, `seller_payable`, `seller_paid`, `refunds`.
+  - Every `ledger::post` asserts a zero sum.
+  - Signs: an inflow to the platform's books is positive on the internal account and negative on the external one.
+- Migration 0012 creates `provider_events`, `payouts`, `refunds` and `seller_strikes`, so Tasks 8 and 9 add no migration. `payouts` gets the extra columns from the Task 8 amendment.
 
 ---
 
@@ -386,6 +433,29 @@ impl ProviderRegistry {
   - `payout_webhook_settles_status`
 - [ ] **Steps 2–5:** run → FAIL, implement, run → PASS, then commit `feat: add escrow release and refund engine`
 
+**Research amendments (binding; they override the text above where they differ):**
+- This task also creates `orders/service.rs` with `mark_picked_up` and `mark_delivered`, which Task 7 then exposes. The concurrency test calls `release_order` twice concurrently; Task 9 adds the received-vs-job race test.
+- **`payouts` columns:**
+  - `status payout_status ('scheduled','sending','pending','unknown','successful','failed','manual')`
+  - `send_after timestamptz`, `next_attempt_at timestamptz`, `attempts int`, `last_error text`
+  - `reference` = `new_reference("PO")` (24 characters or fewer, unique). The reference is **never re-minted** for the same payout.
+- **Payout timing.** Mono settles the next day at 7 PM WAT; Friday–Sunday payments settle Monday.
+  - `send_after = max(now, settlement_time(checkout.paid_at) + payout_settlement_buffer_hours)`.
+  - `pub fn settlement_time(paid_at) -> OffsetDateTime` gives the next working day at 19:00 Africa/Lagos (UTC+1, no DST). Friday, Saturday and Sunday map to Monday. Public holidays are not modelled.
+  - `release_order` completes the order and posts the ledger entries immediately, but inserts the payout as `scheduled`. Sending happens in `send_payout(state, payout_id)`, called inline when `send_after <= now`, and by the Task 9 job otherwise.
+  - Unit tests on `settlement_time` cover Monday 10:00, Thursday 20:00, Friday 10:00 and Sunday 23:00.
+- **Sending (`send_payout`) never double-pays:**
+  1. Claim the row: `scheduled|unknown → sending` in its own short transaction.
+  2. If the status was `unknown`, call `find_payout(reference)` first. If the payout is found, adopt its id → `pending`.
+  3. Otherwise call `create_payout` with the **same** reference. `Ok` → `pending` with the id. `Rejected` → `failed`. `Unavailable` → `scheduled` with `next_attempt_at` set by backoff. `Timeout` → `unknown`.
+- **Do not send** while the order is held or its checkout is `provider_flagged`. The payout stays `scheduled`.
+- **Release ledger** (at release): `escrow −(items + delivery)`, `platform_revenue +(cut + delivery)`, `provider_fees +collection_fee_share`, `platform_revenue +payout_fee_charged`, `seller_payable +payout`.
+  - The payout fee charged to the seller is platform revenue; the real provider fee is booked when it is known.
+- **On payout success** (`settle_payout`): `seller_payable −payout`, `seller_paid +payout`. If the provider reports an actual fee: `provider_fees +actual_fee`, `platform_revenue −actual_fee`.
+- **Payout failure after success** (a reversal): post the reverse of the success entries and set the payout to `failed`. It then appears in the owner's failed list.
+- **Refund after release** is out of scope for plan 2. `refund_order` on a `completed` order returns 409 `already_released`; plan 5 adds clawback with a `seller_receivable` account.
+- Tests added: `payout_waits_for_settlement_time`, `timeout_then_lookup_adopts_existing_payout`, `held_order_not_paid_out`, `flagged_checkout_not_paid_out`, `payout_success_moves_payable_to_paid`, `refund_after_release_rejected`.
+
 ---
 
 ### Task 9: Background jobs
@@ -413,6 +483,20 @@ impl ProviderRegistry {
   - `job_rerun_is_idempotent`: running twice at the same `now` gives the same state
 - [ ] **Steps 2–5:** run → FAIL, implement, run → PASS, then commit `feat: add escrow background jobs`
 
+**Research amendments (binding; they override the text above where they differ):**
+- **Claim, then act.** Each job selects due ids with `FOR UPDATE SKIP LOCKED LIMIT 100` in a short transaction, which only proves no one else is working on them, then commits. It then calls the engine function per id. Engine functions take their own locks and re-check state, so they are idempotent.
+  - Never call an engine function while the job's own lock is open on the same row.
+- Set `idle_in_transaction_session_timeout = '60s'` for the pool's connections (sqlx `after_connect`).
+- **Payout job** (replaces job 5) processes these payouts:
+  - `scheduled` with `send_after <= now` and `next_attempt_at` null or `<= now`
+  - `unknown`, which must go through the lookup first
+  - `pending` older than 1 hour, which gets a `payout_status` poll
+  - Stuck `sending` older than 10 minutes moves to `unknown`.
+  - Backoff is `next_attempt_at = now + min(2^attempts minutes, 6h) ± 20% jitter`. After 8 attempts → `manual`.
+  - A definite `failed` → `manual` in the same job, with an audit row.
+- Auto-release skips held orders and orders whose checkout is `provider_flagged`.
+- Test added: `received_and_job_race_one_payout`, which runs the T7 received route and `run_due_jobs` concurrently and asserts one payout row and one provider call.
+
 ---
 
 ### Task 10: Owner admin endpoints
@@ -434,6 +518,12 @@ impl ProviderRegistry {
   - `manual_payout_mark_paid_audited`
   - `mismatch_list_shows_flagged`
 - [ ] **Steps 2–5:** run → FAIL, implement, run → PASS, then commit `feat: add owner escrow admin endpoints`
+
+**Research amendments (binding; they override the text above where they differ):**
+- `POST /admin/orders/{id}/hold {reason}` and `POST /admin/orders/{id}/unhold` (owner only, audited).
+- `POST /admin/checkouts/{id}/clear-flag` (owner only, audited): clears `provider_flagged` after the owner checks the payment with Mono.
+- `GET /admin/reconciliation` (owner and support): lists `unknown` / `manual` / `failed` payouts, `manual` refunds, flagged checkouts and `amount_mismatch` checkouts.
+- Daily automated reconciliation against Mono statements is deferred to plan 6 (owner dashboard). The roadmap notes it.
 
 ---
 
@@ -465,6 +555,17 @@ impl ProviderRegistry {
   - `secret_not_in_debug_output`
   - `sandbox_smoke_test`: `#[ignore]`, run by hand with real test keys (`cargo test --test mono_adapter -- --ignored`). It initiates a ₦100 payment and checks the returned amount echo, which **confirms the amount unit** before going live.
 - [ ] **Steps 2–5:** run → FAIL, implement, run → PASS, then commit `feat: add Mono DirectPay and Disburse adapter`
+
+**Research amendments (binding; they override the text above where they differ):**
+- **Disburse webhooks have no `data.id`.**
+  - Disbursement-level events carry `data.reference`. Transaction events carry `data.disbursement_reference` (the batch) and `data.reference` (the distribution).
+  - We set the batch reference and the single distribution reference to the **same** payout reference, so either one maps to `WebhookEvent::Payout { reference }`.
+- **Outcome comes from the distribution's own status.** A batch `completed` event can still carry a failed distribution.
+- `find_payout(reference)` uses Mono's "Fetch All Disbursements" list filtered by reference, if the API supports that filter; otherwise it scans the recent page. Mark the exact query shape **unconfirmed** in a code comment.
+- `verify_payment` maps `flagged` / `held_settlement` to `held: true`, and passes `currency` through.
+- Timeouts (reqwest `is_timeout()`) map to `ProviderError::Timeout`. Connect errors map to `Unavailable`. A 4xx maps to `Rejected`.
+- **Refunds:** Mono has a refund API (v2) and dashboard refunds (₦15 each), but the request shape is unconfirmed. Keep `NotSupported` → manual, and leave a code comment pointing at the v2 refund endpoint to wire up once confirmed.
+- **The smoke test can't prove the amount unit from an echo.** It initiates ₦100 (10,000 if kobo, or 100 if naira) and prints the hosted `mono_url`. A person opens it and checks that the page shows ₦100.00, then records the result in `MONO_AMOUNT_UNIT_IS_KOBO`'s doc comment.
 
 ---
 
