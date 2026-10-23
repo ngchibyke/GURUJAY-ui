@@ -152,11 +152,12 @@ async fn owner_manual_verify_activates(pool: PgPool) {
     put(&app, &token, id, NUBAN).await;
     let admin = app.owner_token().await;
     let path = format!("/admin/stores/{id}/payout-account/verify");
+    let seen = seen_changed_at(&app, id, &admin).await;
     let res = app
         .request(
             Method::POST,
             &path,
-            Some(json!({ "account_name": "ADA OBI" })),
+            Some(json!({ "account_name": "ADA OBI", "changed_at": seen })),
             Some(&admin),
         )
         .await;
@@ -175,7 +176,7 @@ async fn owner_manual_verify_activates(pool: PgPool) {
     assert_eq!(got.json["account_name"], "ADA OBI");
     // Audit carries who verified, never the name or number.
     let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT detail::text FROM audit_log WHERE action LIKE 'payout_account.%'",
+        "SELECT detail::text FROM audit_log WHERE action IN ('payout_account.updated', 'payout_account.verified')",
     )
     .fetch_all(&app.pool)
     .await
@@ -193,7 +194,7 @@ async fn manual_verify_requires_owner_role_and_account(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let (token, id, _) = seller_store(&app).await;
     let path = format!("/admin/stores/{id}/payout-account/verify");
-    let body = json!({ "account_name": "ADA OBI" });
+    let body = json!({ "account_name": "ADA OBI", "changed_at": "2026-01-01T00:00:00Z" });
     let admin = app.owner_token().await;
     // No account yet.
     let none = app
@@ -214,7 +215,7 @@ async fn manual_verify_requires_owner_role_and_account(pool: PgPool) {
         .request(
             Method::POST,
             &path,
-            Some(json!({ "account_name": "  " })),
+            Some(json!({ "account_name": "  ", "changed_at": "2026-01-01T00:00:00Z" })),
             Some(&admin),
         )
         .await;
@@ -252,10 +253,11 @@ async fn suspended_store_is_never_unsuspended(pool: PgPool) {
     assert_eq!(res.json["status"], "verified");
     assert_eq!(store_status(&app, id).await, "suspended");
     let admin = app.owner_token().await;
+    let seen = seen_changed_at(&app, id, &admin).await;
     app.request(
         Method::POST,
         &format!("/admin/stores/{id}/payout-account/verify"),
-        Some(json!({ "account_name": "X" })),
+        Some(json!({ "account_name": "X", "changed_at": seen })),
         Some(&admin),
     )
     .await;
@@ -293,14 +295,24 @@ async fn account_number_encrypted_and_masked(pool: PgPool) {
     assert_eq!(got.json["last4"], "6785");
     assert_eq!(got.json["bank_code"], "058");
     assert!(!got.json.to_string().contains(NUBAN));
-    // Support admins may read the name; ordinary users may not read at all.
+    // Only the owner reads the holder's name; support and ordinary users may not.
     let support = app.make_support().await;
-    let admin_view = app
+    let by_support = app
         .request(
             Method::GET,
             &format!("/admin/stores/{id}/payout-account"),
             None,
             Some(&support),
+        )
+        .await;
+    assert_eq!(by_support.status, 403);
+    let admin = app.owner_token().await;
+    let admin_view = app
+        .request(
+            Method::GET,
+            &format!("/admin/stores/{id}/payout-account"),
+            None,
+            Some(&admin),
         )
         .await;
     assert_eq!(admin_view.status, 200);
@@ -489,4 +501,116 @@ async fn previous_existed(app: &TestApp) -> bool {
         .fetch_one(&app.pool)
         .await
         .unwrap()
+}
+
+/// The `changed_at` the owner sees when reviewing the account.
+async fn seen_changed_at(app: &TestApp, id: Uuid, admin: &str) -> serde_json::Value {
+    let view = app
+        .request(
+            Method::GET,
+            &format!("/admin/stores/{id}/payout-account"),
+            None,
+            Some(admin),
+        )
+        .await;
+    assert_eq!(view.status, 200, "{}", view.json);
+    view.json["changed_at"].clone()
+}
+
+#[sqlx::test]
+async fn concurrent_puts_cannot_skip_the_password(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (token, id, _) = seller_store(&app).await;
+    let path = format!("/stores/{id}/payout-account");
+    let body = json!({ "bank_code": "058", "account_number": NUBAN });
+    let (a, b) = tokio::join!(
+        app.request(Method::PUT, &path, Some(body.clone()), Some(&token)),
+        app.request(Method::PUT, &path, Some(body.clone()), Some(&token)),
+    );
+    let mut statuses = [a.status, b.status];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 401], "{} / {}", a.json, b.json);
+}
+
+#[sqlx::test]
+async fn rejected_lookups_count_toward_the_limit(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    use_fake_for_payouts(&app).await;
+    app.fake.set_lookup(Err(ProviderError::Rejected {
+        code: "not_found".into(),
+        message: "no such account".into(),
+    }));
+    let (token, id, _) = seller_store(&app).await;
+    for i in 0..5 {
+        let res = put(&app, &token, id, NUBAN).await;
+        assert_eq!(res.status, 422, "attempt {i}: {}", res.json);
+    }
+    let calls = app.fake.calls("resolve_account");
+    let res = put(&app, &token, id, NUBAN).await;
+    assert_eq!(res.status, 429, "{}", res.json);
+    assert_eq!(app.fake.calls("resolve_account"), calls);
+    let detail: String = sqlx::query_scalar(
+        "SELECT detail::text FROM audit_log WHERE action = 'payout_account.lookup_rejected' LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert!(
+        !detail.contains(NUBAN) && detail.contains(&id.to_string()),
+        "{detail}"
+    );
+}
+
+#[sqlx::test]
+async fn failed_reauth_counts_toward_the_limit(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (token, id, _) = seller_store(&app).await;
+    assert_eq!(put(&app, &token, id, NUBAN).await.status, 200);
+    let path = format!("/stores/{id}/payout-account");
+    let wrong =
+        json!({ "bank_code": "058", "account_number": NUBAN, "password": "wrong-password-1" });
+    for i in 0..4 {
+        let res = app
+            .request(Method::PUT, &path, Some(wrong.clone()), Some(&token))
+            .await;
+        assert_eq!(res.status, 401, "attempt {i}");
+    }
+    // One accepted PUT plus four failures: the sixth attempt is limited, even with the right password.
+    let res = put(&app, &token, id, NUBAN).await;
+    assert_eq!(res.status, 429, "{}", res.json);
+}
+
+#[sqlx::test]
+async fn stale_owner_review_is_refused(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (token, id, _) = seller_store(&app).await;
+    put(&app, &token, id, NUBAN).await;
+    let admin = app.owner_token().await;
+    let seen = seen_changed_at(&app, id, &admin).await;
+    // The seller changes the account after the owner looked at it.
+    let changed = put(&app, &token, id, "9876543216").await;
+    assert_eq!(changed.status, 200, "{}", changed.json);
+    let path = format!("/admin/stores/{id}/payout-account/verify");
+    let stale = app
+        .request(
+            Method::POST,
+            &path,
+            Some(json!({ "account_name": "ADA OBI", "changed_at": seen })),
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(stale.status, 409, "{}", stale.json);
+    assert_eq!(stale.json["error"]["code"], "stale_review");
+    assert_eq!(store_status(&app, id).await, "pending");
+    let fresh = seen_changed_at(&app, id, &admin).await;
+    let ok = app
+        .request(
+            Method::POST,
+            &path,
+            Some(json!({ "account_name": "ADA OBI", "changed_at": fresh })),
+            Some(&admin),
+        )
+        .await;
+    assert_eq!(ok.status, 200, "{}", ok.json);
+    assert_eq!(store_status(&app, id).await, "active");
 }

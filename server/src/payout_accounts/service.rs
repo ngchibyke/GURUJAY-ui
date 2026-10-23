@@ -10,7 +10,7 @@
 //! hash is computed while a transaction is open.
 //!
 //! Rate limit: counted from `audit_log` rows (`payout_account.updated` and
-//! `payout_account.reauth_failed`, per store, rolling 24h); no extra table is needed.
+//! `payout_account.reauth_failed`, `payout_account.lookup_rejected`, per store, rolling 24h); no extra table is needed.
 //!
 //! Provider outcomes on a lookup: `Ok(name)` verifies when the name matches the seller;
 //! `NotSupported`, `Unavailable`, `Timeout` (and an unregistered provider) leave the account
@@ -34,7 +34,7 @@ use crate::{
     settings,
 };
 
-/// PUT attempts (accepted, or failed re-authentication) allowed per store in a rolling day.
+/// PUT attempts (accepted, failed re-authentication, or rejected by the provider lookup) allowed per store in a rolling day.
 pub const MAX_PUTS_PER_DAY: i64 = 5;
 
 const REDACTED: &str = "[redacted]";
@@ -61,6 +61,9 @@ impl std::fmt::Debug for SetPayoutAccount {
 #[derive(Deserialize)]
 pub struct VerifyPayoutAccount {
     pub account_name: String,
+    /// The `changed_at` the owner saw when reviewing; a later change makes the review stale.
+    #[serde(with = "time::serde::rfc3339")]
+    pub changed_at: OffsetDateTime,
 }
 
 impl std::fmt::Debug for VerifyPayoutAccount {
@@ -170,8 +173,14 @@ pub fn nuban_check_ok(bank_code: &str, account_number: &str) -> bool {
 }
 
 fn name_tokens(name: &str) -> HashSet<String> {
+    // Apostrophes vanish (O'Brien -> OBRIEN); every other non-alphanumeric character,
+    // hyphens included, separates tokens.
     name.to_uppercase()
-        .split(|c: char| !c.is_alphanumeric())
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '\u{2019}'))
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
         .filter(|t| t.chars().count() >= 2)
         .map(str::to_string)
         .collect()
@@ -233,7 +242,7 @@ async fn recent_attempts(conn: &mut PgConnection, store_id: Uuid) -> Result<i64,
     Ok(sqlx::query_scalar(
         "SELECT count(*) FROM audit_log \
          WHERE subject_type = 'store' AND subject_id = $1 \
-           AND action IN ('payout_account.updated', 'payout_account.reauth_failed') \
+           AND action IN ('payout_account.updated', 'payout_account.reauth_failed', \n                          'payout_account.lookup_rejected') \
            AND at > now() - interval '24 hours'",
     )
     .bind(store_id)
@@ -263,6 +272,7 @@ impl Decision {
 async fn decide(
     state: &AppState,
     owner: Uuid,
+    store_id: Uuid,
     input: &SetPayoutAccount,
 ) -> Result<Decision, AppError> {
     if input.bank_code.len() == 3 && !nuban_check_ok(&input.bank_code, &input.account_number) {
@@ -294,10 +304,23 @@ async fn decide(
             }
         }
         Err(ProviderError::NotSupported) => Ok(Decision::pending("lookup_unsupported", None)),
-        Err(ProviderError::Rejected { .. }) => Err(AppError::Unprocessable(
-            "account_not_found",
-            "That bank account could not be found. Check the bank and account number".into(),
-        )),
+        Err(ProviderError::Rejected { .. }) => {
+            // Counts toward the daily limit, so this cannot be used to probe accounts.
+            let mut conn = state.db.acquire().await.context("acquire")?;
+            audit::record(
+                &mut conn,
+                Some(owner),
+                "payout_account.lookup_rejected",
+                "store",
+                Some(store_id),
+                json!({ "store_id": store_id }),
+            )
+            .await?;
+            Err(AppError::Unprocessable(
+                "account_not_found",
+                "That bank account could not be found. Check the bank and account number".into(),
+            ))
+        }
         Err(ProviderError::Unavailable(_))
         | Err(ProviderError::Timeout)
         | Err(ProviderError::InvalidSignature) => Ok(Decision::pending("lookup_unavailable", None)),
@@ -332,6 +355,7 @@ pub async fn set_account(
             .fetch_one(&mut *conn)
             .await
             .context("check existing account")?;
+    let mut password_verified = false;
     if existing {
         // Changing a payout account is the account-takeover step: re-authenticate.
         let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
@@ -352,10 +376,11 @@ pub async fn set_account(
             .await?;
             return Err(AppError::InvalidCredentials);
         }
+        password_verified = true;
     }
     drop(conn);
 
-    let decision = decide(state, owner, &input).await?;
+    let decision = decide(state, owner, store_id, &input).await?;
 
     let last4 = input.account_number[6..].to_string();
     let number_enc = state.cipher.encrypt(&input.account_number);
@@ -365,6 +390,28 @@ pub async fn set_account(
     let store_status = lock_store(&mut tx, store_id, Some(owner)).await?;
     if recent_attempts(&mut tx, store_id).await? >= MAX_PUTS_PER_DAY {
         return Err(AppError::TooManyRequests("too_many_attempts"));
+    }
+    // Re-read under the store lock: a concurrent request may have created the account since
+    // the pre-check, and then this one has not re-authenticated.
+    let exists_now: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM payout_accounts WHERE store_id = $1)")
+            .bind(store_id)
+            .fetch_one(&mut *tx)
+            .await
+            .context("recheck existing account")?;
+    if exists_now && !password_verified {
+        tx.rollback().await.context("rollback")?;
+        let mut conn = state.db.acquire().await.context("acquire")?;
+        audit::record(
+            &mut conn,
+            Some(owner),
+            "payout_account.reauth_failed",
+            "store",
+            Some(store_id),
+            json!({}),
+        )
+        .await?;
+        return Err(AppError::InvalidCredentials);
     }
     let row: Row = sqlx::query_as(&format!(
         "INSERT INTO payout_accounts \
@@ -427,15 +474,12 @@ pub async fn get_for_owner(
     owner: Uuid,
     store_id: Uuid,
 ) -> Result<PayoutAccountView, AppError> {
-    let row: Option<Row> = sqlx::query_as(&format!(
-        "SELECT {} FROM payout_accounts pa JOIN stores s ON s.id = pa.store_id \
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT pa.bank_code, pa.account_last4, pa.account_name_enc, \
+                pa.status::text AS status, pa.pending_reason, pa.verified_by, pa.changed_at \
+         FROM payout_accounts pa JOIN stores s ON s.id = pa.store_id \
          WHERE pa.store_id = $1 AND s.owner_id = $2 AND s.deleted_at IS NULL",
-        COLUMNS
-            .split(", ")
-            .map(|c| format!("pa.{}", c.trim()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
+    )
     .bind(store_id)
     .bind(owner)
     .fetch_optional(&state.db)
@@ -487,13 +531,15 @@ pub async fn owner_verify(
     let name_enc = state.cipher.encrypt(name);
     let mut tx = state.db.begin().await.context("begin")?;
     let store_status = lock_store(&mut tx, store_id, None).await?;
-    let exists: Option<Uuid> =
-        sqlx::query_scalar("SELECT store_id FROM payout_accounts WHERE store_id = $1 FOR UPDATE")
+    let current: Option<OffsetDateTime> =
+        sqlx::query_scalar("SELECT changed_at FROM payout_accounts WHERE store_id = $1 FOR UPDATE")
             .bind(store_id)
             .fetch_optional(&mut *tx)
             .await
             .context("lock payout account")?;
-    exists.ok_or(AppError::NotFound)?;
+    if current.ok_or(AppError::NotFound)? != input.changed_at {
+        return Err(AppError::Conflict("stale_review"));
+    }
     let row: Row = sqlx::query_as(&format!(
         "UPDATE payout_accounts SET status = 'verified', verified_by = 'owner', \
                 verified_at = now(), account_name_enc = $2, pending_reason = NULL, \
@@ -531,8 +577,10 @@ mod tests {
         assert!(!nuban_check_ok("011", "000001457"));
         assert!(!nuban_check_ok("0110", "0000014579"));
         assert!(!nuban_check_ok("01a", "0000014579"));
-        // Check digit 0 when the sum is a multiple of ten.
         assert!(nuban_check_ok("058", "0123456785"));
+        // Weighted sum 200 (a multiple of ten) gives check digit 0.
+        assert!(nuban_check_ok("058", "0123456730"));
+        assert!(!nuban_check_ok("058", "0123456731"));
     }
 
     #[test]
@@ -540,6 +588,9 @@ mod tests {
         assert!(names_match("Ada Obi", "OBI ADA CHINWE"));
         assert!(names_match("Ada", "ADA OBI"));
         assert!(names_match("ada-obi", "Obi, Ada"));
+        assert!(names_match("Ada O'Brien", "ADA OBRIEN"));
+        assert!(names_match("Ada O\u{2019}Brien", "OBRIEN ADA"));
+        assert!(!names_match("Ada O'Brien", "ADA O BRIEN"));
         assert!(!names_match("Ada Obi", "CHIDI OKAFOR"));
         // One shared token is not enough when the user has two.
         assert!(!names_match("Ada Obi", "ADA OKAFOR"));

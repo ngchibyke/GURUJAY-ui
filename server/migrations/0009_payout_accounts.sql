@@ -1,7 +1,7 @@
 -- Seller payout accounts: one bank account per store. The account number and the
 -- account holder's name are personal data and are stored encrypted (FieldCipher).
 -- Only the last four digits are kept in the clear, to show the seller which account is set.
-CREATE TYPE payout_account_status AS ENUM ('pending', 'verified', 'rejected');
+CREATE TYPE payout_account_status AS ENUM ('pending', 'verified');
 
 CREATE TABLE payout_accounts (
     store_id                 uuid PRIMARY KEY REFERENCES stores (id),

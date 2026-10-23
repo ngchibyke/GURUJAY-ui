@@ -53,7 +53,7 @@ async fn admin_show(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<PayoutAccountView>, AppError> {
-    user.require_role(Role::Support)?;
+    user.require_role(Role::Owner)?;
     Ok(Json(
         service::get_for_admin(&state, user.id, parse_id(&id)?).await?,
     ))
