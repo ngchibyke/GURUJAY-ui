@@ -9,6 +9,7 @@ pub mod limits;
 pub mod money;
 pub mod phone;
 pub mod products;
+pub mod settings;
 pub mod stores;
 
 use axum::{Json, Router, extract::MatchedPath, http::Request, routing::get};
@@ -73,6 +74,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(access_codes::routes::router())
         .merge(stores::routes::router())
         .merge(products::routes::router())
+        .merge(settings::routes::router())
         // Must follow every route: it applies to the method routers registered so far.
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
