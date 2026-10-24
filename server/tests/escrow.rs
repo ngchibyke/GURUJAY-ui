@@ -55,6 +55,18 @@ struct PayoutRow {
 /// `old_payment`: back-date the payment 10 days, so the payout's settlement
 /// wait is over and release sends it inline.
 async fn picked_up_order(app: &TestApp, price: i64, fee: i64, old_payment: bool) -> Fixture {
+    picked_up_order_with_delivery(app, price, fee, 0, old_payment).await
+}
+
+/// [`picked_up_order`] with a delivery fee of `delivery` on the order (and in
+/// the checkout total the buyer pays).
+async fn picked_up_order_with_delivery(
+    app: &TestApp,
+    price: i64,
+    fee: i64,
+    delivery: i64,
+    old_payment: bool,
+) -> Fixture {
     let listing = app
         .make_active_store_with_product(SELLER, "Mama Put", price, 5)
         .await;
@@ -66,8 +78,22 @@ async fn picked_up_order(app: &TestApp, price: i64, fee: i64, old_payment: bool)
     let res = app.checkout(&buyer, METHOD).await;
     assert_eq!(res.status, 201, "{}", res.json);
     let reference = res.json["reference"].as_str().unwrap().to_string();
-    let total = res.json["total_kobo"].as_i64().unwrap();
     let checkout_id: Uuid = res.json["checkout_id"].as_str().unwrap().parse().unwrap();
+    let total = res.json["total_kobo"].as_i64().unwrap() + delivery;
+    if delivery > 0 {
+        exec(
+            app,
+            &format!(
+                "UPDATE orders SET delivery_fee_kobo = {delivery} WHERE checkout_id = '{checkout_id}'"
+            ),
+        )
+        .await;
+        exec(
+            app,
+            &format!("UPDATE checkouts SET total_kobo = {total} WHERE id = '{checkout_id}'"),
+        )
+        .await;
+    }
     app.fake.set_payment(
         &reference,
         PaymentStatus::Successful {
@@ -236,6 +262,11 @@ async fn release_from_delivered_and_wrong_states_are_noops(pool: PgPool) {
     mark_delivered(&app.pool, f.order_id, OffsetDateTime::now_utc())
         .await
         .unwrap();
+    exec(
+        &app,
+        "UPDATE orders SET release_at = now() - interval '1 minute'",
+    )
+    .await;
     release_order(&app.state, f.order_id, ReleaseReason::AutoAfterDelivery)
         .await
         .unwrap();
@@ -279,7 +310,7 @@ async fn concurrent_release_one_payout(pool: PgPool) {
     let f = picked_up_order(&app, 100_000, 100, true).await;
     let (a, b) = tokio::join!(
         release_order(&app.state, f.order_id, ReleaseReason::BuyerConfirmed),
-        release_order(&app.state, f.order_id, ReleaseReason::AutoAfterDelivery),
+        release_order(&app.state, f.order_id, ReleaseReason::BuyerConfirmed),
     );
     a.unwrap();
     b.unwrap();
@@ -368,9 +399,37 @@ async fn non_positive_payout_goes_manual(pool: PgPool) {
     release(&app, &f).await;
     let p = payout(&app).await;
     assert_eq!(p.status, "manual");
-    assert_eq!(p.amount_kobo, -660);
+    assert_eq!(p.amount_kobo, 0);
+    assert_eq!(p.last_error.as_deref(), Some("non_positive_payout"));
     assert_eq!(app.fake.calls("create_payout"), 0);
     assert_eq!(order_status(&app, f.order_id).await, "completed");
+    // The seller never owes the platform: no negative (or any) payable.
+    assert_eq!(balance(&app, "seller_payable").await, 0);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM ledger_entries WHERE account = 'seller_payable'"
+        )
+        .await,
+        0
+    );
+    // The platform absorbs the 660 shortfall out of cut + delivery (150 + 0).
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT account::text, amount_kobo FROM ledger_entries WHERE kind = 'release' ORDER BY id",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("escrow".to_string(), -3_000),
+            ("platform_revenue".to_string(), 150 - 660),
+            ("provider_fees".to_string(), 10),
+            ("platform_revenue".to_string(), 3_500),
+        ]
+    );
+    assert_eq!(balance(&app, "escrow").await, 0);
     assert_orders_balance(&app).await;
     // send_payout never sends a manual payout.
     assert_eq!(send(&app, p.id).await.status, "manual");
@@ -516,8 +575,67 @@ async fn held_order_not_paid_out(pool: PgPool) {
         "UPDATE orders SET held_at = now(), hold_reason = 'complaint'",
     )
     .await;
-    release(&app, &f).await;
+    let err = release_order(&app.state, f.order_id, ReleaseReason::BuyerConfirmed)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AppError::Conflict("order_held")), "{err:?}");
+    // Not completed, nothing booked or sent.
+    assert_eq!(order_status(&app, f.order_id).await, "picked_up");
+    assert_eq!(count(&app, "SELECT count(*) FROM payouts").await, 0);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM ledger_entries WHERE kind = 'release'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(app.fake.calls("create_payout"), 0);
+    assert_eq!(balance(&app, "escrow").await, 10_000);
+    // Never `already_released`: the money is still in escrow for the owner's
+    // decision. (refund_order today accepts only `paid` orders, so a
+    // picked-up order answers `not_refundable`; dispute refunds are plan 5.)
+    let err = refund_order(&app.state, f.order_id, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AppError::Conflict("not_refundable")),
+        "{err:?}"
+    );
+}
+
+#[sqlx::test]
+async fn held_order_cannot_be_released_except_by_owner(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = picked_up_order(&app, 10_000, 10, true).await;
+    mark_delivered(&app.pool, f.order_id, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    exec(
+        &app,
+        "UPDATE orders SET held_at = now(), hold_reason = 'complaint', release_at = now() - interval '1 minute'",
+    )
+    .await;
+    for reason in [
+        ReleaseReason::BuyerConfirmed,
+        ReleaseReason::AutoAfterDelivery,
+    ] {
+        let err = release_order(&app.state, f.order_id, reason)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict("order_held")), "{err:?}");
+    }
+    assert_eq!(order_status(&app, f.order_id).await, "delivered");
+    assert_eq!(count(&app, "SELECT count(*) FROM payouts").await, 0);
+
+    // The owner resolves the complaint in the seller's favour.
+    release_order(&app.state, f.order_id, ReleaseReason::OwnerDecision)
+        .await
+        .unwrap();
+    assert_eq!(order_status(&app, f.order_id).await, "completed");
     let p = payout(&app).await;
+    assert_eq!(p.release_reason.as_deref(), Some("owner_decision"));
+    // The send gate still holds it until the hold itself is lifted.
     assert_eq!(p.status, "scheduled");
     assert_eq!(p.last_error.as_deref(), Some("order_held"));
     assert_eq!(app.fake.calls("create_payout"), 0);
@@ -525,6 +643,45 @@ async fn held_order_not_paid_out(pool: PgPool) {
     exec(&app, "UPDATE orders SET held_at = NULL, hold_reason = NULL").await;
     make_due(&app).await;
     assert_eq!(send(&app, p.id).await.status, "pending");
+    assert_eq!(app.fake.calls("create_payout"), 1);
+}
+
+#[sqlx::test]
+async fn auto_release_requires_delivered_and_due(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = picked_up_order(&app, 10_000, 10, true).await;
+    let auto = || release_order(&app.state, f.order_id, ReleaseReason::AutoAfterDelivery);
+
+    // Picked up, never delivered (even with a release_at somehow set): skipped.
+    exec(
+        &app,
+        "UPDATE orders SET release_at = now() - interval '1 day'",
+    )
+    .await;
+    auto().await.unwrap();
+    assert_eq!(order_status(&app, f.order_id).await, "picked_up");
+
+    // Delivered, deadline not reached: skipped.
+    mark_delivered(&app.pool, f.order_id, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    auto().await.unwrap();
+    assert_eq!(order_status(&app, f.order_id).await, "delivered");
+    assert_eq!(count(&app, "SELECT count(*) FROM payouts").await, 0);
+    assert_eq!(count(&app, "SELECT count(*) FROM ledger_entries").await, 2);
+
+    // Due: released.
+    exec(
+        &app,
+        "UPDATE orders SET release_at = now() - interval '1 second'",
+    )
+    .await;
+    auto().await.unwrap();
+    assert_eq!(order_status(&app, f.order_id).await, "completed");
+    assert_eq!(
+        payout(&app).await.release_reason.as_deref(),
+        Some("auto_after_delivery")
+    );
 }
 
 #[sqlx::test]
@@ -1030,4 +1187,141 @@ async fn deliver_requires_pickup(pool: PgPool) {
         mark_delivered(&app.pool, f.order_id, OffsetDateTime::now_utc()).await,
         Err(AppError::Conflict("invalid_order_state"))
     ));
+}
+
+// ---------------------------------------------------------------- fix round 1
+
+#[sqlx::test]
+async fn release_ledger_routes_delivery_to_platform_revenue(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = picked_up_order_with_delivery(&app, 1_000_000, 1_500, 200_000, true).await;
+    release(&app, &f).await;
+    let p = payout(&app).await;
+    // Delivery never reaches the seller: the payout is the same as without it.
+    assert_eq!(p.amount_kobo, 945_000);
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT account::text, amount_kobo FROM ledger_entries WHERE kind = 'release' ORDER BY id",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("escrow".to_string(), -1_200_000),
+            ("platform_revenue".to_string(), 50_000 + 200_000),
+            ("provider_fees".to_string(), 1_500),
+            ("platform_revenue".to_string(), 3_500),
+            ("seller_payable".to_string(), 945_000),
+        ]
+    );
+    assert_eq!(balance(&app, "escrow").await, 0);
+    assert_orders_balance(&app).await;
+}
+
+#[sqlx::test]
+async fn concurrent_send_payout_creates_once(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = picked_up_order(&app, 10_000, 10, true).await;
+    exec(&app, "UPDATE checkouts SET provider_flagged = true").await;
+    release(&app, &f).await;
+    exec(&app, "UPDATE checkouts SET provider_flagged = false").await;
+    make_due(&app).await;
+    let id = payout(&app).await.id;
+    // The first sender holds its lease while the provider is slow.
+    app.fake
+        .delay_next_payout(std::time::Duration::from_millis(500));
+    let (a, b) = tokio::join!(send_payout(&app.state, id), send_payout(&app.state, id));
+    let mut statuses = vec![a.unwrap().status, b.unwrap().status];
+    statuses.sort();
+    assert_eq!(statuses, ["pending", "sending"]);
+    assert_eq!(app.fake.calls("create_payout"), 1);
+    assert_eq!(app.fake.calls("find_payout"), 0);
+    let p = payout(&app).await;
+    assert_eq!(p.status, "pending");
+    assert_eq!(p.attempts, 1);
+}
+
+#[sqlx::test]
+async fn refund_and_payment_posting_keys_are_recorded(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = picked_up_order(&app, 10_000, 10, true).await;
+    exec(&app, "UPDATE orders SET status = 'paid'").await;
+    let out = refund_order(&app.state, f.order_id, false).await.unwrap();
+    let keys: Vec<(String, String)> =
+        sqlx::query_as("SELECT kind, ref FROM ledger_postings ORDER BY posted_at, kind")
+            .fetch_all(&app.pool)
+            .await
+            .unwrap();
+    assert!(keys.contains(&("payment".to_string(), f.checkout_id.to_string())));
+    assert!(keys.contains(&("refund".to_string(), out.refund_id.to_string())));
+    // Each key points at the txn that holds its entries.
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM ledger_postings lp WHERE NOT EXISTS (SELECT 1 FROM ledger_entries e WHERE e.txn_id = lp.txn_id)"
+        )
+        .await,
+        0
+    );
+}
+
+#[sqlx::test]
+async fn unknown_escalates_to_manual_after_max_attempts_and_still_settles(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = picked_up_order(&app, 10_000, 10, true).await;
+    app.fake.fail_payout_with(ProviderError::Timeout);
+    release(&app, &f).await;
+    assert_eq!(payout(&app).await.status, "unknown");
+    exec(&app, "UPDATE payouts SET attempts = 7").await;
+    make_due(&app).await;
+    let p = payout(&app).await;
+    assert_eq!(send(&app, p.id).await.status, "manual");
+    let after = payout(&app).await;
+    assert_eq!(after.attempts, 8);
+    assert_eq!(
+        after.last_error.as_deref(),
+        Some("unknown_after_max_attempts")
+    );
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM audit_log WHERE action = 'payout.escalated_manual'"
+        )
+        .await,
+        1
+    );
+    // Manual now: never sent again automatically.
+    app.fake.clear_payout_failure();
+    make_due(&app).await;
+    assert_eq!(send(&app, p.id).await.status, "manual");
+    assert_eq!(app.fake.calls("create_payout"), 2);
+
+    // It did go out after all: the success settles it and records the id.
+    app.fake.set_found_payout(&p.reference, Some("x7"));
+    app.fake
+        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 0 });
+    settle_payout(&app.state, &p.reference).await.unwrap();
+    let settled = payout(&app).await;
+    assert_eq!(settled.status, "successful");
+    assert_eq!(settled.provider_payout_id.as_deref(), Some("x7"));
+    assert_eq!(balance(&app, "seller_paid").await, settled.amount_kobo);
+}
+
+#[sqlx::test]
+async fn success_without_payout_id_stores_the_found_id(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = picked_up_order(&app, 10_000, 10, true).await;
+    app.fake.fail_payout_with(ProviderError::Timeout);
+    release(&app, &f).await;
+    let p = payout(&app).await;
+    assert_eq!(p.status, "unknown");
+    assert_eq!(p.provider_payout_id, None);
+    app.fake.set_found_payout(&p.reference, Some("x8"));
+    app.fake
+        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 0 });
+    settle_payout(&app.state, &p.reference).await.unwrap();
+    let after = payout(&app).await;
+    assert_eq!(after.status, "successful");
+    assert_eq!(after.provider_payout_id.as_deref(), Some("x8"));
 }

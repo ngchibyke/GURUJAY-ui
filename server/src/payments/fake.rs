@@ -60,6 +60,7 @@ pub struct FakeProvider {
     refund_supported: Mutex<bool>,
     refund_failure: Mutex<Option<ProviderError>>,
     refund_delay: Mutex<Option<std::time::Duration>>,
+    payout_delay: Mutex<Option<std::time::Duration>>,
     lookup: Mutex<Option<Result<String, ProviderError>>>,
     calls: Mutex<HashMap<&'static str, usize>>,
     initiated: Mutex<Vec<InitiatePayment>>,
@@ -157,6 +158,12 @@ impl FakeProvider {
     /// before returning it (a slow provider; one-shot).
     pub fn delay_next_refund(&self, delay: std::time::Duration) {
         *self.refund_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// The next `create_payout` call decides its answer on entry, then waits
+    /// `delay` before returning it (a slow provider; one-shot).
+    pub fn delay_next_payout(&self, delay: std::time::Duration) {
+        *self.payout_delay.lock().unwrap() = Some(delay);
     }
 
     pub fn clear_refund_failure(&self) {
@@ -260,16 +267,21 @@ impl PaymentProvider for FakeProvider {
         self.record("create_payout");
         let reference = req.reference.clone();
         self.payouts.lock().unwrap().push(req);
-        if let Some(e) = self.payout_failure.lock().unwrap().as_ref() {
-            return Err(copy_err(e));
-        }
-        if std::mem::take(&mut *self.payout_timeout_after_success.lock().unwrap()) {
+        let result = if let Some(e) = self.payout_failure.lock().unwrap().as_ref() {
+            Err(copy_err(e))
+        } else if std::mem::take(&mut *self.payout_timeout_after_success.lock().unwrap()) {
             self.set_found_payout(&reference, Some(&format!("fakepo_{reference}")));
-            return Err(ProviderError::Timeout);
+            Err(ProviderError::Timeout)
+        } else {
+            Ok(PayoutHandle {
+                provider_payout_id: format!("fakepo_{reference}"),
+            })
+        };
+        let delay = self.payout_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
-        Ok(PayoutHandle {
-            provider_payout_id: format!("fakepo_{reference}"),
-        })
+        result
     }
 
     async fn payout_status(

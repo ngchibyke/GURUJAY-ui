@@ -4,11 +4,16 @@
 //!
 //! 1. [`release_order`] (one transaction, under the order lock): an order
 //!    `picked_up`/`delivered` with no payout row is booked out of escrow,
-//!    marked `completed`, and gets a payout row `scheduled` (or `manual` when
-//!    the payout would be ≤ 0). Ledger, key `("release", order_id)`:
+//!    marked `completed`, and gets a payout row `scheduled` (or `manual` with
+//!    amount 0 when the payout would be ≤ 0). It enforces the release rules
+//!    itself (defence in depth): a held order is 409 `order_held` unless the
+//!    owner decides; `AutoAfterDelivery` needs `delivered_at` and a passed
+//!    `release_at`, else it is a no-op. Ledger, key `("release", order_id)`:
 //!    `escrow −(items + delivery)`, `platform_revenue +(cut + delivery)`,
 //!    `provider_fees +collection_fee_share`, `platform_revenue +payout_fee`,
-//!    `seller_payable +payout`. Delivery money sits in `platform_revenue`
+//!    `seller_payable +payout`. A payout ≤ 0 books `seller_payable` 0 and the
+//!    shortfall comes off `platform_revenue` (cut + delivery − shortfall), so
+//!    the seller never owes the platform. Delivery money sits in `platform_revenue`
 //!    until plan 3 routes it to the courier or the self-delivering seller.
 //!    The payout fee is fixed here, from the fee schedule at release.
 //!    The payout waits for the provider's settlement of the buyer's payment:
@@ -28,6 +33,12 @@
 //!    success (a reversal), key `("payout_reversal", id)`, posts the exact
 //!    reverse and marks the payout `failed`. A payout still pending 24h after
 //!    the provider accepted it goes `manual`: never `failed`, never re-sent.
+//!
+//! Lock order (global: `... checkouts -> orders -> payouts`): every step locks
+//! the order first, then the payout row. `payout_accounts` comes after
+//! `payouts` and is only ever read here under `FOR SHARE` (the seller's
+//! account change takes `FOR UPDATE` on it alone), so it cannot deadlock with
+//! the order/payout locks.
 //!
 //! Personal data: the seller's account number is decrypted only for the
 //! provider call and never logged, audited or returned.
@@ -68,6 +79,9 @@ const GATE_RECHECK: time::Duration = time::Duration::hours(1);
 const BACKOFF_FIRST_SECS: i64 = 5 * 60;
 const BACKOFF_CAP_SECS: i64 = 6 * 60 * 60;
 const SETTLEMENT_HOUR: u8 = 19;
+/// `last_error` of a payout whose outcome stayed unknown for MAX_SEND_ATTEMPTS
+/// claims; it may have been paid, so settle_payout still asks the provider.
+const UNKNOWN_EXHAUSTED: &str = "unknown_after_max_attempts";
 const NARRATION: &str = "Marketplace order payout";
 
 /// Africa/Lagos: UTC+1 all year (no DST).
@@ -177,11 +191,17 @@ struct ReleaseRow {
     checkout_id: Uuid,
     paid_at: Option<OffsetDateTime>,
     has_payout: bool,
+    held: bool,
+    delivered: bool,
+    release_due: bool,
 }
 
 /// Step 1 (see the module docs). Idempotent: an order that is not
 /// `picked_up`/`delivered`, or already has a payout, is left as it is (Ok).
-/// Unknown order -> 404. After commit, a payout that is already due is sent
+/// Unknown order -> 404. A held order -> 409 `order_held` unless the reason is
+/// `OwnerDecision` (the owner resolves complaints). `AutoAfterDelivery` on an
+/// order not delivered, or before its stored `release_at`, is a no-op (Ok), so
+/// the job simply skips it. After commit, a payout that is already due is sent
 /// inline; a send failure is only logged (the job retries).
 pub async fn release_order(
     state: &AppState,
@@ -198,7 +218,9 @@ pub async fn release_order(
     let row: ReleaseRow = sqlx::query_as(
         "SELECT o.status::text AS status, o.items_total_kobo, o.delivery_fee_kobo, \
                 o.platform_cut_kobo, o.collection_fee_share_kobo, o.checkout_id, c.paid_at, \
-                EXISTS (SELECT 1 FROM payouts p WHERE p.order_id = o.id) AS has_payout \
+                EXISTS (SELECT 1 FROM payouts p WHERE p.order_id = o.id) AS has_payout, \
+                o.held_at IS NOT NULL AS held, o.delivered_at IS NOT NULL AS delivered, \
+                COALESCE(o.release_at <= now(), false) AS release_due \
          FROM orders o JOIN checkouts c ON c.id = o.checkout_id \
          WHERE o.id = $1 FOR UPDATE OF o",
     )
@@ -208,6 +230,13 @@ pub async fn release_order(
     .map_err(db_err("lock order"))?
     .ok_or(AppError::NotFound)?;
     if !matches!(row.status.as_str(), "picked_up" | "delivered") || row.has_payout {
+        return Ok(());
+    }
+    // The release rules, enforced here as well as by the callers.
+    if row.held && reason != ReleaseReason::OwnerDecision {
+        return Err(AppError::Conflict("order_held"));
+    }
+    if reason == ReleaseReason::AutoAfterDelivery && !(row.delivered && row.release_due) {
         return Ok(());
     }
 
@@ -223,9 +252,16 @@ pub async fn release_order(
     // payout BEFORE the fee (Task 1 ruling): a payout just over ₦10,000 pays
     // the duty even if the net lands just under it.
     let payout_fee = money::payout_fee_kobo(before_fee, &settings.fee_schedule());
-    let payout = before_fee.checked_sub(payout_fee).ok_or_else(too_large)?;
+    let computed = before_fee.checked_sub(payout_fee).ok_or_else(too_large)?;
+    // Fees above the order: the seller is owed nothing (never a negative
+    // payable); the platform absorbs the shortfall out of its cut + delivery.
+    let payout = computed.max(0);
+    let shortfall = payout - computed;
     let gross = items.checked_add(delivery).ok_or_else(too_large)?;
-    let cut_and_delivery = cut.checked_add(delivery).ok_or_else(too_large)?;
+    let cut_and_delivery = cut
+        .checked_add(delivery)
+        .and_then(|x| x.checked_sub(shortfall))
+        .ok_or_else(too_large)?;
 
     let now = OffsetDateTime::now_utc();
     let paid_at = row.paid_at.unwrap_or(now);
@@ -293,6 +329,7 @@ pub async fn release_order(
             "payout_id": payout_id,
             "reason": reason.as_str(),
             "payout_kobo": payout,
+            "shortfall_kobo": shortfall,
             "payout_fee_kobo": payout_fee,
             "payout_status": status,
             // Fraud signal: a buyer confirming minutes after paying.
@@ -449,7 +486,11 @@ pub async fn send_payout(state: &AppState, payout_id: Uuid) -> Result<PayoutOutc
 
     // Claim with a 2-minute lease and snapshot the account paid. A payout that
     // may already be in flight (Lookup) keeps its earlier snapshot, so a later
-    // account change never redirects it.
+    // account change never redirects it (ruling 2). Deliberate consequence: if
+    // the lookup then confirms the payout absent, the create still pays that
+    // claimed snapshot, not the current account. The gates above have already
+    // re-checked that the current account is verified and outside the 48h
+    // hold; support can see on the row exactly which account was paid.
     let keep_snapshot = mode == Mode::Lookup;
     let claim: Claim = sqlx::query_as(
         "UPDATE payouts SET status = 'sending', sending_until = now() + interval '2 minutes', \
@@ -491,6 +532,10 @@ pub async fn send_payout(state: &AppState, payout_id: Uuid) -> Result<PayoutOutc
             Some("unavailable"),
             Some(now + backoff(claim.attempts)),
         ),
+        // Lookups that keep failing: stop guessing, hand it to the owner.
+        Sent::Unknown(_) if claim.attempts >= MAX_SEND_ATTEMPTS => {
+            ("manual", None, Some(UNKNOWN_EXHAUSTED), None)
+        }
         Sent::Unknown(why) => (
             "unknown",
             None,
@@ -506,6 +551,10 @@ pub async fn send_payout(state: &AppState, payout_id: Uuid) -> Result<PayoutOutc
     );
 
     let mut tx = state.db.begin().await.context("begin")?;
+    sqlx::query(LOCK_TIMEOUT)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err("set lock_timeout"))?;
     sqlx::query(
         "SELECT o.id FROM orders o JOIN payouts p ON p.order_id = o.id \
          WHERE p.id = $1 FOR SHARE OF o",
@@ -550,6 +599,18 @@ pub async fn send_payout(state: &AppState, payout_id: Uuid) -> Result<PayoutOutc
         json!({ "status": status, "attempt": claim.attempts, "error": error }),
     )
     .await?;
+    if error == Some(UNKNOWN_EXHAUSTED) {
+        audit::record(
+            &mut tx,
+            None,
+            "payout.escalated_manual",
+            "payout",
+            Some(payout_id),
+            json!({ "reason": UNKNOWN_EXHAUSTED, "attempts": claim.attempts }),
+        )
+        .await?;
+        tracing::warn!("payout outcome still unknown after max attempts; moved to manual");
+    }
     tx.commit().await.context("commit")?;
     Ok(outcome(status))
 }
@@ -655,11 +716,12 @@ struct SettleRow {
 }
 
 /// Whether a payout in `status` can still change on the provider's answer.
-fn settleable(status: &str, has_provider_id: bool) -> bool {
+fn settleable(status: &str, has_provider_id: bool, last_error: Option<&str>) -> bool {
     match status {
         "pending" | "unknown" | "sending" | "successful" => true,
-        // Pending too long, but the provider did accept it.
-        "manual" => has_provider_id,
+        // Pending too long but accepted by the provider, or an outcome that
+        // stayed unknown: either may still have paid.
+        "manual" => has_provider_id || last_error == Some(UNKNOWN_EXHAUSTED),
         _ => false,
     }
 }
@@ -680,19 +742,20 @@ pub async fn settle_payout_from(
     reference: &str,
     from_provider: Option<&str>,
 ) -> Result<SettlePayoutOutcome, AppError> {
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT status::text, provider, provider_payout_id FROM payouts WHERE reference = $1",
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status::text, provider, provider_payout_id, last_error \
+         FROM payouts WHERE reference = $1",
     )
     .bind(reference)
     .fetch_optional(&state.db)
     .await
     .context("find payout")?;
-    let Some((status, provider_name, provider_id)) =
-        row.filter(|(_, p, _)| from_provider.is_none_or(|f| f == p))
+    let Some((status, provider_name, provider_id, last_error)) =
+        row.filter(|(_, p, _, _)| from_provider.is_none_or(|f| f == p))
     else {
         return Ok(SettlePayoutOutcome::UnknownReference);
     };
-    if !settleable(&status, provider_id.is_some()) {
+    if !settleable(&status, provider_id.is_some(), last_error.as_deref()) {
         return Ok(SettlePayoutOutcome::Settled { status });
     }
     let Some(provider) = state.providers.by_name(&provider_name) else {
@@ -714,6 +777,16 @@ pub async fn settle_payout_from(
             tracing::warn!(provider = provider.name(), "payout status timed out");
             return Ok(SettlePayoutOutcome::RetryLater);
         }
+    };
+    // A success for a payout we never got an id for (an unknown outcome):
+    // look the id up so support can trace it. Best effort, outside any tx.
+    let found_id = if provider_id.is_none() && matches!(answer, PayoutState::Successful { .. }) {
+        match tokio::time::timeout(PAYOUT_CALL_TIMEOUT, provider.find_payout(reference)).await {
+            Ok(Ok(Some(h))) => Some(h.provider_payout_id),
+            _ => None,
+        }
+    } else {
+        None
     };
 
     let mut tx = state.db.begin().await.context("begin")?;
@@ -794,12 +867,14 @@ pub async fn settle_payout_from(
             .await?;
             sqlx::query(
                 "UPDATE payouts SET status = 'successful', provider_fee_kobo = $2, \
+                        provider_payout_id = COALESCE(provider_payout_id, $3), \
                         settled_at = now(), last_error = NULL, sending_until = NULL, \
                         next_attempt_at = NULL, last_polled_at = now(), updated_at = now() \
                  WHERE id = $1",
             )
             .bind(p.id)
             .bind(fee)
+            .bind(&found_id)
             .execute(&mut *tx)
             .await
             .context("payout successful")?;
