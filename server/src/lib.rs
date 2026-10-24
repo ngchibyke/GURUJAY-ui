@@ -101,3 +101,19 @@ pub fn build_app(state: AppState) -> Router {
         .layer(trace)
         .with_state(state)
 }
+
+/// Options for the server's database pool. Every connection gets
+/// `idle_in_transaction_session_timeout = 60s`: a transaction left open (a
+/// stuck job claim, a hung request) is ended by Postgres instead of holding
+/// its row locks and blocking VACUUM on the hot tables.
+pub fn pool_options(max_connections: u32) -> sqlx::postgres::PgPoolOptions {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::Executor::execute(conn, "SET idle_in_transaction_session_timeout = '60s'")
+                    .await?;
+                Ok(())
+            })
+        })
+}

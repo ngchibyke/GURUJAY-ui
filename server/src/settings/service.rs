@@ -25,6 +25,8 @@ pub struct Settings {
     pub release_after_hours: i32,
     pub backstop_days: i32,
     pub payout_settlement_buffer_hours: i32,
+    /// Kill switch for the ship-deadline job (auto-refund + seller strike).
+    pub jobs_ship_deadline_enabled: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
@@ -44,7 +46,7 @@ impl Settings {
 const SELECT: &str = "SELECT platform_cut_bps, fee_small_kobo, fee_large_kobo, \
     fee_threshold_kobo, stamp_duty_kobo, stamp_duty_threshold_kobo, enabled_methods, \
     payout_provider, checkout_ttl_minutes, ship_deadline_hours, release_after_hours, \
-    backstop_days, payout_settlement_buffer_hours, updated_at \
+    backstop_days, payout_settlement_buffer_hours, jobs_ship_deadline_enabled, updated_at \
     FROM platform_settings WHERE id";
 
 pub async fn load(db: &PgPool) -> Result<Settings, AppError> {
@@ -71,6 +73,7 @@ pub struct SettingsPatch {
     pub release_after_hours: Option<i32>,
     pub backstop_days: Option<i32>,
     pub payout_settlement_buffer_hours: Option<i32>,
+    pub jobs_ship_deadline_enabled: Option<bool>,
 }
 
 fn in_range<T: PartialOrd>(field: &str, v: Option<T>, lo: T, hi: T) -> Result<(), AppError> {
@@ -97,6 +100,7 @@ impl SettingsPatch {
             && self.release_after_hours.is_none()
             && self.backstop_days.is_none()
             && self.payout_settlement_buffer_hours.is_none()
+            && self.jobs_ship_deadline_enabled.is_none()
     }
 
     fn validate(&self) -> Result<(), AppError> {
@@ -206,6 +210,7 @@ pub async fn update(db: &PgPool, actor: Uuid, patch: SettingsPatch) -> Result<Se
             release_after_hours,
             backstop_days,
             payout_settlement_buffer_hours,
+            jobs_ship_deadline_enabled,
         );
     }
     if changed.is_empty() {

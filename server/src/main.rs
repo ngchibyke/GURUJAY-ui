@@ -11,10 +11,12 @@ use server::{
     build_app,
     config::Config,
     crypto::FieldCipher,
+    escrow::jobs,
     payments::ProviderRegistry,
     phone::normalize_ng_phone,
+    pool_options,
 };
-use sqlx::postgres::PgPoolOptions;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 /// How long open connections get to finish after a shutdown signal.
@@ -55,10 +57,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&config.database_url)
-        .await?;
+    let db = pool_options(10).connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
 
     let state = AppState {
@@ -84,25 +83,43 @@ async fn serve(state: AppState, config: &Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "listening");
     let db = state.db.clone();
+    // Background jobs (Task 9): stopped by the same shutdown signal, and
+    // awaited before the pool closes.
+    let stop_jobs = CancellationToken::new();
+    let jobs_loop = tokio::spawn(jobs::run_loop(state.clone(), stop_jobs.clone()));
     let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let cancel_jobs = stop_jobs.clone();
     let server = axum::serve(listener, build_app(state)).with_graceful_shutdown(async move {
         shutdown_signal().await;
         tracing::info!("shutdown signal received, draining connections");
+        cancel_jobs.cancel();
         let _ = signalled_tx.send(());
     });
     // Idle keep-alive connections can stall the drain forever, so bound it once the signal fires.
-    tokio::select! {
-        res = server => res?,
+    let served = tokio::select! {
+        res = server => res,
         _ = async {
             if signalled_rx.await.is_ok() {
                 tokio::time::sleep(SHUTDOWN_GRACE).await;
             } else {
                 std::future::pending::<()>().await;
             }
-        } => tracing::warn!("drain timed out, shutting down with connections still open"),
+        } => {
+            tracing::warn!("drain timed out, shutting down with connections still open");
+            Ok(())
+        }
+    };
+    // Also on a server error: the jobs stop between rows, never mid-call.
+    stop_jobs.cancel();
+    if tokio::time::timeout(SHUTDOWN_GRACE, jobs_loop)
+        .await
+        .is_err()
+    {
+        tracing::warn!("jobs did not stop in time, shutting down anyway");
     }
     db.close().await;
     tracing::info!("shut down");
+    served?;
     Ok(())
 }
 
