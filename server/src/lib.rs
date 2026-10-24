@@ -6,7 +6,9 @@ pub mod checkout;
 pub mod config;
 pub mod crypto;
 pub mod error;
+pub mod escrow;
 pub mod extract;
+pub mod ledger;
 pub mod limits;
 pub mod money;
 pub mod payments;
@@ -37,6 +39,8 @@ pub struct AppState {
     pub providers: Arc<ProviderRegistry>,
     /// Fixed return URL sent to the payment provider (config `PUBLIC_REDIRECT_URL`).
     pub payment_redirect_url: String,
+    /// Cooldown and concurrency cap on outbound payment verify calls.
+    pub verify_gate: Arc<payments::VerifyGate>,
 }
 
 async fn health() -> Json<Value> {
@@ -88,6 +92,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(payout_accounts::routes::router())
         .merge(cart::routes::router())
         .merge(checkout::routes::router())
+        .merge(payments::webhooks::router())
         // Must follow every route: it applies to the method routers registered so far.
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)

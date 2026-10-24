@@ -71,6 +71,7 @@ async fn main() -> anyhow::Result<()> {
         // Mono is registered here once its keys are configured (Task 11).
         providers: Arc::new(ProviderRegistry::new()),
         payment_redirect_url: config.public_redirect_url.clone(),
+        verify_gate: Arc::new(server::payments::VerifyGate::default()),
     };
 
     match command {

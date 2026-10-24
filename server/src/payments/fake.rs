@@ -58,6 +58,7 @@ pub struct FakeProvider {
     payout_states: Mutex<HashMap<String, PayoutState>>,
     found_payouts: Mutex<HashMap<String, Option<String>>>,
     refund_supported: Mutex<bool>,
+    refund_failure: Mutex<Option<ProviderError>>,
     lookup: Mutex<Option<Result<String, ProviderError>>>,
     calls: Mutex<HashMap<&'static str, usize>>,
     initiated: Mutex<Vec<InitiatePayment>>,
@@ -143,6 +144,16 @@ impl FakeProvider {
     /// When true, `refund` succeeds with id `fakerf_<payment_reference>`.
     pub fn set_refund_supported(&self, supported: bool) {
         *self.refund_supported.lock().unwrap() = supported;
+    }
+
+    /// Every later `refund` call returns this error (after being recorded),
+    /// until [`clear_refund_failure`](Self::clear_refund_failure).
+    pub fn fail_refund_with(&self, err: ProviderError) {
+        *self.refund_failure.lock().unwrap() = Some(err);
+    }
+
+    pub fn clear_refund_failure(&self) {
+        *self.refund_failure.lock().unwrap() = None;
     }
 
     /// What `resolve_account` returns from now on.
@@ -285,6 +296,9 @@ impl PaymentProvider for FakeProvider {
         self.record("refund");
         let reference = req.payment_reference.clone();
         self.refunds.lock().unwrap().push(req);
+        if let Some(e) = self.refund_failure.lock().unwrap().as_ref() {
+            return Err(copy_err(e));
+        }
         if !*self.refund_supported.lock().unwrap() {
             return Err(ProviderError::NotSupported);
         }
@@ -447,6 +461,7 @@ mod tests {
             fee_kobo: 1,
             currency: "NGN".into(),
             held: false,
+            reference: "R".into(),
         };
         fake.set_payment("R", paid.clone());
         assert_eq!(fake.verify_payment("R").await.unwrap(), paid);
@@ -507,6 +522,7 @@ mod tests {
         );
 
         let refund = RefundRequest {
+            reference: "RF1".into(),
             payment_reference: "R".into(),
             amount_kobo: 100,
             reason: "r".into(),

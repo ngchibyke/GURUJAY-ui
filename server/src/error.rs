@@ -20,6 +20,16 @@ pub enum AppError {
     Validation(String),
     #[error("unauthorized")]
     Unauthorized,
+    /// 401 `invalid_signature`: a webhook whose secret/signature did not match.
+    #[error("invalid webhook signature")]
+    InvalidSignature,
+    /// 413 `payload_too_large`.
+    #[error("payload too large")]
+    PayloadTooLarge,
+    /// 503 with the given code: try again later (e.g. a webhook the provider
+    /// should redeliver because the payment could not be verified yet).
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(&'static str),
     #[error("invalid credentials")]
     InvalidCredentials,
     #[error("forbidden: {0}")]
@@ -64,6 +74,18 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 body("unauthorized", "Authentication required"),
+            ),
+            AppError::InvalidSignature => (
+                StatusCode::UNAUTHORIZED,
+                body("invalid_signature", "Invalid signature"),
+            ),
+            AppError::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                body("payload_too_large", "Request body is too large"),
+            ),
+            AppError::Unavailable(code) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                body(code, "Temporarily unavailable, try again later"),
             ),
             AppError::InvalidCredentials => (
                 StatusCode::UNAUTHORIZED,

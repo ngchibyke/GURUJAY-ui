@@ -503,7 +503,8 @@ async fn load_created(conn: &mut PgConnection, checkout_id: Uuid) -> Result<Crea
 
 /// The checkout's reserved quantities per variant (from the snapshotted
 /// `order_items`, never the live cart), with those variants locked in id order.
-async fn lock_reserved(
+/// A lock timeout or deadlock is 409 `checkout_busy`.
+pub(crate) async fn lock_reserved(
     conn: &mut PgConnection,
     checkout_id: Uuid,
 ) -> Result<Vec<(Uuid, i32)>, AppError> {
@@ -521,7 +522,7 @@ async fn lock_reserved(
         .bind(&ids)
         .fetch_all(&mut *conn)
         .await
-        .context("lock variants")?;
+        .map_err(db_err("lock variants"))?;
     items
         .into_iter()
         .map(|(id, q)| Ok((id, i32::try_from(q).context("quantity range")?)))

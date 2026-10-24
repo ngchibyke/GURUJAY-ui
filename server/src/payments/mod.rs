@@ -7,6 +7,10 @@
 //! [`ProviderError`] never prints its inner detail, so none of it reaches logs.
 
 pub mod fake;
+pub mod verify_gate;
+pub mod webhooks;
+
+pub use verify_gate::VerifyGate;
 
 use std::{collections::HashMap, fmt, sync::Arc};
 
@@ -152,7 +156,7 @@ impl From<ProviderError> for AppError {
         tracing::warn!(kind = e.kind(), "payment provider error");
         match e {
             ProviderError::NotSupported => AppError::NotSupported,
-            ProviderError::InvalidSignature => AppError::Unauthorized,
+            ProviderError::InvalidSignature => AppError::InvalidSignature,
             ProviderError::Rejected { .. }
             | ProviderError::Unavailable(_)
             | ProviderError::Timeout => AppError::ProviderUnavailable,
@@ -196,6 +200,9 @@ pub enum PaymentStatus {
         currency: String,
         /// The provider flagged the payment or is holding its settlement.
         held: bool,
+        /// The reference the provider's answer is about. Settlement checks it
+        /// equals ours exactly before applying anything.
+        reference: String,
     },
     Failed,
 }
@@ -244,6 +251,9 @@ pub enum PayoutState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundRequest {
+    /// Our refund reference (`new_reference("RF")`), the provider-side
+    /// idempotency key: every retry of one refund sends the same value.
+    pub reference: String,
     pub payment_reference: String,
     pub amount_kobo: i64,
     pub reason: String,

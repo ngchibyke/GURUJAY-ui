@@ -19,7 +19,7 @@ use server::{
     build_app,
     crypto::FieldCipher,
     error::AppError,
-    payments::{ProviderRegistry, fake::FakeProvider},
+    payments::{ProviderRegistry, VerifyGate, fake::FakeProvider},
     phone::normalize_ng_phone,
 };
 use sqlx::PgPool;
@@ -86,6 +86,12 @@ pub struct TestApp {
 
 impl TestApp {
     pub async fn new(pool: PgPool) -> Self {
+        Self::with_verify_gate(pool, VerifyGate::default()).await
+    }
+
+    /// Like [`new`](Self::new) with a custom payment-verify gate (e.g. no cooldown,
+    /// so concurrent settle paths can race each other).
+    pub async fn with_verify_gate(pool: PgPool, gate: VerifyGate) -> Self {
         let otp = Arc::new(RecordingOtpSender::default());
         let fake = Arc::new(FakeProvider::new());
         let mut providers = ProviderRegistry::new();
@@ -97,6 +103,7 @@ impl TestApp {
             otp: otp.clone(),
             providers: Arc::new(providers),
             payment_redirect_url: TEST_REDIRECT_URL.into(),
+            verify_gate: Arc::new(gate),
         };
         Self {
             router: build_app(state.clone()),
@@ -162,6 +169,28 @@ impl TestApp {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
         TestResponse { status, json }
+    }
+
+    /// Sends raw bytes with the given headers (no content type unless given).
+    pub async fn send_raw(
+        &self,
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> TestResponse {
+        let mut builder = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let req = builder.body(Body::from(body)).expect("valid request");
+        let res = self.router.clone().oneshot(req).await.expect("infallible");
+        let status = res.status().as_u16();
+        let bytes = res.into_body().collect().await.expect("body").to_bytes();
+        TestResponse {
+            status,
+            json: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        }
     }
 
     /// Sends a raw (possibly non-JSON) body with a JSON content type.

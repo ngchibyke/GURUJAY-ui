@@ -68,7 +68,9 @@ async fn show(
     user: AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<CheckoutView>, AppError> {
-    Ok(Json(
-        service::get(&state.db, user.id, parse_id(&id)?).await?,
-    ))
+    let id = parse_id(&id)?;
+    // Fallback for a lost webhook: a pending checkout is verified with the
+    // provider (rate-limited by the verify gate) before it is shown.
+    super::settle::settle_for_buyer(&state, user.id, id).await;
+    Ok(Json(service::get(&state.db, user.id, id).await?))
 }
