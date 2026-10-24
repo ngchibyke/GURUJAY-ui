@@ -10,6 +10,8 @@
 //! `txn_id` at commit (a deferred constraint trigger), and rejects UPDATE,
 //! DELETE and TRUNCATE. Balances are derived with `SUM(amount_kobo)`.
 
+use std::collections::HashMap;
+
 use anyhow::Context;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -46,7 +48,8 @@ pub struct Entry {
 
 /// Inserts `entries` as one balanced transaction (a fresh `txn_id`) inside the
 /// caller's DB transaction. Fails, inserting nothing, when the set is empty,
-/// has no non-zero entry, or does not sum to zero; those are programming errors.
+/// has no non-zero entry, or does not sum to zero overall and per `order_id`
+/// (entries with an order id); those are programming errors.
 pub async fn post(conn: &mut PgConnection, entries: &[Entry]) -> Result<(), AppError> {
     let entries: Vec<&Entry> = entries.iter().filter(|e| e.amount_kobo != 0).collect();
     if entries.is_empty() {
@@ -55,6 +58,16 @@ pub async fn post(conn: &mut PgConnection, entries: &[Entry]) -> Result<(), AppE
     let sum: i128 = entries.iter().map(|e| i128::from(e.amount_kobo)).sum();
     if sum != 0 {
         return Err(anyhow::anyhow!("ledger post does not balance").into());
+    }
+    // Every order's own entries balance too (global constraint: per order, zero).
+    let mut per_order: HashMap<Uuid, i128> = HashMap::new();
+    for e in &entries {
+        if let Some(order_id) = e.order_id {
+            *per_order.entry(order_id).or_default() += i128::from(e.amount_kobo);
+        }
+    }
+    if per_order.values().any(|&s| s != 0) {
+        return Err(anyhow::anyhow!("ledger post does not balance per order").into());
     }
     let txn_id = Uuid::new_v4();
     for e in entries {

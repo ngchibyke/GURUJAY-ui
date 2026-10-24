@@ -59,6 +59,7 @@ pub struct FakeProvider {
     found_payouts: Mutex<HashMap<String, Option<String>>>,
     refund_supported: Mutex<bool>,
     refund_failure: Mutex<Option<ProviderError>>,
+    refund_delay: Mutex<Option<std::time::Duration>>,
     lookup: Mutex<Option<Result<String, ProviderError>>>,
     calls: Mutex<HashMap<&'static str, usize>>,
     initiated: Mutex<Vec<InitiatePayment>>,
@@ -150,6 +151,12 @@ impl FakeProvider {
     /// until [`clear_refund_failure`](Self::clear_refund_failure).
     pub fn fail_refund_with(&self, err: ProviderError) {
         *self.refund_failure.lock().unwrap() = Some(err);
+    }
+
+    /// The next `refund` call decides its answer on entry, then waits `delay`
+    /// before returning it (a slow provider; one-shot).
+    pub fn delay_next_refund(&self, delay: std::time::Duration) {
+        *self.refund_delay.lock().unwrap() = Some(delay);
     }
 
     pub fn clear_refund_failure(&self) {
@@ -296,15 +303,20 @@ impl PaymentProvider for FakeProvider {
         self.record("refund");
         let reference = req.payment_reference.clone();
         self.refunds.lock().unwrap().push(req);
-        if let Some(e) = self.refund_failure.lock().unwrap().as_ref() {
-            return Err(copy_err(e));
+        let result = if let Some(e) = self.refund_failure.lock().unwrap().as_ref() {
+            Err(copy_err(e))
+        } else if !*self.refund_supported.lock().unwrap() {
+            Err(ProviderError::NotSupported)
+        } else {
+            Ok(RefundHandle {
+                provider_refund_id: format!("fakerf_{reference}"),
+            })
+        };
+        let delay = self.refund_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
-        if !*self.refund_supported.lock().unwrap() {
-            return Err(ProviderError::NotSupported);
-        }
-        Ok(RefundHandle {
-            provider_refund_id: format!("fakerf_{reference}"),
-        })
+        result
     }
 
     async fn resolve_account(

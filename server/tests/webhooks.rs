@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 use server::{
     checkout::{SettleOutcome, settle_payment},
     error::AppError,
-    escrow::refund::refund_order,
+    escrow::refund::{refund_order, send_refund},
     ledger::{self, Account, Entry},
+    limits::MAX_STOCK,
     payments::{
         PaymentStatus, ProviderError, VerifyGate,
         fake::{FAKE_SIGNATURE_HEADER, FAKE_WEBHOOK_SECRET},
@@ -358,6 +359,8 @@ async fn amount_mismatch_flagged(pool: PgPool) {
     );
     assert!(ledger_rows(&app).await.is_empty());
     assert_eq!(app.stock(b.listing.variant_id).await, 5);
+    // The reservation is released (the owner refunds it later).
+    assert_eq!(app.reserved(b.listing.variant_id).await, 0);
     let detail: Value = sqlx::query_scalar(
         "SELECT detail FROM audit_log WHERE action = 'checkout.amount_mismatch' AND subject_id = $1",
     )
@@ -367,6 +370,7 @@ async fn amount_mismatch_flagged(pool: PgPool) {
     .unwrap();
     assert_eq!(detail["expected_kobo"], 1_000);
     assert_eq!(detail["received_kobo"], 999);
+    assert_eq!(detail["reason"], "amount");
     assert_eq!(event_processed(&app, "evt-1").await, Some(true));
 }
 
@@ -1093,4 +1097,174 @@ async fn refund_rejects_released_or_unpaid_orders(pool: PgPool) {
     ));
     assert_eq!(count(&app, "SELECT count(*) FROM refunds").await, 0);
     assert_eq!(app.fake.calls("refund"), 0);
+}
+
+#[sqlx::test]
+async fn fee_out_of_range_is_amount_mismatch(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let b = bought(&app, 1_000, 5, 1).await;
+    // The amount matches, but the provider claims a fee larger than the payment.
+    app.fake
+        .set_payment(&b.reference, success(&b.reference, b.total_kobo, 1_001));
+    assert_status(&webhook(&app, "evt-1", &b.reference).await, 200, "received");
+    assert_eq!(
+        checkout_status(&app, b.checkout_id).await,
+        "amount_mismatch"
+    );
+    assert!(ledger_rows(&app).await.is_empty());
+    assert_eq!(app.reserved(b.listing.variant_id).await, 0);
+    let reason: String = sqlx::query_scalar(
+        "SELECT detail->>'reason' FROM audit_log WHERE action = 'checkout.amount_mismatch'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(reason, "fee_out_of_range");
+}
+
+#[sqlx::test]
+async fn negative_fee_is_amount_mismatch(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let b = bought(&app, 1_000, 5, 1).await;
+    app.fake
+        .set_payment(&b.reference, success(&b.reference, b.total_kobo, -1));
+    assert_status(&webhook(&app, "evt-1", &b.reference).await, 200, "received");
+    assert_eq!(
+        checkout_status(&app, b.checkout_id).await,
+        "amount_mismatch"
+    );
+    assert!(ledger_rows(&app).await.is_empty());
+}
+
+#[sqlx::test]
+async fn concurrent_same_event_applies_once(pool: PgPool) {
+    let app = TestApp::with_verify_gate(pool, VerifyGate::new(Duration::ZERO, 8)).await;
+    let b = bought(&app, 1_000, 5, 2).await;
+    app.fake
+        .set_payment(&b.reference, success(&b.reference, b.total_kobo, 10));
+    let (r1, r2) = tokio::join!(
+        webhook(&app, "evt-1", &b.reference),
+        webhook(&app, "evt-1", &b.reference),
+    );
+    assert_eq!(r1.status, 200, "{}", r1.json);
+    assert_eq!(r2.status, 200, "{}", r2.json);
+    assert_eq!(checkout_status(&app, b.checkout_id).await, "paid");
+    assert_eq!(ledger_rows(&app).await.len(), 2);
+    assert_eq!(app.stock(b.listing.variant_id).await, 3);
+    assert_eq!(count(&app, "SELECT count(*) FROM provider_events").await, 1);
+    assert_eq!(event_processed(&app, "evt-1").await, Some(true));
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM audit_log WHERE action = 'checkout.paid'"
+        )
+        .await,
+        1
+    );
+}
+
+#[sqlx::test]
+async fn refund_restore_clamps_at_stock_cap(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (b, order_id) = paid_order(&app, 2).await;
+    // The seller restocked to one below the cap meanwhile.
+    sqlx::query("UPDATE product_variants SET stock = $2 WHERE id = $1")
+        .bind(b.listing.variant_id)
+        .bind(MAX_STOCK - 1)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let out = refund_order(&app.state, order_id, true).await.unwrap();
+    assert_eq!(out.status, "manual");
+    assert_eq!(app.stock(b.listing.variant_id).await, MAX_STOCK);
+    let clamped: i64 = sqlx::query_scalar(
+        "SELECT (detail->>'clamped_units')::bigint FROM audit_log \
+         WHERE action = 'order.refund_requested'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(clamped, 1);
+    assert_eq!(ledger_rows(&app).await.len(), 4);
+}
+
+#[sqlx::test]
+async fn refund_double_claim_cannot_overwrite(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (_, order_id) = paid_order(&app, 1).await;
+    app.fake.set_refund_supported(true);
+    app.fake
+        .fail_refund_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    let first = refund_order(&app.state, order_id, false).await.unwrap();
+    assert_eq!(first.status, "requested");
+
+    // Sender A claims and gets a slow "unavailable" answer.
+    app.fake.delay_next_refund(Duration::from_millis(800));
+    let state = app.state.clone();
+    let refund_id = first.refund_id;
+    let a = tokio::spawn(async move { send_refund(&state, refund_id).await });
+    let mut claimed = false;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if app.fake.calls("refund") == 2 {
+            claimed = true;
+            break;
+        }
+    }
+    assert!(claimed, "sender A never called the provider");
+
+    // A's claim expires; sender B claims afresh and succeeds.
+    sqlx::query("UPDATE refunds SET sending_until = now() - interval '1 second'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    app.fake.clear_refund_failure();
+    let b = send_refund(&app.state, refund_id).await.unwrap();
+    assert_eq!(b.status, "processing");
+
+    // A's late answer does not overwrite B's.
+    let a = a.await.unwrap().unwrap();
+    assert_eq!(a.status, "processing");
+    let (status, last_error, provider_id): (String, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT status::text, last_error, provider_refund_id FROM refunds")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "processing");
+    assert_eq!(last_error, None);
+    assert!(provider_id.is_some());
+    assert_eq!(order_status(&app, order_id).await, "refunded");
+}
+
+#[sqlx::test]
+async fn ledger_post_rejects_unbalanced_order(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let b = bought(&app, 1_000, 5, 1).await;
+    let o1: Option<Uuid> = sqlx::query_scalar("SELECT id FROM orders WHERE checkout_id = $1")
+        .bind(b.checkout_id)
+        .fetch_optional(&app.pool)
+        .await
+        .unwrap();
+    let o2: Option<Uuid> = None;
+    let entry = |order_id, account, amount_kobo| Entry {
+        order_id,
+        checkout_id: None,
+        account,
+        amount_kobo,
+        kind: "test",
+        reference: None,
+    };
+    // Balanced per transaction, but the order on its own is not.
+    let mut tx = app.pool.begin().await.unwrap();
+    let res = ledger::post(
+        &mut tx,
+        &[
+            entry(o1, Account::Escrow, 100),
+            entry(o2, Account::BuyerFunds, -100),
+        ],
+    )
+    .await;
+    assert!(res.is_err());
+    drop(tx);
+    assert!(ledger_rows(&app).await.is_empty());
 }

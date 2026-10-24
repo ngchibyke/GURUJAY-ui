@@ -12,7 +12,9 @@
 //!    timeout. No transaction is open during the call.
 //! 3. One transaction, locks in the global order: the checkout's variants (id
 //!    order), the checkout, its orders. Status is re-checked under the locks.
-//!    - amount, currency (`NGN`) or reference differ -> `amount_mismatch` + audit;
+//!    - amount, currency (`NGN`) or reference differ, or the fee is negative or
+//!      above the total -> `amount_mismatch` + audit, a pending checkout's
+//!      reservation released (the owner refunds it);
 //!    - `pending` -> commit the reservation (`stock -= q`, `reserved -= q`), paid;
 //!    - `expired` (reservation already released) -> if available stock covers
 //!      every line, `stock -= q` and paid; otherwise the checkout is `refunded`:
@@ -32,7 +34,7 @@ use serde_json::json;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::service::lock_reserved;
+use super::service::{db_err, lock_reserved};
 use crate::{
     AppState, audit,
     error::AppError,
@@ -177,8 +179,11 @@ pub async fn settle(
                 reference_ok: verified_reference == reference,
                 held,
             };
+            // Lock timeouts and deadlocks (`db_err`) roll back: retry later.
             match apply(state, checkout_id, reference, &v, source).await {
-                Err(AppError::Conflict("checkout_busy")) => Ok(SettleOutcome::RetryLater),
+                Err(AppError::Conflict("checkout_busy" | "order_busy")) => {
+                    Ok(SettleOutcome::RetryLater)
+                }
                 other => other,
             }
         }
@@ -191,16 +196,6 @@ struct Verified {
     currency_ok: bool,
     reference_ok: bool,
     held: bool,
-}
-
-/// Lock timeouts and deadlocks -> 409 `checkout_busy` (settle maps it to retry later).
-fn db_err(ctx: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
-    move |e| match &e {
-        sqlx::Error::Database(d) if matches!(d.code().as_deref(), Some("55P03" | "40P01")) => {
-            AppError::Conflict("checkout_busy")
-        }
-        _ => AppError::Internal(anyhow::Error::new(e).context(ctx)),
-    }
 }
 
 async fn mark_processed<'e, E>(db: E, source: Source<'_>) -> Result<(), AppError>
@@ -216,7 +211,7 @@ where
         .bind(event_id)
         .execute(db)
         .await
-        .context("mark event processed")?;
+        .map_err(db_err("mark event processed"))?;
     }
     Ok(())
 }
@@ -234,7 +229,7 @@ async fn apply(
     sqlx::query(LOCK_TIMEOUT)
         .execute(&mut *tx)
         .await
-        .context("set lock_timeout")?;
+        .map_err(db_err("set lock_timeout"))?;
 
     // product_variants (id order) -> checkouts -> orders.
     let items = lock_reserved(&mut tx, checkout_id).await?;
@@ -259,17 +254,33 @@ async fn apply(
         "expired" => true,
         _ => {
             mark_processed(&mut *tx, source).await?;
-            tx.commit().await.context("commit")?;
+            tx.commit().await.map_err(db_err("commit"))?;
             return Ok(SettleOutcome::AlreadySettled);
         }
     };
 
-    if v.amount_kobo != total_kobo || !v.currency_ok || !v.reference_ok {
+    let mismatch = if v.amount_kobo != total_kobo {
+        Some("amount")
+    } else if !v.currency_ok {
+        Some("currency")
+    } else if !v.reference_ok {
+        Some("reference")
+    } else if v.fee_kobo < 0 || v.fee_kobo > total_kobo {
+        Some("fee_out_of_range")
+    } else {
+        None
+    };
+    if let Some(reason) = mismatch {
+        // Nothing is applied. A pending checkout's reservation is released here,
+        // under the variant locks; the owner refunds the payment (Task 10).
+        if !after_expiry {
+            release_reserved(&mut tx, &items).await?;
+        }
         sqlx::query("UPDATE checkouts SET status = 'amount_mismatch' WHERE id = $1")
             .bind(checkout_id)
             .execute(&mut *tx)
             .await
-            .context("flag amount mismatch")?;
+            .map_err(db_err("flag amount mismatch"))?;
         audit::record(
             &mut tx,
             None,
@@ -277,16 +288,19 @@ async fn apply(
             "checkout",
             Some(checkout_id),
             json!({
+                "reason": reason,
                 "expected_kobo": total_kobo,
                 "received_kobo": v.amount_kobo,
                 "currency_ok": v.currency_ok,
                 "reference_ok": v.reference_ok,
+                "fee_kobo": v.fee_kobo,
                 "after_expiry": after_expiry,
+                "reservation_released": !after_expiry,
             }),
         )
         .await?;
         mark_processed(&mut *tx, source).await?;
-        tx.commit().await.context("commit")?;
+        tx.commit().await.map_err(db_err("commit"))?;
         tracing::warn!("payment does not match its checkout; flagged amount_mismatch");
         return Ok(SettleOutcome::AmountMismatch);
     }
@@ -301,7 +315,7 @@ async fn apply(
         .bind(&ids)
         .fetch_all(&mut *tx)
         .await
-        .context("load variants")?;
+        .map_err(db_err("load variants"))?;
         let covered = items.iter().all(|(id, q)| {
             rows.iter()
                 .any(|(vid, stock, reserved)| vid == id && stock - reserved >= *q)
@@ -313,7 +327,7 @@ async fn apply(
                     .bind(quantity)
                     .execute(&mut *tx)
                     .await
-                    .context("take stock")?;
+                    .map_err(db_err("take stock"))?;
             }
         } else {
             refund = true;
@@ -322,12 +336,8 @@ async fn apply(
         super::commit_reserved(&mut tx, checkout_id).await?;
     }
 
-    let fee = if v.fee_kobo < 0 {
-        tracing::warn!("provider reported a negative fee; recording 0");
-        0
-    } else {
-        v.fee_kobo
-    };
+    // In range: checked with the mismatch rules above.
+    let fee = v.fee_kobo;
     sqlx::query(
         "UPDATE checkouts SET status = $2::checkout_status, paid_at = now(), \
                 collection_fee_kobo = $3, provider_flagged = $4 WHERE id = $1",
@@ -338,7 +348,7 @@ async fn apply(
     .bind(v.held)
     .execute(&mut *tx)
     .await
-    .context("mark checkout paid")?;
+    .map_err(db_err("mark checkout paid"))?;
 
     let totals = orders
         .iter()
@@ -364,7 +374,7 @@ async fn apply(
         .bind(settings.backstop_days)
         .execute(&mut *tx)
         .await
-        .context("mark order paid")?;
+        .map_err(db_err("mark order paid"))?;
         for (account, amount_kobo) in [(Account::BuyerFunds, -total), (Account::Escrow, *total)] {
             entries.push(Entry {
                 order_id: Some(*order_id),
@@ -432,6 +442,22 @@ async fn apply(
     Ok(SettleOutcome::RefundedAfterExpiry)
 }
 
+/// Releases a pending checkout's reservation (`reserved_quantity -= q`); the
+/// variants are already locked by the caller.
+async fn release_reserved(conn: &mut PgConnection, items: &[(Uuid, i32)]) -> Result<(), AppError> {
+    for (variant_id, quantity) in items {
+        sqlx::query(
+            "UPDATE product_variants SET reserved_quantity = reserved_quantity - $2 WHERE id = $1",
+        )
+        .bind(variant_id)
+        .bind(quantity)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err("release reservation"))?;
+    }
+    Ok(())
+}
+
 /// Removes the paid variants from the buyer's cart (lines added since stay).
 async fn clear_cart_lines(
     conn: &mut PgConnection,
@@ -444,6 +470,6 @@ async fn clear_cart_lines(
         .bind(&ids)
         .execute(&mut *conn)
         .await
-        .context("clear cart lines")?;
+        .map_err(db_err("clear cart lines"))?;
     Ok(())
 }

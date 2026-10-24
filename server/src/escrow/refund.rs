@@ -15,20 +15,28 @@
 //!    - Unavailable/Timeout: refund stays `requested` with `last_error`, order
 //!      stays `refund_pending`; a later call retries with the SAME reference.
 
+use std::time::Duration;
+
 use anyhow::Context;
 use serde_json::json;
 use sqlx::PgConnection;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
     AppState, audit,
+    checkout::service::busy_err,
     error::AppError,
     ledger::{self, Account, Entry},
+    limits::MAX_STOCK,
     payments::{self, ProviderError, RefundRequest},
 };
 
 const REFERENCE_PREFIX: &str = "RF";
 const LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '5s'";
+/// Longest wait for the provider's refund answer. Well under the 2-minute
+/// claim, so a slow call cannot outlive its claim; past it the outcome is a Timeout.
+pub const REFUND_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundOutcome {
@@ -39,12 +47,7 @@ pub struct RefundOutcome {
 }
 
 fn db_err(ctx: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
-    move |e| match &e {
-        sqlx::Error::Database(d) if matches!(d.code().as_deref(), Some("55P03" | "40P01")) => {
-            AppError::Conflict("order_busy")
-        }
-        _ => AppError::Internal(anyhow::Error::new(e).context(ctx)),
-    }
+    busy_err("order_busy", ctx)
 }
 
 /// Refunds a `paid` order in full, or retries the provider call of an order
@@ -79,7 +82,8 @@ pub async fn begin_refund(
     restore_stock: bool,
     reason: &str,
 ) -> Result<Uuid, AppError> {
-    let items: Vec<(Uuid, i32)> = if restore_stock {
+    // (variant, quantity, on-hand stock under the lock)
+    let items: Vec<(Uuid, i32, i32)> = if restore_stock {
         let items: Vec<(Uuid, i32)> = sqlx::query_as(
             "SELECT variant_id, quantity FROM order_items WHERE order_id = $1 ORDER BY variant_id",
         )
@@ -88,14 +92,21 @@ pub async fn begin_refund(
         .await
         .context("load order items")?;
         let ids: Vec<Uuid> = items.iter().map(|(id, _)| *id).collect();
-        sqlx::query(
-            "SELECT id FROM product_variants WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE",
+        let stocks: Vec<(Uuid, i32)> = sqlx::query_as(
+            "SELECT id, stock FROM product_variants WHERE id = ANY($1) \
+             ORDER BY id FOR NO KEY UPDATE",
         )
         .bind(&ids)
         .fetch_all(&mut *conn)
         .await
         .map_err(db_err("lock variants"))?;
         items
+            .into_iter()
+            .map(|(id, q)| {
+                let stock = stocks.iter().find(|(v, _)| *v == id).map_or(0, |(_, s)| *s);
+                (id, q, stock)
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -139,13 +150,19 @@ pub async fn begin_refund(
         .execute(&mut *conn)
         .await
         .context("mark refund pending")?;
-    for (variant_id, quantity) in &items {
-        sqlx::query("UPDATE product_variants SET stock = stock + $2 WHERE id = $1")
+    // Units back on hand, clamped at the stock cap (the seller may have
+    // restocked meanwhile); the clamped units are recorded in the audit row.
+    let mut clamped_units: i64 = 0;
+    for (variant_id, quantity, stock) in &items {
+        let wanted = i64::from(*stock) + i64::from(*quantity);
+        clamped_units += (wanted - i64::from(MAX_STOCK)).max(0);
+        sqlx::query("UPDATE product_variants SET stock = LEAST(stock + $2, $3) WHERE id = $1")
             .bind(variant_id)
             .bind(quantity)
+            .bind(MAX_STOCK)
             .execute(&mut *conn)
             .await
-            .context("restore stock")?;
+            .map_err(db_err("restore stock"))?;
     }
     let reference = payments::new_reference(REFERENCE_PREFIX);
     let refund_id: Uuid = sqlx::query_scalar(
@@ -182,7 +199,12 @@ pub async fn begin_refund(
         "order.refund_requested",
         "order",
         Some(order_id),
-        json!({ "refund_id": refund_id, "amount_kobo": amount, "restore_stock": restore_stock }),
+        json!({
+            "refund_id": refund_id,
+            "amount_kobo": amount,
+            "restore_stock": restore_stock,
+            "clamped_units": clamped_units,
+        }),
     )
     .await?;
     Ok(refund_id)
@@ -195,12 +217,17 @@ struct Claimed {
     provider: String,
     amount_kobo: i64,
     reason: String,
+    /// Fencing token: the outcome is written only while the claim still holds it.
+    claimed_until: OffsetDateTime,
     payment_reference: String,
 }
 
 /// Step 2 (see the module docs). Never call it inside an open transaction.
-/// Only one caller at a time sends a given refund (a 2-minute claim on the row);
-/// anyone else gets the refund's current status.
+/// Only one caller at a time sends a given refund (a 2-minute claim on the row,
+/// and the provider call is cut off after [`REFUND_CALL_TIMEOUT`]); anyone else
+/// gets the refund's current status. The outcome is written only if the claim
+/// is still ours (`sending_until` unchanged), so a late answer never
+/// overwrites a newer sender's.
 pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutcome, AppError> {
     let claimed: Option<Claimed> = sqlx::query_as(
         "UPDATE refunds r SET sending_until = now() + interval '2 minutes', \
@@ -209,7 +236,7 @@ pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutc
          WHERE r.id = $1 AND o.id = r.order_id AND r.status = 'requested' \
            AND (r.sending_until IS NULL OR r.sending_until < now()) \
          RETURNING r.order_id, r.reference, r.provider, r.amount_kobo, r.reason, \
-                   c.reference AS payment_reference",
+                   r.sending_until AS claimed_until, c.reference AS payment_reference",
     )
     .bind(refund_id)
     .fetch_optional(&state.db)
@@ -221,14 +248,15 @@ pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutc
 
     let result = match state.providers.by_name(&c.provider) {
         Some(provider) => {
-            provider
-                .refund(RefundRequest {
-                    reference: c.reference.clone(),
-                    payment_reference: c.payment_reference.clone(),
-                    amount_kobo: c.amount_kobo,
-                    reason: c.reason.clone(),
-                })
+            let call = provider.refund(RefundRequest {
+                reference: c.reference.clone(),
+                payment_reference: c.payment_reference.clone(),
+                amount_kobo: c.amount_kobo,
+                reason: c.reason.clone(),
+            });
+            tokio::time::timeout(REFUND_CALL_TIMEOUT, call)
                 .await
+                .unwrap_or(Err(ProviderError::Timeout))
         }
         None => Err(ProviderError::Unavailable(anyhow::anyhow!(
             "provider not configured"
@@ -251,6 +279,36 @@ pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutc
 
     let mut tx = state.db.begin().await.context("begin")?;
     // Lock order: orders before refunds.
+    sqlx::query("SELECT id FROM orders WHERE id = $1 FOR UPDATE")
+        .bind(c.order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err("lock order"))?;
+    // Fenced on our claim: if it expired and another sender claimed the row,
+    // that sender owns the outcome and this late answer is dropped.
+    let fenced: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE refunds SET status = $2::refund_status, \
+                provider_refund_id = COALESCE($3, provider_refund_id), \
+                last_error = $4, sending_until = NULL, updated_at = now() \
+         WHERE id = $1 AND status = 'requested' AND sending_until = $5 RETURNING id",
+    )
+    .bind(refund_id)
+    .bind(status)
+    .bind(&provider_id)
+    .bind(error)
+    .bind(c.claimed_until)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("record refund outcome")?;
+    if fenced.is_none() {
+        drop(tx);
+        tracing::warn!(
+            provider = c.provider.as_str(),
+            outcome = status,
+            "refund claim lost to a newer sender; late answer not recorded"
+        );
+        return current(&state.db, refund_id).await;
+    }
     if done {
         sqlx::query(
             "UPDATE orders SET status = 'refunded' WHERE id = $1 AND status = 'refund_pending'",
@@ -260,19 +318,6 @@ pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutc
         .await
         .context("mark order refunded")?;
     }
-    sqlx::query(
-        "UPDATE refunds SET status = $2::refund_status, \
-                provider_refund_id = COALESCE($3, provider_refund_id), \
-                last_error = $4, sending_until = NULL, updated_at = now() \
-         WHERE id = $1",
-    )
-    .bind(refund_id)
-    .bind(status)
-    .bind(&provider_id)
-    .bind(error)
-    .execute(&mut *tx)
-    .await
-    .context("record refund outcome")?;
     if done {
         audit::record(
             &mut tx,

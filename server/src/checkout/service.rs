@@ -74,10 +74,20 @@ fn too_large() -> AppError {
 }
 
 /// Maps lock timeouts and deadlocks to 409 `checkout_busy`; anything else is internal.
-fn db_err(ctx: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
+pub(crate) fn db_err(ctx: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
+    busy_err("checkout_busy", ctx)
+}
+
+/// Maps lock timeouts (55P03) and deadlocks (40P01) to 409 `code`; anything
+/// else is internal with `ctx`. Payment settlement treats these 409s as
+/// "retry later".
+pub(crate) fn busy_err(
+    code: &'static str,
+    ctx: &'static str,
+) -> impl FnOnce(sqlx::Error) -> AppError {
     move |e| match &e {
         sqlx::Error::Database(d) if matches!(d.code().as_deref(), Some("55P03" | "40P01")) => {
-            AppError::Conflict("checkout_busy")
+            AppError::Conflict(code)
         }
         _ => AppError::Internal(anyhow::Error::new(e).context(ctx)),
     }
