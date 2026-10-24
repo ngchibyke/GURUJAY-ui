@@ -6,11 +6,16 @@
 //!   unknown provider -> 404, mismatch -> 401 `invalid_signature`.
 //! - A malformed body after a valid signature, and events we do not act on,
 //!   -> 200 `{"status":"ignored"}` (nothing stored).
-//! - Payment events are deduplicated on `(provider, event_id)`: a row with
-//!   `processed_at` set -> 200 `{"status":"duplicate"}`. Otherwise the payment
-//!   is settled ([`settle`](crate::checkout::settle::settle)), which marks the
-//!   event processed with the state change. When the payment cannot be verified
-//!   right now the answer is 503 `verify_unavailable`, so the provider redelivers.
+//! - Payment and payout events are deduplicated on `(provider, event_id)`: a
+//!   row with `processed_at` set -> 200 `{"status":"duplicate"}`.
+//! - A payment is settled ([`settle`](crate::checkout::settle::settle)), which
+//!   marks the event processed with the state change. When the payment cannot
+//!   be verified right now the answer is 503 `verify_unavailable`, so the
+//!   provider redelivers.
+//! - A payout is settled by our reference
+//!   ([`settle_payout`](crate::escrow::settle_payout)), which re-fetches the
+//!   payout's status from the provider; the event is marked processed after it.
+//!   When the status cannot be fetched the answer is 503 `payout_status_unavailable`.
 //!
 //! Logging: the provider name and event kind only, never the body or headers
 //! (bodies can carry the payer's bank account).
@@ -33,7 +38,23 @@ use crate::{
     AppState,
     checkout::settle::{SettleOutcome, Source, settle},
     error::AppError,
+    escrow::{SettlePayoutOutcome, release::settle_payout_from},
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    Payment,
+    Payout,
+}
+
+impl EventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Payment => "payment",
+            EventKind::Payout => "payout",
+        }
+    }
+}
 
 /// Largest webhook body accepted.
 pub const MAX_WEBHOOK_BODY: usize = 64 * 1024;
@@ -91,33 +112,34 @@ async fn receive(
             return Ok(status("ignored"));
         }
     };
-    let (event_id, reference) = match event {
+    let (event_id, reference, kind) = match event {
         WebhookEvent::Payment {
             event_id,
             reference,
-        } => (event_id, reference),
-        // Payout events are settled by escrow::settle_payout (Task 8).
-        WebhookEvent::Payout { .. } => {
-            tracing::info!(provider = name, kind = "payout", "webhook ignored");
-            return Ok(status("ignored"));
-        }
+        } => (event_id, reference, EventKind::Payment),
+        WebhookEvent::Payout {
+            event_id,
+            reference,
+        } => (event_id, reference, EventKind::Payout),
         _ => {
             tracing::info!(provider = name, kind = "other", "webhook ignored");
             return Ok(status("ignored"));
         }
     };
+    let kind_name = kind.as_str();
     if event_id.is_empty() || event_id.len() > MAX_EVENT_ID_LEN {
         tracing::info!(provider = name, kind = "bad_event_id", "webhook ignored");
         return Ok(status("ignored"));
     }
-    tracing::info!(provider = name, kind = "payment", "webhook received");
+    tracing::info!(provider = name, kind = kind_name, "webhook received");
 
     sqlx::query(
-        "INSERT INTO provider_events (provider, event_id, kind) VALUES ($1, $2, 'payment') \
+        "INSERT INTO provider_events (provider, event_id, kind) VALUES ($1, $2, $3) \
          ON CONFLICT (provider, event_id) DO NOTHING",
     )
     .bind(name)
     .bind(&event_id)
+    .bind(kind_name)
     .execute(&state.db)
     .await
     .context("record provider event")?;
@@ -131,6 +153,28 @@ async fn receive(
     .context("load provider event")?;
     if processed {
         return Ok(status("duplicate"));
+    }
+
+    if kind == EventKind::Payout {
+        // settle_payout is idempotent (status checks under the payout lock and
+        // ledger posting keys), so marking the event processed after it is safe.
+        return match settle_payout_from(&state, &reference, Some(name)).await? {
+            SettlePayoutOutcome::RetryLater => {
+                Err(AppError::Unavailable("payout_status_unavailable"))
+            }
+            _ => {
+                sqlx::query(
+                    "UPDATE provider_events SET processed_at = now() \
+                     WHERE provider = $1 AND event_id = $2 AND processed_at IS NULL",
+                )
+                .bind(name)
+                .bind(&event_id)
+                .execute(&state.db)
+                .await
+                .context("mark event processed")?;
+                Ok(status("received"))
+            }
+        };
     }
 
     let source = Source::Webhook {

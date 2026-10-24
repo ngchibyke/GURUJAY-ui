@@ -899,10 +899,11 @@ async fn ledger_post_rejects_unbalanced_and_empty(pool: PgPool) {
         reference: None,
     };
     let mut tx = app.pool.begin().await.unwrap();
-    assert!(ledger::post(&mut tx, &[]).await.is_err());
+    assert!(ledger::post(&mut tx, ("test", "k1"), &[]).await.is_err());
     assert!(
         ledger::post(
             &mut tx,
+            ("test", "k2"),
             &[entry(Account::Escrow, 100), entry(Account::BuyerFunds, -99)]
         )
         .await
@@ -911,6 +912,7 @@ async fn ledger_post_rejects_unbalanced_and_empty(pool: PgPool) {
     assert!(
         ledger::post(
             &mut tx,
+            ("test", "k3"),
             &[entry(Account::Escrow, i64::MAX), entry(Account::Escrow, 1)]
         )
         .await
@@ -918,6 +920,7 @@ async fn ledger_post_rejects_unbalanced_and_empty(pool: PgPool) {
     );
     ledger::post(
         &mut tx,
+        ("test", "k4"),
         &[
             entry(Account::Escrow, 100),
             entry(Account::BuyerFunds, -100),
@@ -1258,6 +1261,7 @@ async fn ledger_post_rejects_unbalanced_order(pool: PgPool) {
     let mut tx = app.pool.begin().await.unwrap();
     let res = ledger::post(
         &mut tx,
+        ("test", "k5"),
         &[
             entry(o1, Account::Escrow, 100),
             entry(o2, Account::BuyerFunds, -100),

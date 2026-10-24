@@ -9,6 +9,12 @@
 //! entries that sums to zero. The database re-checks the zero sum per
 //! `txn_id` at commit (a deferred constraint trigger), and rejects UPDATE,
 //! DELETE and TRUNCATE. Balances are derived with `SUM(amount_kobo)`.
+//!
+//! Every post carries a posting key `(kind, ref)`, e.g. `("release", order_id)`
+//! or `("payout_reversal", payout_id)`, recorded in `ledger_postings` in the
+//! same transaction. A key that was already posted skips the entries, so a
+//! release, success or reversal can never be booked twice (webhook replays,
+//! a poll racing a webhook).
 
 use std::collections::HashMap;
 
@@ -47,10 +53,18 @@ pub struct Entry {
 }
 
 /// Inserts `entries` as one balanced transaction (a fresh `txn_id`) inside the
-/// caller's DB transaction. Fails, inserting nothing, when the set is empty,
-/// has no non-zero entry, or does not sum to zero overall and per `order_id`
-/// (entries with an order id); those are programming errors.
-pub async fn post(conn: &mut PgConnection, entries: &[Entry]) -> Result<(), AppError> {
+/// caller's DB transaction, under the posting key `key = (kind, ref)`.
+///
+/// Returns `Ok(true)` when posted and `Ok(false)` when `key` was already
+/// posted (nothing inserted). A concurrent post of the same key waits for the
+/// first transaction and then skips. Fails, inserting nothing, when the set is
+/// empty, has no non-zero entry, or does not sum to zero overall and per
+/// `order_id` (entries with an order id); those are programming errors.
+pub async fn post(
+    conn: &mut PgConnection,
+    key: (&str, &str),
+    entries: &[Entry],
+) -> Result<bool, AppError> {
     let entries: Vec<&Entry> = entries.iter().filter(|e| e.amount_kobo != 0).collect();
     if entries.is_empty() {
         return Err(anyhow::anyhow!("ledger post with no entries").into());
@@ -70,6 +84,20 @@ pub async fn post(conn: &mut PgConnection, entries: &[Entry]) -> Result<(), AppE
         return Err(anyhow::anyhow!("ledger post does not balance per order").into());
     }
     let txn_id = Uuid::new_v4();
+    let claimed: Option<Uuid> = sqlx::query_scalar(
+        "INSERT INTO ledger_postings (kind, ref, txn_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (kind, ref) DO NOTHING RETURNING txn_id",
+    )
+    .bind(key.0)
+    .bind(key.1)
+    .bind(txn_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .context("insert ledger posting key")?;
+    if claimed.is_none() {
+        tracing::info!(kind = key.0, "ledger posting key already posted; skipped");
+        return Ok(false);
+    }
     for e in entries {
         sqlx::query(
             "INSERT INTO ledger_entries \
@@ -87,5 +115,5 @@ pub async fn post(conn: &mut PgConnection, entries: &[Entry]) -> Result<(), AppE
         .await
         .context("insert ledger entry")?;
     }
-    Ok(())
+    Ok(true)
 }

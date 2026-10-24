@@ -187,6 +187,7 @@ pub async fn begin_refund(
     };
     ledger::post(
         conn,
+        ("refund", &refund_id.to_string()),
         &[
             entry(Account::Escrow, -amount),
             entry(Account::Refunds, amount),

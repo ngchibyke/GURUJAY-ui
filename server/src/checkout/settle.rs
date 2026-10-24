@@ -386,7 +386,9 @@ async fn apply(
             });
         }
     }
-    ledger::post(&mut tx, &entries).await?;
+    // One posting per checkout (a single balanced txn across its orders); the
+    // status re-check above already makes this once-only, the key enforces it.
+    ledger::post(&mut tx, ("payment", &checkout_id.to_string()), &entries).await?;
 
     if v.held {
         audit::record(

@@ -11,6 +11,7 @@ pub mod extract;
 pub mod ledger;
 pub mod limits;
 pub mod money;
+pub mod orders;
 pub mod payments;
 pub mod payout_accounts;
 pub mod phone;
