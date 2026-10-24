@@ -93,6 +93,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(payout_accounts::routes::router())
         .merge(cart::routes::router())
         .merge(checkout::routes::router())
+        .merge(orders::routes::router())
         .merge(payments::webhooks::router())
         // Must follow every route: it applies to the method routers registered so far.
         .method_not_allowed_fallback(method_not_allowed)

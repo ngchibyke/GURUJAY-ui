@@ -1005,7 +1005,7 @@ async fn mark_delivered_sets_release_at_from_settings_at_that_time(pool: PgPool)
     // Back to picked up is not a valid transition.
     assert!(matches!(
         mark_picked_up(&app.pool, f.order_id, at).await,
-        Err(AppError::Conflict("invalid_order_status"))
+        Err(AppError::Conflict("invalid_order_state"))
     ));
     assert!(matches!(
         mark_delivered(&app.pool, Uuid::new_v4(), at).await,
@@ -1028,6 +1028,6 @@ async fn deliver_requires_pickup(pool: PgPool) {
     .await;
     assert!(matches!(
         mark_delivered(&app.pool, f.order_id, OffsetDateTime::now_utc()).await,
-        Err(AppError::Conflict("invalid_order_status"))
+        Err(AppError::Conflict("invalid_order_state"))
     ));
 }

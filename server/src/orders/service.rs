@@ -7,7 +7,7 @@
 //!   that moment, so a later settings change never moves the deadline).
 //!
 //! Repeating a transition on an order already in its target state is a no-op;
-//! any other status is 409 `invalid_order_status`.
+//! any other status is 409 `invalid_order_state`.
 
 use anyhow::Context;
 use serde_json::json;
@@ -60,7 +60,7 @@ async fn transition(
         return Ok(());
     }
     if status != from {
-        return Err(AppError::Conflict("invalid_order_status"));
+        return Err(AppError::Conflict("invalid_order_state"));
     }
     if to == "picked_up" {
         sqlx::query("UPDATE orders SET status = 'picked_up', picked_up_at = $2 WHERE id = $1")
