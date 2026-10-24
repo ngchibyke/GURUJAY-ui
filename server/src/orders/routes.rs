@@ -5,7 +5,7 @@ use anyhow::Context;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     routing::{get, post},
 };
 use serde::Deserialize;
@@ -18,6 +18,7 @@ use crate::{
     auth::{AuthUser, extractor::Role},
     error::AppError,
     escrow::{ReleaseReason, refund::refund_order, release_order},
+    extract::AppQuery,
 };
 
 pub fn router() -> Router<AppState> {
@@ -55,7 +56,7 @@ impl PageQuery {
 async fn list(
     State(state): State<AppState>,
     user: AuthUser,
-    Query(q): Query<PageQuery>,
+    AppQuery(q): AppQuery<PageQuery>,
 ) -> Result<Json<Page<OrderView>>, AppError> {
     let limit = q.limit()?;
     Ok(Json(
@@ -79,7 +80,7 @@ async fn store_orders(
     State(state): State<AppState>,
     user: AuthUser,
     Path(key): Path<String>,
-    Query(q): Query<PageQuery>,
+    AppQuery(q): AppQuery<PageQuery>,
 ) -> Result<Json<Page<OrderView>>, AppError> {
     let store_id = parse_id(&key)?;
     let limit = q.limit()?;
@@ -107,22 +108,33 @@ async fn buyer_order(
     row.ok_or(AppError::NotFound)
 }
 
+/// Route-level audit row. The engines write the authoritative rows inside their
+/// own transactions (`order.refund_requested`, `order.released`), so a failure
+/// here is logged (error kind only, no PII) and never fails the request.
 async fn record(
     state: &AppState,
     user: &AuthUser,
     action: &str,
     order_id: Uuid,
-) -> Result<(), AppError> {
-    let mut conn = state.db.acquire().await.context("acquire")?;
-    audit::record(
-        &mut conn,
-        Some(user.id),
-        action,
-        "order",
-        Some(order_id),
-        json!({}),
-    )
-    .await
+    prior_status: &str,
+) {
+    let result = async {
+        let mut conn = state.db.acquire().await.map_err(|_| "acquire")?;
+        audit::record(
+            &mut conn,
+            Some(user.id),
+            action,
+            "order",
+            Some(order_id),
+            json!({ "prior_status": prior_status }),
+        )
+        .await
+        .map_err(|_| "insert")
+    }
+    .await;
+    if let Err(kind) = result {
+        tracing::error!(action, kind, "order audit write failed");
+    }
 }
 
 async fn cancel(
@@ -144,7 +156,7 @@ async fn cancel(
         }
         Err(e) => return Err(e),
     }
-    record(&state, &user, "order.cancelled_by_buyer", id).await?;
+    record(&state, &user, "order.cancelled_by_buyer", id, &status).await;
     Ok(Json(
         views::get_for_viewer(&state.db, user.id, false, id).await?,
     ))
@@ -185,7 +197,7 @@ async fn received(
                 return Err(AppError::Conflict("order_held"));
             }
             release_order(&state, id, ReleaseReason::BuyerConfirmed).await?;
-            record(&state, &user, "order.received", id).await?;
+            record(&state, &user, "order.received", id, &status).await;
         }
         _ => return Err(AppError::Conflict("invalid_order_state")),
     }

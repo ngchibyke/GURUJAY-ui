@@ -26,3 +26,25 @@ where
         }
     }
 }
+
+/// Query-string extractor whose rejections use the standard JSON error envelope
+/// (422 `validation_failed`). The message is generic: serde's text is never echoed back.
+pub struct AppQuery<T>(pub T);
+
+impl<S, T> axum::extract::FromRequestParts<S> for AppQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, AppError> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(AppQuery(value)),
+            Err(_) => Err(AppError::Validation("Query string is invalid".into())),
+        }
+    }
+}

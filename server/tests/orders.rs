@@ -360,6 +360,7 @@ async fn held_order_cannot_be_received(pool: PgPool) {
     let res = received(&app, f.order_id, &f.buyer).await;
     assert_eq!(res.status, 409);
     assert_eq!(res.json["error"]["code"], "order_held");
+    assert_eq!(status_of(&app, f.order_id).await, "picked_up");
     assert_eq!(count(&app, "SELECT count(*) FROM payouts").await, 0);
 }
 
@@ -437,10 +438,14 @@ async fn stranger_cannot_cancel_or_receive(pool: PgPool) {
 async fn cancel_races_pickup_exactly_one_wins(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let f = paid_order(&app).await;
-    let (c, p) = tokio::join!(
-        cancel(&app, f.order_id, &f.buyer),
-        mark_picked_up(&app.pool, f.order_id, OffsetDateTime::now_utc())
-    );
+    let app = std::sync::Arc::new(app);
+    let (a1, pool, order_id, buyer) = (app.clone(), app.pool.clone(), f.order_id, f.buyer.clone());
+    let cancel_task = tokio::spawn(async move { cancel(&a1, order_id, &buyer).await });
+    let pickup_task =
+        tokio::spawn(
+            async move { mark_picked_up(&pool, order_id, OffsetDateTime::now_utc()).await },
+        );
+    let (c, p) = (cancel_task.await.unwrap(), pickup_task.await.unwrap());
     let status = status_of(&app, f.order_id).await;
     match (c.status, p.is_ok()) {
         (200, false) => assert!(matches!(status.as_str(), "refund_pending" | "refunded")),
@@ -449,6 +454,40 @@ async fn cancel_races_pickup_exactly_one_wins(pool: PgPool) {
     }
     let refunds = count(&app, "SELECT count(*) FROM refunds").await;
     assert_eq!(refunds, i64::from(c.status == 200));
+}
+
+#[sqlx::test]
+async fn pending_payment_order_hidden_from_seller_and_admin(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    sqlx::query("UPDATE orders SET status = 'pending_payment'")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let path = format!("/orders/{}", f.order_id);
+    assert_eq!(get(&app, &path, &f.seller).await.status, 404);
+    let owner = app.owner_token().await;
+    assert_eq!(get(&app, &path, &owner).await.status, 404);
+    assert_eq!(get(&app, &path, &f.buyer).await.status, 200);
+}
+
+#[sqlx::test]
+async fn bad_query_strings_use_the_json_envelope(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    for path in [
+        "/orders?limit=abc".to_string(),
+        format!("/stores/{}/orders?limit=abc", f.store_id),
+    ] {
+        let token = if path.starts_with("/stores") {
+            &f.seller
+        } else {
+            &f.buyer
+        };
+        let res = get(&app, &path, token).await;
+        assert_eq!(res.status, 422, "{path}");
+        assert_eq!(res.json["error"]["code"], "validation_failed");
+    }
 }
 
 #[sqlx::test]

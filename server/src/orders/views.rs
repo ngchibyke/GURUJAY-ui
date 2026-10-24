@@ -36,7 +36,6 @@ pub struct ItemView {
 #[derive(Debug, Serialize)]
 pub struct PayoutView {
     pub status: String,
-    pub amount_kobo: i64,
 }
 
 /// Fields common to both audiences.
@@ -234,10 +233,7 @@ async fn build(db: &PgPool, rows: Vec<Row>, seller: bool) -> Result<Vec<OrderVie
                 order,
                 buyer_display_name: r.buyer_display_name,
                 expected_payout_kobo: expected,
-                payout: r.payout_status.map(|status| PayoutView {
-                    status,
-                    amount_kobo: expected,
-                }),
+                payout: r.payout_status.map(|status| PayoutView { status }),
             }))
         })
         .collect()
@@ -331,7 +327,7 @@ pub async fn get_for_viewer(
     order_id: Uuid,
 ) -> Result<OrderView, AppError> {
     let row: Option<Row> = sqlx::query_as(&format!(
-        "{SELECT} WHERE o.id = $1 AND (o.buyer_id = $2 OR s.owner_id = $2 OR $3)"
+        "{SELECT} WHERE o.id = $1 AND (o.buyer_id = $2 OR \n         ((s.owner_id = $2 OR $3) AND o.status <> 'pending_payment'))"
     ))
     .bind(order_id)
     .bind(viewer)
