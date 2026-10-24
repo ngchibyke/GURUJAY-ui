@@ -7,7 +7,8 @@
 //!    through [`settle_payment`] (which passes the shared verify gate: its
 //!    concurrency cap and per-checkout cooldown). Each claim pushes the
 //!    checkout's own `next_reverify_at` back (5 min doubling, capped at 6h).
-//! 3. `ship_deadline`: `paid` orders past their stored `ship_by`, not held ->
+//! 3. `ship_deadline`: `paid` orders past their stored `ship_by`, not held,
+//!    payment not `provider_flagged` ->
 //!    a full refund (stock back on hand) plus a `seller_strikes` row, in one
 //!    transaction, then the refund is sent. Capped per tick, and switched off
 //!    by `platform_settings.jobs_ship_deadline_enabled` (owner kill switch).
@@ -18,12 +19,15 @@
 //!    flagged -> `backstop_flagged_at` + audit `order.backstop_flagged`.
 //! 6. `payouts`: due payouts only. `scheduled`/`unknown` with `send_after`
 //!    reached and `next_attempt_at` null or passed, and `sending` rows whose
-//!    lease expired -> [`send_payout`] (the 8-attempt cap lives there).
+//!    lease expired, for orders not held and payments not flagged ->
+//!    [`send_payout`] (the 8-attempt cap lives there).
 //!    `pending` payouts not polled for an hour -> [`settle_payout`] (the
 //!    24h-pending -> `manual` rule lives there). A payout that ends `failed`
 //!    goes to `manual` with an audit row.
 //! 7. `refunds`: `requested` refunds not under a send claim, past their
-//!    `next_attempt_at` -> [`send_refund`] with the same RF reference.
+//!    `next_attempt_at` -> [`send_refund`] with the same RF reference. After
+//!    [`MAX_REFUND_ATTEMPTS`] sends the refund goes to `manual` with an audit
+//!    row (the order stays `refund_pending`).
 //!
 //! **Time.** Every due comparison uses the database clock (`now()` in SQL),
 //! and only the deadlines stored on each row: a settings change never moves an
@@ -36,7 +40,9 @@
 //! function ever runs while the job holds a lock on the same row. Every
 //! exclusion lives in the claim SQL, and a row the engine leaves unchanged is
 //! pushed back by a durable column (`next_attempt_at`, `next_reverify_at`,
-//! `last_polled_at`), so no row stays due forever and fills the batch.
+//! `last_polled_at`), so no row stays due forever and fills the batch. A row
+//! whose engine call returns an error is pushed back in `job_row_failures`
+//! (same backoff) and the claims skip it until then.
 //!
 //! **Provider calls.** Ids are processed one at a time, so the jobs make at
 //! most one outbound call at a time, and each provider-calling job handles at
@@ -80,6 +86,16 @@ pub const PROVIDER_CALLS_PER_TICK: i64 = 20;
 pub const SHIP_DEADLINE_PER_TICK: i64 = 20;
 /// A pending payout is polled at most this often.
 const PENDING_POLL_EVERY: &str = "1 hour";
+/// Refund sends (the inline one included) before a `requested` refund goes to
+/// `manual` for the owner (same cap as payouts).
+pub const MAX_REFUND_ATTEMPTS: i32 = 8;
+// Job names (`job_runs.job`, `job_row_failures.job`).
+const EXPIRE: &str = "expire_checkouts";
+const REVERIFY: &str = "reverify_checkouts";
+const SHIP_DEADLINE: &str = "ship_deadline";
+const AUTO_RELEASE: &str = "auto_release";
+const PAYOUTS: &str = "payouts";
+const REFUNDS: &str = "refunds";
 /// The refund sweeper leaves a refund this long after its last send.
 const REFUND_GRACE: &str = "1 minute";
 /// Expired checkouts are re-verified for this long after expiry.
@@ -120,14 +136,22 @@ pub async fn run_due_jobs(state: &AppState) -> JobReport {
 /// [`run_due_jobs`], stopping between rows (never mid-call) once `cancel` fires.
 pub async fn run_due_jobs_until(state: &AppState, cancel: &CancellationToken) -> JobReport {
     let mut report = JobReport::default();
+    // Push-backs long past are no longer needed.
+    if let Err(e) =
+        sqlx::query("DELETE FROM job_row_failures WHERE next_try_at < now() - interval '7 days'")
+            .execute(&state.db)
+            .await
+    {
+        tracing::warn!(error = %e, "job push-backs not pruned");
+    }
     let jobs: [(&str, Job); 7] = [
-        ("expire_checkouts", Job::Expire),
-        ("reverify_checkouts", Job::Reverify),
-        ("ship_deadline", Job::ShipDeadline),
-        ("auto_release", Job::AutoRelease),
+        (EXPIRE, Job::Expire),
+        (REVERIFY, Job::Reverify),
+        (SHIP_DEADLINE, Job::ShipDeadline),
+        (AUTO_RELEASE, Job::AutoRelease),
         ("backstop", Job::Backstop),
-        ("payouts", Job::Payouts),
-        ("refunds", Job::Refunds),
+        (PAYOUTS, Job::Payouts),
+        (REFUNDS, Job::Refunds),
     ];
     for (name, job) in jobs {
         if cancel.is_cancelled() {
@@ -265,34 +289,71 @@ async fn claim(state: &AppState, sql: &str, limit: i64) -> Result<Vec<Uuid>, App
     Ok(ids)
 }
 
-/// Counts one engine call's result into `stats`; `Ok(true)` means it did something.
-fn tally(stats: &mut Stats, job: &'static str, result: Result<bool, AppError>) {
+/// Counts one engine call's result into `stats`; `Ok(true)` means it did
+/// something. A row whose call failed is pushed back in `job_row_failures`
+/// (the jobs' usual backoff), so it cannot be reclaimed at the head of the
+/// batch every tick and starve newer due rows.
+async fn tally(
+    state: &AppState,
+    stats: &mut Stats,
+    job: &'static str,
+    row_id: Uuid,
+    result: Result<bool, AppError>,
+) {
     match result {
         Ok(true) => stats.done += 1,
         Ok(false) => {}
         Err(e) => {
             stats.failed += 1;
-            tracing::warn!(job, error = %e, "job row failed; retried on a later tick");
+            tracing::warn!(job, error = %e, "job row failed; retried after a backoff");
+            push_back(state, job, row_id).await;
         }
     }
+}
+
+async fn push_back(state: &AppState, job: &str, row_id: Uuid) {
+    let sql = format!(
+        "INSERT INTO job_row_failures (job, row_id, failures, next_try_at) \
+         VALUES ($1, $2, 1, now() + make_interval(secs => \
+             (SELECT {BACKOFF_SQL} FROM (SELECT 1 AS a) x))) \
+         ON CONFLICT (job, row_id) DO UPDATE SET failures = job_row_failures.failures + 1, \
+             next_try_at = now() + make_interval(secs => \
+                 (SELECT {BACKOFF_SQL} FROM (SELECT job_row_failures.failures + 1 AS a) x))"
+    );
+    if let Err(e) = sqlx::query(&sql)
+        .bind(job)
+        .bind(row_id)
+        .execute(&state.db)
+        .await
+    {
+        tracing::warn!(job, error = %e, "failed row not pushed back");
+    }
+}
+
+/// SQL condition: the row `row` (an id expression) is not pushed back for `job`.
+fn not_pushed_back(job: &str, row: &str) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM job_row_failures f \
+                     WHERE f.job = '{job}' AND f.row_id = {row} AND f.next_try_at > now())"
+    )
 }
 
 // ------------------------------------------------------------------ 1. expiry
 
 async fn expire_checkouts(state: &AppState, cancel: &CancellationToken) -> Result<Stats, AppError> {
-    let ids = claim(
-        state,
-        "SELECT id FROM checkouts WHERE status = 'pending' AND expires_at < now() \
-         ORDER BY expires_at, id LIMIT $1 FOR UPDATE SKIP LOCKED",
-        BATCH,
-    )
-    .await?;
+    let sql = format!(
+        "SELECT c.id FROM checkouts c WHERE c.status = 'pending' AND c.expires_at < now() \
+           AND {} ORDER BY c.expires_at, c.id LIMIT $1 FOR UPDATE SKIP LOCKED",
+        not_pushed_back(EXPIRE, "c.id")
+    );
+    let ids = claim(state, &sql, BATCH).await?;
     let mut stats = Stats::default();
     for id in ids {
         if cancel.is_cancelled() {
             break;
         }
-        tally(&mut stats, "expire_checkouts", expire_one(state, id).await);
+        let result = expire_one(state, id).await;
+        tally(state, &mut stats, EXPIRE, id, result).await;
     }
     Ok(stats)
 }
@@ -329,10 +390,10 @@ async fn reverify_checkouts(
          UPDATE checkouts c SET reverify_attempts = c.reverify_attempts + 1, \
              next_reverify_at = now() + make_interval(secs => \
                  (SELECT {BACKOFF_SQL} FROM (SELECT c.reverify_attempts + 1 AS a) x)) \
-         FROM due WHERE c.id = due.id RETURNING c.reference"
+         FROM due WHERE c.id = due.id RETURNING c.id, c.reference"
     );
     let mut tx = state.db.begin().await.context("begin claim")?;
-    let references: Vec<String> = sqlx::query_scalar(&sql)
+    let references: Vec<(Uuid, String)> = sqlx::query_as(&sql)
         .bind(PROVIDER_CALLS_PER_TICK)
         .fetch_all(&mut *tx)
         .await
@@ -340,7 +401,7 @@ async fn reverify_checkouts(
     tx.commit().await.context("commit claim")?;
 
     let mut stats = Stats::default();
-    for reference in references {
+    for (id, reference) in references {
         if cancel.is_cancelled() {
             break;
         }
@@ -350,7 +411,7 @@ async fn reverify_checkouts(
                 SettleOutcome::Paid | SettleOutcome::RefundedAfterExpiry
             )
         });
-        tally(&mut stats, "reverify_checkouts", result);
+        tally(state, &mut stats, REVERIFY, id, result).await;
     }
     Ok(stats)
 }
@@ -361,31 +422,33 @@ async fn ship_deadline(state: &AppState, cancel: &CancellationToken) -> Result<S
     if !settings::load(&state.db).await?.jobs_ship_deadline_enabled {
         return Ok(Stats::default());
     }
-    let ids = claim(
-        state,
-        "SELECT id FROM orders \
-         WHERE status = 'paid' AND ship_by < now() AND held_at IS NULL \
-         ORDER BY ship_by, id LIMIT $1 FOR UPDATE SKIP LOCKED",
-        SHIP_DEADLINE_PER_TICK,
-    )
-    .await?;
+    let sql = format!(
+        "SELECT o.id FROM orders o JOIN checkouts c ON c.id = o.checkout_id \
+         WHERE o.status = 'paid' AND o.ship_by < now() AND o.held_at IS NULL \
+           AND NOT c.provider_flagged AND {} \
+         ORDER BY o.ship_by, o.id LIMIT $1 FOR UPDATE OF o SKIP LOCKED",
+        not_pushed_back(SHIP_DEADLINE, "o.id")
+    );
+    let ids = claim(state, &sql, SHIP_DEADLINE_PER_TICK).await?;
     let mut stats = Stats::default();
     for id in ids {
         if cancel.is_cancelled() {
             break;
         }
-        tally(
-            &mut stats,
-            "ship_deadline",
-            miss_ship_deadline(state, id).await,
-        );
+        let result = refund_missed_ship_deadline(state, id).await;
+        tally(state, &mut stats, SHIP_DEADLINE, id, result).await;
     }
     Ok(stats)
 }
 
-/// Refund + strike in one transaction, then the provider call. `Ok(false)`
-/// when the order is no longer due (shipped, held or refunded meanwhile).
-async fn miss_ship_deadline(state: &AppState, order_id: Uuid) -> Result<bool, AppError> {
+/// The ship-deadline action for one order (the job calls it per claimed id):
+/// refund + strike in one transaction, then the provider call. `Ok(false)`,
+/// with nothing changed, when the order is no longer due: shipped, held, its
+/// payment flagged, or already refunded for another reason.
+pub async fn refund_missed_ship_deadline(
+    state: &AppState,
+    order_id: Uuid,
+) -> Result<bool, AppError> {
     const REASON: &str = "ship_deadline";
     let mut tx = state.db.begin().await.context("begin")?;
     sqlx::query(LOCK_TIMEOUT)
@@ -400,12 +463,16 @@ async fn miss_ship_deadline(state: &AppState, order_id: Uuid) -> Result<bool, Ap
         Err(e) => return Err(e),
     };
     // Re-checked under the order lock begin_refund now holds: still due, not
-    // held, and the refund is this job's (an order already refund_pending for
-    // another reason, e.g. a buyer cancel, gets no strike).
+    // held, payment not flagged, and the refund is the one this transaction
+    // created for the deadline. An order that left `paid` between the claim
+    // and the lock (a buyer cancel makes it refund_pending, and begin_refund
+    // then returns that existing refund) fails the reason / created_at check
+    // and gets no strike.
     let (due, store_id): (bool, Uuid) = sqlx::query_as(
-        "SELECT o.held_at IS NULL AND o.ship_by < now() AND r.reason = $2 \
-                AND r.created_at = now(), o.store_id \
-         FROM orders o JOIN refunds r ON r.order_id = o.id WHERE o.id = $1",
+        "SELECT o.held_at IS NULL AND o.ship_by < now() AND NOT c.provider_flagged \
+                AND r.reason = $2 AND r.created_at = now(), o.store_id \
+         FROM orders o JOIN refunds r ON r.order_id = o.id \
+              JOIN checkouts c ON c.id = o.checkout_id WHERE o.id = $1",
     )
     .bind(order_id)
     .bind(REASON)
@@ -446,15 +513,15 @@ async fn miss_ship_deadline(state: &AppState, order_id: Uuid) -> Result<bool, Ap
 // ------------------------------------------------------------- 4. auto-release
 
 async fn auto_release(state: &AppState, cancel: &CancellationToken) -> Result<Stats, AppError> {
-    let ids = claim(
-        state,
+    let sql = format!(
         "SELECT o.id FROM orders o JOIN checkouts c ON c.id = o.checkout_id \
          WHERE o.status = 'delivered' AND o.delivered_at IS NOT NULL \
            AND o.release_at <= now() AND o.held_at IS NULL AND NOT c.provider_flagged \
+           AND {} \
          ORDER BY o.release_at, o.id LIMIT $1 FOR UPDATE OF o SKIP LOCKED",
-        PROVIDER_CALLS_PER_TICK,
-    )
-    .await?;
+        not_pushed_back(AUTO_RELEASE, "o.id")
+    );
+    let ids = claim(state, &sql, PROVIDER_CALLS_PER_TICK).await?;
     let mut stats = Stats::default();
     for id in ids {
         if cancel.is_cancelled() {
@@ -474,7 +541,7 @@ async fn auto_release(state: &AppState, cancel: &CancellationToken) -> Result<St
             .map_err(AppError::from),
             Err(e) => Err(e),
         };
-        tally(&mut stats, "auto_release", result);
+        tally(state, &mut stats, AUTO_RELEASE, id, result).await;
     }
     Ok(stats)
 }
@@ -524,22 +591,29 @@ async fn payouts(state: &AppState, cancel: &CancellationToken) -> Result<Stats, 
     // the status themselves.
     let sql = format!(
         "WITH due AS ( \
-             SELECT id, status FROM payouts \
-             WHERE (status IN ('scheduled', 'unknown') \
-                    AND (next_attempt_at IS NULL OR next_attempt_at <= now()) \
-                    AND (send_after IS NULL OR send_after <= now())) \
-                OR (status = 'sending' AND (sending_until IS NULL OR sending_until < now())) \
-                OR (status = 'pending' AND COALESCE(last_polled_at, pending_since, updated_at) \
-                    <= now() - interval '{PENDING_POLL_EVERY}') \
-             ORDER BY CASE status \
-                 WHEN 'pending' THEN COALESCE(last_polled_at, pending_since, updated_at) \
-                 WHEN 'sending' THEN sending_until \
-                 ELSE COALESCE(next_attempt_at, send_after, created_at) END NULLS FIRST, id \
-             LIMIT $1 FOR UPDATE SKIP LOCKED) \
+             SELECT p.id, p.status FROM payouts p \
+                 JOIN orders o ON o.id = p.order_id JOIN checkouts c ON c.id = o.checkout_id \
+             WHERE ((((p.status IN ('scheduled', 'unknown') \
+                       AND (p.next_attempt_at IS NULL OR p.next_attempt_at <= now()) \
+                       AND (p.send_after IS NULL OR p.send_after <= now())) \
+                      OR (p.status = 'sending' \
+                          AND (p.sending_until IS NULL OR p.sending_until < now()))) \
+                     AND o.held_at IS NULL AND NOT c.provider_flagged) \
+                    OR (p.status = 'pending' \
+                        AND COALESCE(p.last_polled_at, p.pending_since, p.updated_at) \
+                            <= now() - interval '{PENDING_POLL_EVERY}')) \
+               AND {not_pushed} \
+             ORDER BY CASE p.status \
+                 WHEN 'pending' THEN COALESCE(p.last_polled_at, p.pending_since, p.updated_at) \
+                 WHEN 'sending' THEN p.sending_until \
+                 ELSE COALESCE(p.next_attempt_at, p.send_after, p.created_at) END \
+                 NULLS FIRST, p.id \
+             LIMIT $1 FOR UPDATE OF p SKIP LOCKED) \
          UPDATE payouts p SET last_polled_at = CASE WHEN due.status = 'pending' \
                                                     THEN now() ELSE p.last_polled_at END \
          FROM due WHERE p.id = due.id \
-         RETURNING p.id, p.reference, due.status::text"
+         RETURNING p.id, p.reference, due.status::text",
+        not_pushed = not_pushed_back(PAYOUTS, "p.id")
     );
     let mut tx = state.db.begin().await.context("begin claim")?;
     let due: Vec<(Uuid, String, String)> = sqlx::query_as(&sql)
@@ -563,7 +637,7 @@ async fn payouts(state: &AppState, cancel: &CancellationToken) -> Result<Stats, 
             Ok(()) => escalate_failed(state, id).await.map(|_| true),
             Err(e) => Err(e),
         };
-        tally(&mut stats, "payouts", result);
+        tally(state, &mut stats, PAYOUTS, id, result).await;
     }
     Ok(stats)
 }
@@ -600,6 +674,7 @@ async fn escalate_failed(state: &AppState, payout_id: Uuid) -> Result<bool, AppE
 // ------------------------------------------------------------------ 7. refunds
 
 async fn refunds(state: &AppState, cancel: &CancellationToken) -> Result<Stats, AppError> {
+    escalate_exhausted_refunds(state).await?;
     // The claim pushes `next_attempt_at` back from the refund's attempt count;
     // send_refund's own 2-minute claim keeps two senders apart. A refund sent
     // (or created) within the last minute is left to its own caller first, so
@@ -607,7 +682,7 @@ async fn refunds(state: &AppState, cancel: &CancellationToken) -> Result<Stats, 
     let sql = format!(
         "WITH due AS ( \
              SELECT id FROM refunds \
-             WHERE status = 'requested' \
+             WHERE status = 'requested' AND attempts < $2 \
                AND (sending_until IS NULL OR sending_until < now()) \
                AND updated_at <= now() - interval '{REFUND_GRACE}' \
                AND (next_attempt_at IS NULL OR next_attempt_at <= now()) \
@@ -617,19 +692,60 @@ async fn refunds(state: &AppState, cancel: &CancellationToken) -> Result<Stats, 
                  (SELECT {BACKOFF_SQL} FROM (SELECT r.attempts + 1 AS a) x)) \
          FROM due WHERE r.id = due.id RETURNING r.id"
     );
-    let ids = claim(state, &sql, PROVIDER_CALLS_PER_TICK).await?;
+    let mut tx = state.db.begin().await.context("begin claim")?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(&sql)
+        .bind(PROVIDER_CALLS_PER_TICK)
+        .bind(MAX_REFUND_ATTEMPTS)
+        .fetch_all(&mut *tx)
+        .await
+        .context("claim requested refunds")?;
+    tx.commit().await.context("commit claim")?;
     let mut stats = Stats::default();
     for id in ids {
         if cancel.is_cancelled() {
             break;
         }
-        tally(
-            &mut stats,
-            "refunds",
-            send_refund(state, id).await.map(|_| true),
-        );
+        let result = send_refund(state, id).await.map(|_| true);
+        tally(state, &mut stats, REFUNDS, id, result).await;
     }
     Ok(stats)
+}
+
+/// `requested` refunds that used up [`MAX_REFUND_ATTEMPTS`] sends (and are not
+/// being sent right now) go to `manual` for the owner, each with an audit row,
+/// in one transaction fenced on `status = 'requested'`. The order stays
+/// `refund_pending`: the buyer has not been paid back yet.
+async fn escalate_exhausted_refunds(state: &AppState) -> Result<(), AppError> {
+    let mut tx = state.db.begin().await.context("begin")?;
+    let rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+        "UPDATE refunds SET status = 'manual', updated_at = now() \
+         WHERE status = 'requested' AND attempts >= $1 \
+           AND (sending_until IS NULL OR sending_until < now()) \
+         RETURNING id, last_error",
+    )
+    .bind(MAX_REFUND_ATTEMPTS)
+    .fetch_all(&mut *tx)
+    .await
+    .context("escalate exhausted refunds")?;
+    for (id, reason) in &rows {
+        audit::record(
+            &mut tx,
+            None,
+            "refund.escalated_manual",
+            "refund",
+            Some(*id),
+            json!({ "from": "requested", "reason": reason }),
+        )
+        .await?;
+    }
+    tx.commit().await.context("commit refund escalation")?;
+    if !rows.is_empty() {
+        tracing::warn!(
+            count = rows.len(),
+            "refunds still unsent after max attempts; moved to manual"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

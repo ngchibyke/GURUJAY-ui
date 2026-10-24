@@ -12,7 +12,10 @@ use common::TestApp;
 use serde_json::json;
 use server::{
     checkout::{SettleOutcome, settle_payment},
-    escrow::jobs::{JobReport, run_due_jobs, run_loop_every},
+    escrow::jobs::{
+        JobReport, MAX_REFUND_ATTEMPTS, SHIP_DEADLINE_PER_TICK, refund_missed_ship_deadline,
+        run_due_jobs, run_loop_every,
+    },
     orders::service::{mark_delivered, mark_picked_up},
     payments::{PaymentStatus, PayoutState, ProviderError},
 };
@@ -371,10 +374,21 @@ async fn ship_deadline_kill_switch_and_held_orders_skip(pool: PgPool) {
     assert_eq!(count(&app, "SELECT count(*) FROM seller_strikes").await, 1);
 }
 
+/// An order cannot be `paid` with a refund row: `begin_refund` moves it to
+/// `refund_pending` in the same transaction that inserts the row (and
+/// `refunds.order_id` is unique). The guard covers the race instead: the job
+/// claimed the order while `paid`, the buyer cancelled before the job's lock,
+/// and `begin_refund` then hands back the buyer's existing refund. Calling the
+/// per-order action on such an order reproduces that state deterministically.
 #[sqlx::test]
-async fn ship_deadline_does_not_strike_for_a_buyer_cancel(pool: PgPool) {
+async fn ship_deadline_after_a_racing_buyer_cancel_gives_no_strike(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let f = paid_order(&app).await;
+    exec(
+        &app,
+        "UPDATE orders SET ship_by = now() - interval '1 hour'",
+    )
+    .await;
     let res = app
         .request(
             Method::POST,
@@ -384,14 +398,153 @@ async fn ship_deadline_does_not_strike_for_a_buyer_cancel(pool: PgPool) {
         )
         .await;
     assert_eq!(res.status, 200, "{}", res.json);
+    let refunds_before = app.fake.calls("refund");
+
+    // The buyer's refund (reason "refund"): the reason check refuses it.
+    assert!(
+        !refund_missed_ship_deadline(&app.state, f.order_id)
+            .await
+            .unwrap()
+    );
+    // Even a refund carrying the deadline reason from an earlier transaction:
+    // the created_at check refuses it.
+    exec(&app, "UPDATE refunds SET reason = 'ship_deadline'").await;
+    assert!(
+        !refund_missed_ship_deadline(&app.state, f.order_id)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(count(&app, "SELECT count(*) FROM seller_strikes").await, 0);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM audit_log WHERE action = 'order.ship_deadline_missed'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(app.fake.calls("refund"), refunds_before);
+    assert_eq!(tick(&app).await.auto_cancelled, 0);
+}
+
+#[sqlx::test]
+async fn ship_deadline_skips_flagged_payments(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    app.fake.set_refund_supported(true);
     exec(
         &app,
         "UPDATE orders SET ship_by = now() - interval '1 hour'",
     )
     .await;
+    exec(&app, "UPDATE checkouts SET provider_flagged = true").await;
     let r = tick(&app).await;
-    assert_eq!(r.auto_cancelled, 0);
+    assert_eq!((r.auto_cancelled, r.failed), (0, 0));
+    // The in-transaction re-check refuses it too.
+    assert!(
+        !refund_missed_ship_deadline(&app.state, f.order_id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(order_status(&app, f.order_id).await, "paid");
+    assert_eq!(count(&app, "SELECT count(*) FROM refunds").await, 0);
     assert_eq!(count(&app, "SELECT count(*) FROM seller_strikes").await, 0);
+    assert_eq!(app.fake.calls("refund"), 0);
+
+    exec(&app, "UPDATE checkouts SET provider_flagged = false").await;
+    assert_eq!(tick(&app).await.auto_cancelled, 1);
+    assert_eq!(order_status(&app, f.order_id).await, "refunded");
+    assert_eq!(count(&app, "SELECT count(*) FROM seller_strikes").await, 1);
+    assert_eq!(app.fake.calls("refund"), 1);
+}
+
+#[sqlx::test]
+async fn ship_deadline_caps_refunds_per_tick(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let listing = app
+        .make_active_store_with_product(SELLER, "Mama Put", PRICE, 100)
+        .await;
+    let (_, buyer) = app.sign_up_verified(BUYER).await;
+    let n = SHIP_DEADLINE_PER_TICK + 1;
+    for _ in 0..n {
+        assert_eq!(
+            app.set_cart(&buyer, listing.variant_id, 1).await.status,
+            200
+        );
+        let res = app.checkout(&buyer, METHOD).await;
+        assert_eq!(res.status, 201, "{}", res.json);
+        let reference = res.json["reference"].as_str().unwrap().to_string();
+        paid(&app, &reference, PRICE);
+        assert_eq!(
+            settle_payment(&app.state, &reference).await.unwrap(),
+            SettleOutcome::Paid
+        );
+    }
+    exec(
+        &app,
+        "UPDATE orders SET ship_by = now() - interval '1 hour'",
+    )
+    .await;
+
+    let r = tick(&app).await;
+    assert_eq!(r.auto_cancelled, 20);
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM orders WHERE status = 'paid'").await,
+        1
+    );
+    let r = tick(&app).await;
+    assert_eq!(r.auto_cancelled, 1);
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM orders WHERE status = 'paid'").await,
+        0
+    );
+    assert_eq!(count(&app, "SELECT count(*) FROM seller_strikes").await, n);
+}
+
+/// M1: a row whose engine call fails is pushed back, not reclaimed at the
+/// head of the batch every tick.
+#[sqlx::test]
+async fn failed_row_is_pushed_back(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    exec(
+        &app,
+        "UPDATE orders SET ship_by = now() - interval '1 hour'",
+    )
+    .await;
+    // Another session holds the variant lock: begin_refund times out (5s).
+    let mut blocker = app.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM product_variants WHERE id = $1 FOR UPDATE")
+        .bind(f.variant_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let r = tick(&app).await;
+    assert_eq!((r.auto_cancelled, r.failed), (0, 1));
+    blocker.rollback().await.unwrap();
+
+    // Pushed back: not claimed on the next tick even though it is now free.
+    let r = tick(&app).await;
+    assert_eq!((r.auto_cancelled, r.failed), (0, 0));
+    assert_eq!(order_status(&app, f.order_id).await, "paid");
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM job_row_failures WHERE job = 'ship_deadline' \
+             AND failures = 1 AND next_try_at > now() + interval '4 minutes'"
+        )
+        .await,
+        1
+    );
+
+    // Once its push-back passes, it is processed.
+    exec(
+        &app,
+        "UPDATE job_row_failures SET next_try_at = now() - interval '1 second'",
+    )
+    .await;
+    assert_eq!(tick(&app).await.auto_cancelled, 1);
 }
 
 // ---------------------------------------------------------------- auto-release
@@ -713,6 +866,107 @@ async fn expired_sending_lease_looked_up_by_job(pool: PgPool) {
 
 // ---------------------------------------------------------------- refunds
 
+/// M2: a due send for a held order or a flagged payment is not even claimed
+/// (no lock, no defer write); a pending payout is still polled.
+#[sqlx::test]
+async fn payout_claim_skips_held_and_flagged(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    app.fake
+        .fail_payout_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    released_by_job(&app).await;
+    app.fake.clear_payout_failure();
+    exec(&app, "UPDATE payouts SET next_attempt_at = NULL").await;
+
+    exec(
+        &app,
+        "UPDATE orders SET held_at = now(), hold_reason = 'complaint'",
+    )
+    .await;
+    assert_eq!(tick(&app).await.payouts_processed, 0);
+    exec(&app, "UPDATE orders SET held_at = NULL, hold_reason = NULL").await;
+    exec(&app, "UPDATE checkouts SET provider_flagged = true").await;
+    assert_eq!(tick(&app).await.payouts_processed, 0);
+    assert_eq!(app.fake.calls("create_payout"), 1);
+    assert_eq!(payout_status(&app).await, "scheduled");
+    assert!(
+        count(
+            &app,
+            "SELECT count(*) FROM payouts WHERE next_attempt_at IS NULL"
+        )
+        .await
+            == 1,
+        "untouched, not deferred"
+    );
+
+    // A payout already accepted is still polled while the order is flagged.
+    exec(&app, "UPDATE checkouts SET provider_flagged = false").await;
+    assert_eq!(tick(&app).await.payouts_processed, 1);
+    assert_eq!(payout_status(&app).await, "pending");
+    exec(
+        &app,
+        "UPDATE payouts SET pending_since = now() - interval '2 hours'",
+    )
+    .await;
+    exec(&app, "UPDATE checkouts SET provider_flagged = true").await;
+    assert_eq!(tick(&app).await.payouts_processed, 1);
+    assert_eq!(app.fake.calls("payout_status"), 1);
+}
+
+#[sqlx::test]
+async fn refund_sweeper_stops_after_8_attempts(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    app.fake.set_refund_supported(true);
+    app.fake
+        .fail_refund_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    // Attempt 1 is the inline send.
+    let out = server::escrow::refund::refund_order(&app.state, f.order_id, true)
+        .await
+        .unwrap();
+    assert_eq!(out.status, "requested");
+    let due = "UPDATE refunds SET updated_at = now() - interval '2 minutes', \
+                                  next_attempt_at = NULL";
+    for attempt in 2..=MAX_REFUND_ATTEMPTS {
+        exec(&app, due).await;
+        assert_eq!(tick(&app).await.refunds_retried, 1, "attempt {attempt}");
+        assert_eq!(app.fake.calls("refund"), attempt as usize);
+    }
+    assert_eq!(
+        text(&app, "SELECT status::text FROM refunds").await,
+        "requested"
+    );
+    exec(&app, due).await;
+    let r = tick(&app).await;
+    assert_eq!(r.refunds_retried, 0);
+    assert_eq!(app.fake.calls("refund"), 8, "no 9th call");
+    assert_eq!(
+        text(&app, "SELECT status::text FROM refunds").await,
+        "manual"
+    );
+    assert_eq!(order_status(&app, f.order_id).await, "refund_pending");
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM audit_log WHERE action = 'refund.escalated_manual' \
+             AND detail->>'from' = 'requested' AND detail->>'reason' = 'unavailable'"
+        )
+        .await,
+        1
+    );
+    // Final for the job.
+    exec(&app, due).await;
+    tick(&app).await;
+    assert_eq!(app.fake.calls("refund"), 8);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM audit_log WHERE action = 'refund.escalated_manual'"
+        )
+        .await,
+        1
+    );
+}
+
 #[sqlx::test]
 async fn refund_sweeper_retries_with_same_reference(pool: PgPool) {
     let app = TestApp::new(pool).await;
@@ -896,6 +1150,32 @@ async fn job_rerun_is_idempotent(pool: PgPool) {
         ),
     )
     .await;
+    // A picked-up order past its backstop (and not due for anything else).
+    assert_eq!(app.set_cart(&f.buyer, f.variant_id, 1).await.status, 200);
+    let res = app.checkout(&f.buyer, METHOD).await;
+    let fourth: Uuid = res.json["checkout_id"].as_str().unwrap().parse().unwrap();
+    let reference = res.json["reference"].as_str().unwrap().to_string();
+    paid(&app, &reference, PRICE);
+    assert_eq!(
+        settle_payment(&app.state, &reference).await.unwrap(),
+        SettleOutcome::Paid
+    );
+    let backstop_order: Uuid = sqlx::query_scalar("SELECT id FROM orders WHERE checkout_id = $1")
+        .bind(fourth)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    mark_picked_up(&app.pool, backstop_order, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    exec(
+        &app,
+        &format!(
+            "UPDATE orders SET backstop_at = now() - interval '1 minute' \
+             WHERE id = '{backstop_order}'"
+        ),
+    )
+    .await;
     assert_eq!(app.set_cart(&f.buyer, f.variant_id, 1).await.status, 200);
     let third = app.checkout(&f.buyer, METHOD).await;
     assert_eq!(third.status, 201, "{}", third.json);
@@ -909,7 +1189,9 @@ async fn job_rerun_is_idempotent(pool: PgPool) {
     assert_eq!(first.released, 1);
     assert_eq!(first.auto_cancelled, 1);
     assert_eq!(first.expired, 1);
-    // The backstop order was released first in the same tick, so it is not flagged.
+    // The delivered order was released earlier in the same tick, so only the
+    // picked-up one is flagged.
+    assert_eq!(first.flagged, 1);
     assert_eq!(first.failed, 0);
     let after_first = snapshot(&app).await;
     let calls = (
