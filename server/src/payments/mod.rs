@@ -7,6 +7,7 @@
 //! [`ProviderError`] never prints its inner detail, so none of it reaches logs.
 
 pub mod fake;
+pub mod mono;
 pub mod verify_gate;
 pub mod webhooks;
 

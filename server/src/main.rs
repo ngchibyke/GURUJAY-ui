@@ -12,7 +12,7 @@ use server::{
     config::Config,
     crypto::FieldCipher,
     escrow::jobs,
-    payments::ProviderRegistry,
+    payments::{ProviderRegistry, mono::MonoProvider},
     phone::normalize_ng_phone,
     pool_options,
 };
@@ -60,6 +60,16 @@ async fn main() -> anyhow::Result<()> {
     let db = pool_options(10).connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
 
+    let mut providers = ProviderRegistry::new();
+    match config.mono.clone() {
+        Some(mono_cfg) => {
+            let live = mono_cfg.live;
+            providers.register(Arc::new(MonoProvider::new(mono_cfg)?));
+            tracing::info!(live, "mono payment provider registered");
+        }
+        None => tracing::warn!("MONO_SECRET_KEY not set: no payment provider is configured"),
+    }
+
     let state = AppState {
         db,
         cipher: Arc::new(FieldCipher::new(config.field_key)),
@@ -67,8 +77,7 @@ async fn main() -> anyhow::Result<()> {
         otp: Arc::new(LogOtpSender {
             echo: config.otp_dev_echo,
         }),
-        // Mono is registered here once its keys are configured (Task 11).
-        providers: Arc::new(ProviderRegistry::new()),
+        providers: Arc::new(providers),
         payment_redirect_url: config.public_redirect_url.clone(),
         verify_gate: Arc::new(server::payments::VerifyGate::default()),
     };
