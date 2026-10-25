@@ -10,7 +10,26 @@ async fn get(app: &TestApp, token: &str) -> common::TestResponse {
         .await
 }
 
-async fn patch(app: &TestApp, token: &str, body: Value) -> common::TestResponse {
+/// The settings' current `updated_at`, as the API returns it.
+async fn current_version(app: &TestApp) -> String {
+    let at: time::OffsetDateTime = sqlx::query_scalar("SELECT updated_at FROM platform_settings")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    at.format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+/// PATCH with the current `expected_updated_at` added (unless the body has one).
+async fn patch(app: &TestApp, token: &str, mut body: Value) -> common::TestResponse {
+    if let Some(obj) = body.as_object_mut()
+        && !obj.contains_key("expected_updated_at")
+    {
+        obj.insert(
+            "expected_updated_at".into(),
+            json!(current_version(app).await),
+        );
+    }
     app.request(Method::PATCH, "/admin/settings", Some(body), Some(token))
         .await
 }
@@ -297,4 +316,54 @@ async fn rejected_patch_writes_no_audit_row(pool: PgPool) {
         200
     );
     assert_eq!(audit_count(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn patch_requires_expected_updated_at(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    let owner = app.make_owner().await;
+    let res = app
+        .request(
+            Method::PATCH,
+            "/admin/settings",
+            Some(json!({ "platform_cut_bps": 450 })),
+            Some(&owner),
+        )
+        .await;
+    assert_eq!(res.status, 422, "{}", res.json);
+    assert_eq!(res.json["error"]["code"], "validation_failed");
+    assert_eq!(get(&app, &owner).await.json["platform_cut_bps"], 500);
+}
+
+#[sqlx::test]
+async fn stale_patch_is_rejected(pool: PgPool) {
+    let app = TestApp::new(pool.clone()).await;
+    let owner = app.make_owner().await;
+    let seen = get(&app, &owner).await.json["updated_at"].clone();
+    // Another edit lands after this owner loaded the settings.
+    assert_eq!(
+        patch(&app, &owner, json!({ "platform_cut_bps": 450 }))
+            .await
+            .status,
+        200
+    );
+    let res = patch(
+        &app,
+        &owner,
+        json!({ "platform_cut_bps": 400, "expected_updated_at": seen }),
+    )
+    .await;
+    assert_eq!(res.status, 409, "{}", res.json);
+    assert_eq!(res.json["error"]["code"], "stale_settings");
+    assert_eq!(get(&app, &owner).await.json["platform_cut_bps"], 450);
+    assert_eq!(audit_count(&pool).await, 1);
+    // With the version it now holds, the edit goes through.
+    let now = get(&app, &owner).await.json["updated_at"].clone();
+    let res = patch(
+        &app,
+        &owner,
+        json!({ "platform_cut_bps": 400, "expected_updated_at": now }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
 }

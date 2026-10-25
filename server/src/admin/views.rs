@@ -1,0 +1,296 @@
+//! Admin read models and lists. Personal data: ids, amounts, statuses, our
+//! own references and the last four digits of the account paid. Never an
+//! account number, an account name or any buyer data; Support does not see
+//! the bank code either. Every list read is audited (`admin.viewed`).
+
+use anyhow::Context;
+use serde::Serialize;
+use serde_json::json;
+use sqlx::{PgConnection, PgPool};
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+use crate::{audit, error::AppError};
+
+/// Rows per list (each reconciliation section too).
+pub const MAX_LIMIT: i64 = 100;
+pub const DEFAULT_LIMIT: i64 = 50;
+/// Payout statuses a list may filter on (`payout_status` enum).
+const PAYOUT_STATUSES: &[&str] = &[
+    "scheduled",
+    "sending",
+    "pending",
+    "unknown",
+    "successful",
+    "failed",
+    "manual",
+];
+
+pub fn limit(given: Option<i64>) -> Result<i64, AppError> {
+    let limit = given.unwrap_or(DEFAULT_LIMIT);
+    if !(1..=MAX_LIMIT).contains(&limit) {
+        return Err(AppError::Validation(format!(
+            "limit must be between 1 and {MAX_LIMIT}"
+        )));
+    }
+    Ok(limit)
+}
+
+#[derive(Debug, Serialize)]
+pub struct Items<T> {
+    pub items: Vec<T>,
+}
+
+/// An order as the owner sees it (no buyer data).
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct AdminOrderView {
+    pub order_id: Uuid,
+    pub store_id: Uuid,
+    pub status: String,
+    pub items_total_kobo: i64,
+    pub delivery_fee_kobo: i64,
+    pub held: bool,
+    pub hold_reason: Option<String>,
+    pub provider_flagged: bool,
+    pub payout_status: Option<String>,
+    pub refund_status: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub paid_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub backstop_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub backstop_flagged_at: Option<OffsetDateTime>,
+}
+
+const ORDER_SELECT: &str = "SELECT o.id AS order_id, o.store_id, o.status::text AS status, \
+        o.items_total_kobo, o.delivery_fee_kobo, o.held_at IS NOT NULL AS held, o.hold_reason, \
+        c.provider_flagged, p.status::text AS payout_status, r.status::text AS refund_status, \
+        o.paid_at, o.backstop_at, o.backstop_flagged_at \
+    FROM orders o JOIN checkouts c ON c.id = o.checkout_id \
+         LEFT JOIN payouts p ON p.order_id = o.id LEFT JOIN refunds r ON r.order_id = o.id";
+
+pub async fn order(db: &PgPool, order_id: Uuid) -> Result<AdminOrderView, AppError> {
+    sqlx::query_as::<_, AdminOrderView>(&format!("{ORDER_SELECT} WHERE o.id = $1"))
+        .bind(order_id)
+        .fetch_optional(db)
+        .await
+        .context("load admin order")?
+        .ok_or(AppError::NotFound)
+}
+
+/// Orders the backstop job flagged (unreleased 30 days after payment) that are
+/// still unfinished, oldest flag first.
+pub async fn backstop(db: &PgPool, limit: i64) -> Result<Vec<AdminOrderView>, AppError> {
+    Ok(sqlx::query_as::<_, AdminOrderView>(&format!(
+        "{ORDER_SELECT} WHERE o.backstop_flagged_at IS NOT NULL \
+           AND o.status NOT IN ('completed', 'refunded', 'cancelled') \
+         ORDER BY o.backstop_flagged_at, o.id LIMIT $1"
+    ))
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .context("list backstop orders")?)
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct PayoutView {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub store_id: Uuid,
+    pub reference: String,
+    pub status: String,
+    pub amount_kobo: i64,
+    pub fee_kobo: i64,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    /// Owner only (None, and left out, for Support).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank_code: Option<String>,
+    pub account_last4: Option<String>,
+    pub round: i32,
+    pub reversed: bool,
+    pub settled_by: Option<String>,
+    pub release_reason: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+const PAYOUT_SELECT: &str = "SELECT p.id, p.order_id, o.store_id, p.reference, \
+        p.status::text AS status, p.amount_kobo, p.fee_kobo, p.attempts, p.last_error, \
+        p.bank_code, p.account_last4, p.round, p.reversed_at IS NOT NULL AS reversed, \
+        p.settled_by, p.release_reason, p.created_at, p.updated_at \
+    FROM payouts p JOIN orders o ON o.id = p.order_id";
+
+pub async fn payout(db: &PgPool, payout_id: Uuid) -> Result<PayoutView, AppError> {
+    sqlx::query_as::<_, PayoutView>(&format!("{PAYOUT_SELECT} WHERE p.id = $1"))
+        .bind(payout_id)
+        .fetch_optional(db)
+        .await
+        .context("load payout")?
+        .ok_or(AppError::NotFound)
+}
+
+/// Payouts in `status` (any when None), oldest change first.
+pub async fn payouts(
+    db: &PgPool,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<PayoutView>, AppError> {
+    if let Some(s) = status
+        && !PAYOUT_STATUSES.contains(&s)
+    {
+        return Err(AppError::Validation("status is not a payout status".into()));
+    }
+    Ok(sqlx::query_as::<_, PayoutView>(&format!(
+        "{PAYOUT_SELECT} WHERE ($1::text IS NULL OR p.status::text = $1) \
+         ORDER BY p.updated_at, p.id LIMIT $2"
+    ))
+    .bind(status)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .context("list payouts")?)
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct RefundView {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub reference: String,
+    pub status: String,
+    pub amount_kobo: i64,
+    pub attempts: i32,
+    pub last_error: Option<String>,
+    pub settled_by: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+const REFUND_SELECT: &str = "SELECT id, order_id, reference, status::text AS status, \
+        amount_kobo, attempts, last_error, settled_by, created_at, updated_at FROM refunds";
+
+pub async fn refund(db: &PgPool, refund_id: Uuid) -> Result<RefundView, AppError> {
+    sqlx::query_as::<_, RefundView>(&format!("{REFUND_SELECT} WHERE id = $1"))
+        .bind(refund_id)
+        .fetch_optional(db)
+        .await
+        .context("load refund")?
+        .ok_or(AppError::NotFound)
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct CheckoutView {
+    pub id: Uuid,
+    pub reference: String,
+    pub status: String,
+    pub provider: String,
+    pub total_kobo: i64,
+    pub collection_fee_kobo: Option<i64>,
+    pub provider_flagged: bool,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub paid_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+const CHECKOUT_SELECT: &str = "SELECT id, reference, status::text AS status, provider, \
+        total_kobo, collection_fee_kobo, provider_flagged, paid_at, created_at FROM checkouts";
+
+pub async fn checkout(db: &PgPool, checkout_id: Uuid) -> Result<CheckoutView, AppError> {
+    sqlx::query_as::<_, CheckoutView>(&format!("{CHECKOUT_SELECT} WHERE id = $1"))
+        .bind(checkout_id)
+        .fetch_optional(db)
+        .await
+        .context("load checkout")?
+        .ok_or(AppError::NotFound)
+}
+
+/// Checkouts needing the owner: `amount_mismatch` (paid the wrong amount,
+/// to refund by hand) or `flagged` (the provider held the payment).
+pub async fn checkouts(
+    db: &PgPool,
+    which: &str,
+    limit: i64,
+) -> Result<Vec<CheckoutView>, AppError> {
+    let filter = match which {
+        "amount_mismatch" => "status = 'amount_mismatch' ORDER BY created_at, id",
+        "flagged" => "provider_flagged ORDER BY paid_at, id",
+        _ => {
+            return Err(AppError::Validation(
+                "status must be amount_mismatch or flagged".into(),
+            ));
+        }
+    };
+    Ok(
+        sqlx::query_as::<_, CheckoutView>(&format!("{CHECKOUT_SELECT} WHERE {filter} LIMIT $1"))
+            .bind(limit)
+            .fetch_all(db)
+            .await
+            .context("list checkouts")?,
+    )
+}
+
+#[derive(Debug, Serialize)]
+pub struct Reconciliation {
+    /// `unknown`, `manual` and `failed` payouts.
+    pub payouts: Vec<PayoutView>,
+    /// `manual` and `failed` refunds.
+    pub refunds: Vec<RefundView>,
+    pub flagged_checkouts: Vec<CheckoutView>,
+    pub mismatched_checkouts: Vec<CheckoutView>,
+    /// Rows per section; a full section has more behind it.
+    pub limit: i64,
+}
+
+/// Everything waiting on the owner, oldest first, [`MAX_LIMIT`] per section.
+pub async fn reconciliation(db: &PgPool, owner: bool) -> Result<Reconciliation, AppError> {
+    let mut payouts = sqlx::query_as::<_, PayoutView>(&format!(
+        "{PAYOUT_SELECT} WHERE p.status IN ('unknown', 'manual', 'failed') \
+         ORDER BY p.updated_at, p.id LIMIT $1"
+    ))
+    .bind(MAX_LIMIT)
+    .fetch_all(db)
+    .await
+    .context("list attention payouts")?;
+    if !owner {
+        for p in &mut payouts {
+            p.bank_code = None;
+        }
+    }
+    let refunds = sqlx::query_as::<_, RefundView>(&format!(
+        "{REFUND_SELECT} WHERE status IN ('manual', 'failed') ORDER BY updated_at, id LIMIT $1"
+    ))
+    .bind(MAX_LIMIT)
+    .fetch_all(db)
+    .await
+    .context("list attention refunds")?;
+    Ok(Reconciliation {
+        payouts,
+        refunds,
+        flagged_checkouts: checkouts(db, "flagged", MAX_LIMIT).await?,
+        mismatched_checkouts: checkouts(db, "amount_mismatch", MAX_LIMIT).await?,
+        limit: MAX_LIMIT,
+    })
+}
+
+/// Audit row for an admin read (`admin.viewed`): which view and how many rows.
+pub async fn record_view(
+    conn: &mut PgConnection,
+    actor: Uuid,
+    view: &str,
+    rows: usize,
+) -> Result<(), AppError> {
+    audit::record(
+        conn,
+        Some(actor),
+        "admin.viewed",
+        "admin_view",
+        None,
+        json!({ "view": view, "rows": rows }),
+    )
+    .await
+}

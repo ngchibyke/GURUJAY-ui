@@ -15,7 +15,10 @@
 //!    shortfall comes off `platform_revenue` (cut + delivery − shortfall), so
 //!    the seller never owes the platform. Delivery money sits in `platform_revenue`
 //!    until plan 3 routes it to the courier or the self-delivering seller.
-//!    The payout fee is fixed here, from the fee schedule at release.
+//!    The payout fee is fixed here, from the fee schedule snapshotted on the
+//!    order when it was paid (orders paid before that snapshot existed use the
+//!    schedule at release). An owner decision ([`release_by_owner`]) also
+//!    clears the order's hold in the same transaction, so the payout can go.
 //!    The payout waits for the provider's settlement of the buyer's payment:
 //!    `send_after = max(now, settlement_time(paid_at) + buffer)`.
 //! 2. [`send_payout`] (inline after release when due, else the Task 9 job):
@@ -31,8 +34,17 @@
 //!    `seller_payable −payout`, `seller_paid +payout`, and the actual provider
 //!    fee `provider_fees +fee`, `platform_revenue −fee`. A failure after
 //!    success (a reversal), key `("payout_reversal", id)`, posts the exact
-//!    reverse and marks the payout `failed`. A payout still pending 24h after
-//!    the provider accepted it goes `manual`: never `failed`, never re-sent.
+//!    reverse and marks the payout `failed`; the attempt is recorded in
+//!    `payout_attempts`, the payout's round moves on (so a later success,
+//!    after an owner re-queue or mark-paid, books under a new key), and the
+//!    seller's payout account goes back to `pending` (`payout_reversed`) for
+//!    the owner to re-verify. A payout still pending 24h after the provider
+//!    accepted it goes `manual`: never `failed`, never re-sent. Provider
+//!    answers no longer change a payout the owner settled (`settled_by =
+//!    owner`) or a reversed attempt.
+//!
+//! Posting keys for success and reversal carry the payout's round
+//! ([`round_ref`]): the payout id for round 1, `id:round` after that.
 //!
 //! Lock order (global: `... checkouts -> orders -> payouts`): every step locks
 //! the order first, then the payout row. `payout_accounts` comes after
@@ -57,7 +69,7 @@ use crate::{
     checkout::service::busy_err,
     error::AppError,
     ledger::{self, Account, Entry},
-    money,
+    money::{self, FeeSchedule},
     payments::{self, PayoutHandle, PayoutRequest, PayoutState, ProviderError},
     settings,
 };
@@ -129,6 +141,15 @@ fn db_err(ctx: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
     busy_err("order_busy", ctx)
 }
 
+/// The `ref` of a payout's success/reversal posting key in `round`.
+pub fn round_ref(payout_id: Uuid, round: i32) -> String {
+    if round <= 1 {
+        payout_id.to_string()
+    } else {
+        format!("{payout_id}:{round}")
+    }
+}
+
 fn too_large() -> AppError {
     AppError::Unprocessable("amount_too_large", "amount is too large".into())
 }
@@ -194,6 +215,37 @@ struct ReleaseRow {
     held: bool,
     delivered: bool,
     release_due: bool,
+    fee_small_kobo: Option<i64>,
+    fee_large_kobo: Option<i64>,
+    fee_threshold_kobo: Option<i64>,
+    stamp_duty_kobo: Option<i64>,
+    stamp_duty_threshold_kobo: Option<i64>,
+}
+
+impl ReleaseRow {
+    /// The schedule snapshotted when the order was paid, if it has one.
+    fn fee_snapshot(&self) -> Option<FeeSchedule> {
+        Some(FeeSchedule {
+            small_fee: self.fee_small_kobo?,
+            large_fee: self.fee_large_kobo?,
+            threshold: self.fee_threshold_kobo?,
+            stamp_duty_kobo: self.stamp_duty_kobo?,
+            stamp_duty_threshold: self.stamp_duty_threshold_kobo?,
+        })
+    }
+}
+
+/// An owner's decision: who, and why (audited; never personal data).
+struct OwnerAction<'a> {
+    actor: Uuid,
+    note: &'a str,
+}
+
+enum Released {
+    /// This call released the order.
+    Done,
+    /// Nothing changed; the order's status.
+    Unchanged(String),
 }
 
 /// Step 1 (see the module docs). Idempotent: an order that is not
@@ -208,6 +260,35 @@ pub async fn release_order(
     order_id: Uuid,
     reason: ReleaseReason,
 ) -> Result<(), AppError> {
+    release(state, order_id, reason, None).await.map(|_| ())
+}
+
+/// The owner's release (`OwnerDecision`) from the admin route: also clears
+/// the order's hold in the same transaction and audits the owner and `note`.
+/// Not a no-op on retry: an order that is not `picked_up`/`delivered` (e.g.
+/// already released) is 409 `invalid_order_state` naming its status.
+pub async fn release_by_owner(
+    state: &AppState,
+    order_id: Uuid,
+    actor: Uuid,
+    note: &str,
+) -> Result<(), AppError> {
+    let owner = OwnerAction { actor, note };
+    match release(state, order_id, ReleaseReason::OwnerDecision, Some(owner)).await? {
+        Released::Done => Ok(()),
+        Released::Unchanged(status) => Err(AppError::ConflictDetail(
+            "invalid_order_state",
+            format!("order is {status}"),
+        )),
+    }
+}
+
+async fn release(
+    state: &AppState,
+    order_id: Uuid,
+    reason: ReleaseReason,
+    owner: Option<OwnerAction<'_>>,
+) -> Result<Released, AppError> {
     // The fee schedule and payout provider at release are fixed on the payout.
     let settings = settings::load(&state.db).await?;
     let mut tx = state.db.begin().await.context("begin")?;
@@ -220,7 +301,9 @@ pub async fn release_order(
                 o.platform_cut_kobo, o.collection_fee_share_kobo, o.checkout_id, c.paid_at, \
                 EXISTS (SELECT 1 FROM payouts p WHERE p.order_id = o.id) AS has_payout, \
                 o.held_at IS NOT NULL AS held, o.delivered_at IS NOT NULL AS delivered, \
-                COALESCE(o.release_at <= now(), false) AS release_due \
+                COALESCE(o.release_at <= now(), false) AS release_due, \
+                o.fee_small_kobo, o.fee_large_kobo, o.fee_threshold_kobo, \
+                o.stamp_duty_kobo, o.stamp_duty_threshold_kobo \
          FROM orders o JOIN checkouts c ON c.id = o.checkout_id \
          WHERE o.id = $1 FOR UPDATE OF o",
     )
@@ -230,14 +313,14 @@ pub async fn release_order(
     .map_err(db_err("lock order"))?
     .ok_or(AppError::NotFound)?;
     if !matches!(row.status.as_str(), "picked_up" | "delivered") || row.has_payout {
-        return Ok(());
+        return Ok(Released::Unchanged(row.status));
     }
     // The release rules, enforced here as well as by the callers.
     if row.held && reason != ReleaseReason::OwnerDecision {
         return Err(AppError::Conflict("order_held"));
     }
     if reason == ReleaseReason::AutoAfterDelivery && !(row.delivered && row.release_due) {
-        return Ok(());
+        return Ok(Released::Unchanged(row.status));
     }
 
     let items = row.items_total_kobo;
@@ -251,7 +334,10 @@ pub async fn release_order(
     // The fee tier and the stamp-duty threshold are compared against the
     // payout BEFORE the fee (Task 1 ruling): a payout just over ₦10,000 pays
     // the duty even if the net lands just under it.
-    let payout_fee = money::payout_fee_kobo(before_fee, &settings.fee_schedule());
+    let schedule = row
+        .fee_snapshot()
+        .unwrap_or_else(|| settings.fee_schedule());
+    let payout_fee = money::payout_fee_kobo(before_fee, &schedule);
     let computed = before_fee.checked_sub(payout_fee).ok_or_else(too_large)?;
     // Fees above the order: the seller is owed nothing (never a negative
     // payable); the platform absorbs the shortfall out of its cut + delivery.
@@ -337,6 +423,31 @@ pub async fn release_order(
         }),
     )
     .await?;
+    if let Some(owner) = &owner {
+        // The owner's decision ends the complaint: the hold goes with it, in
+        // this transaction, so the payout is not left gated on it.
+        if row.held {
+            sqlx::query("UPDATE orders SET held_at = NULL, hold_reason = NULL WHERE id = $1")
+                .bind(order_id)
+                .execute(&mut *tx)
+                .await
+                .context("clear hold")?;
+        }
+        audit::record(
+            &mut tx,
+            Some(owner.actor),
+            "admin.order_released",
+            "order",
+            Some(order_id),
+            json!({
+                "note": owner.note,
+                "prior_status": row.status,
+                "was_held": row.held,
+                "payout_id": payout_id,
+            }),
+        )
+        .await?;
+    }
     tx.commit().await.map_err(db_err("commit release"))?;
 
     if status == "scheduled"
@@ -345,7 +456,7 @@ pub async fn release_order(
     {
         tracing::warn!(error = %e, "payout after release not sent; the job retries");
     }
-    Ok(())
+    Ok(Released::Done)
 }
 
 #[derive(sqlx::FromRow)]
@@ -712,8 +823,26 @@ struct SettleRow {
     pending_since: Option<OffsetDateTime>,
     order_id: Uuid,
     checkout_id: Uuid,
+    store_id: Uuid,
+    round: i32,
+    provider_payout_id: Option<String>,
+    closed: bool,
     now: OffsetDateTime,
 }
+
+#[derive(sqlx::FromRow)]
+struct SettleLookup {
+    status: String,
+    provider: String,
+    provider_payout_id: Option<String>,
+    last_error: Option<String>,
+    /// Owner-settled (mark-paid) or a reversed attempt awaiting re-queue:
+    /// provider answers no longer apply.
+    closed: bool,
+}
+
+/// SQL: the payout no longer takes provider answers (see [`SettleLookup`]).
+const CLOSED: &str = "(settled_by IS NOT DISTINCT FROM 'owner' OR reversed_at IS NOT NULL)";
 
 /// Whether a payout in `status` can still change on the provider's answer.
 fn settleable(status: &str, has_provider_id: bool, last_error: Option<&str>) -> bool {
@@ -742,20 +871,26 @@ pub async fn settle_payout_from(
     reference: &str,
     from_provider: Option<&str>,
 ) -> Result<SettlePayoutOutcome, AppError> {
-    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT status::text, provider, provider_payout_id, last_error \
-         FROM payouts WHERE reference = $1",
-    )
+    let row: Option<SettleLookup> = sqlx::query_as(&format!(
+        "SELECT status::text AS status, provider, provider_payout_id, last_error, \
+                {CLOSED} AS closed \
+         FROM payouts WHERE reference = $1"
+    ))
     .bind(reference)
     .fetch_optional(&state.db)
     .await
     .context("find payout")?;
-    let Some((status, provider_name, provider_id, last_error)) =
-        row.filter(|(_, p, _, _)| from_provider.is_none_or(|f| f == p))
+    let Some(SettleLookup {
+        status,
+        provider: provider_name,
+        provider_payout_id: provider_id,
+        last_error,
+        closed,
+    }) = row.filter(|r| from_provider.is_none_or(|f| f == r.provider))
     else {
         return Ok(SettlePayoutOutcome::UnknownReference);
     };
-    if !settleable(&status, provider_id.is_some(), last_error.as_deref()) {
+    if closed || !settleable(&status, provider_id.is_some(), last_error.as_deref()) {
         return Ok(SettlePayoutOutcome::Settled { status });
     }
     let Some(provider) = state.providers.by_name(&provider_name) else {
@@ -802,16 +937,25 @@ pub async fn settle_payout_from(
     .execute(&mut *tx)
     .await
     .map_err(db_err("lock order"))?;
-    let p: SettleRow = sqlx::query_as(
+    let p: Option<SettleRow> = sqlx::query_as(&format!(
         "SELECT p.id, p.status::text AS status, p.amount_kobo, p.provider_fee_kobo, \
-                p.pending_since, p.order_id, o.checkout_id, now() AS now \
+                p.pending_since, p.order_id, o.checkout_id, o.store_id, p.round, \
+                p.provider_payout_id, {CLOSED} AS closed, now() AS now \
          FROM payouts p JOIN orders o ON o.id = p.order_id \
-         WHERE p.reference = $1 FOR UPDATE OF p",
-    )
+         WHERE p.reference = $1 FOR UPDATE OF p"
+    ))
     .bind(reference)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(db_err("lock payout"))?;
+    // Re-queued under a new reference while the provider was answering.
+    let Some(p) = p else {
+        return Ok(SettlePayoutOutcome::UnknownReference);
+    };
+    if p.closed {
+        return Ok(SettlePayoutOutcome::Settled { status: p.status });
+    }
+    let key_ref = round_ref(p.id, p.round);
     let entry = |account, amount_kobo, kind| Entry {
         order_id: Some(p.order_id),
         checkout_id: Some(p.checkout_id),
@@ -856,7 +1000,7 @@ pub async fn settle_payout_from(
             const KIND: &str = "payout_success";
             ledger::post(
                 &mut tx,
-                (KIND, &p.id.to_string()),
+                (KIND, &key_ref),
                 &[
                     entry(Account::SellerPayable, -p.amount_kobo, KIND),
                     entry(Account::SellerPaid, p.amount_kobo, KIND),
@@ -868,7 +1012,8 @@ pub async fn settle_payout_from(
             sqlx::query(
                 "UPDATE payouts SET status = 'successful', provider_fee_kobo = $2, \
                         provider_payout_id = COALESCE(provider_payout_id, $3), \
-                        settled_at = now(), last_error = NULL, sending_until = NULL, \
+                        settled_at = now(), settled_by = 'provider', \
+                        last_error = NULL, sending_until = NULL, \
                         next_attempt_at = NULL, last_polled_at = now(), updated_at = now() \
                  WHERE id = $1",
             )
@@ -887,7 +1032,7 @@ pub async fn settle_payout_from(
             const KIND: &str = "payout_reversal";
             ledger::post(
                 &mut tx,
-                (KIND, &p.id.to_string()),
+                (KIND, &key_ref),
                 &[
                     entry(Account::SellerPaid, -p.amount_kobo, KIND),
                     entry(Account::SellerPayable, p.amount_kobo, KIND),
@@ -897,6 +1042,7 @@ pub async fn settle_payout_from(
             )
             .await?;
             mark_failed(&mut tx, p.id, "reversed").await?;
+            close_reversed_attempt(&mut tx, &p, reference).await?;
             tracing::warn!("payout reversed after success");
             "failed".into()
         }
@@ -920,6 +1066,58 @@ pub async fn settle_payout_from(
     }
     tx.commit().await.map_err(db_err("commit payout settle"))?;
     Ok(SettlePayoutOutcome::Settled { status: new_status })
+}
+
+/// After a reversal (under the order and payout locks): keep the attempt in
+/// `payout_attempts`, start the payout's next round, and send the seller's
+/// payout account back for owner re-verification (a reversal usually means a
+/// closed or wrong account). Lock order: `payout_accounts` comes after
+/// `payouts`; the seller's account change locks it without any order or
+/// payout lock, so this cannot deadlock with it. The store's own status is
+/// left alone (that needs the store lock, which comes before orders); the
+/// send gate already refuses an unverified account.
+async fn close_reversed_attempt(
+    conn: &mut PgConnection,
+    p: &SettleRow,
+    reference: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO payout_attempts (payout_id, round, reference, provider_payout_id, outcome) \
+         VALUES ($1, $2, $3, $4, 'reversed') ON CONFLICT DO NOTHING",
+    )
+    .bind(p.id)
+    .bind(p.round)
+    .bind(reference)
+    .bind(&p.provider_payout_id)
+    .execute(&mut *conn)
+    .await
+    .context("record payout attempt")?;
+    sqlx::query("UPDATE payouts SET reversed_at = now(), round = round + 1 WHERE id = $1")
+        .bind(p.id)
+        .execute(&mut *conn)
+        .await
+        .context("close payout round")?;
+    let marked: Option<Uuid> = sqlx::query_scalar(
+        "UPDATE payout_accounts SET status = 'pending', pending_reason = 'payout_reversed', \
+                verified_by = NULL, verified_at = NULL, updated_at = now() \
+         WHERE store_id = $1 AND status = 'verified' RETURNING store_id",
+    )
+    .bind(p.store_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .context("mark payout account for re-verification")?;
+    if marked.is_some() {
+        audit::record(
+            conn,
+            None,
+            "payout_account.reverify_required",
+            "store",
+            Some(p.store_id),
+            json!({ "reason": "payout_reversed", "payout_id": p.id }),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn mark_failed(conn: &mut PgConnection, id: Uuid, error: &str) -> Result<(), AppError> {

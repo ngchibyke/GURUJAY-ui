@@ -531,14 +531,21 @@ pub async fn owner_verify(
     let name_enc = state.cipher.encrypt(name);
     let mut tx = state.db.begin().await.context("begin")?;
     let store_status = lock_store(&mut tx, store_id, None).await?;
-    let current: Option<OffsetDateTime> =
-        sqlx::query_scalar("SELECT changed_at FROM payout_accounts WHERE store_id = $1 FOR UPDATE")
-            .bind(store_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .context("lock payout account")?;
-    if current.ok_or(AppError::NotFound)? != input.changed_at {
+    let current: Option<(OffsetDateTime, String)> = sqlx::query_as(
+        "SELECT changed_at, status::text FROM payout_accounts WHERE store_id = $1 FOR UPDATE",
+    )
+    .bind(store_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .context("lock payout account")?;
+    let (changed_at, status) = current.ok_or(AppError::NotFound)?;
+    if changed_at != input.changed_at {
         return Err(AppError::Conflict("stale_review"));
+    }
+    // Only an account awaiting review (a failed lookup, a name mismatch, a
+    // reversed payout) is verified by hand; a verified one keeps its record.
+    if status == "verified" {
+        return Err(AppError::Conflict("already_verified"));
     }
     let row: Row = sqlx::query_as(&format!(
         "UPDATE payout_accounts SET status = 'verified', verified_by = 'owner', \

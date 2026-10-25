@@ -334,12 +334,21 @@ async fn ship_deadline_kill_switch_and_held_orders_skip(pool: PgPool) {
     // The owner switches the job off through the settings route (audited).
     let owner = app.owner_token().await;
     let switch = |on: bool| {
-        app.request(
-            Method::PATCH,
-            "/admin/settings",
-            Some(json!({ "jobs_ship_deadline_enabled": on })),
-            Some(&owner),
-        )
+        let (app, owner) = (&app, &owner);
+        async move {
+            let version = app
+                .request(Method::GET, "/admin/settings", None, Some(owner))
+                .await
+                .json["updated_at"]
+                .clone();
+            app.request(
+                Method::PATCH,
+                "/admin/settings",
+                Some(json!({ "jobs_ship_deadline_enabled": on, "expected_updated_at": version })),
+                Some(owner),
+            )
+            .await
+        }
     };
     let res = switch(false).await;
     assert_eq!(res.status, 200, "{}", res.json);
@@ -1052,7 +1061,12 @@ async fn settings_change_does_not_move_existing_deadlines(pool: PgPool) {
             "/admin/settings",
             Some(json!({
                 "checkout_ttl_minutes": 5, "ship_deadline_hours": 1,
-                "release_after_hours": 1, "backstop_days": 1
+                "release_after_hours": 1, "backstop_days": 1,
+                "expected_updated_at": app
+                    .request(Method::GET, "/admin/settings", None, Some(&owner))
+                    .await
+                    .json["updated_at"]
+                    .clone(),
             })),
             Some(&owner),
         )

@@ -5,5 +5,6 @@ pub mod refund;
 pub mod release;
 
 pub use release::{
-    PayoutOutcome, ReleaseReason, SettlePayoutOutcome, release_order, send_payout, settle_payout,
+    PayoutOutcome, ReleaseReason, SettlePayoutOutcome, release_by_owner, release_order,
+    send_payout, settle_payout,
 };

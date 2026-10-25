@@ -74,6 +74,11 @@ pub struct SettingsPatch {
     pub backstop_days: Option<i32>,
     pub payout_settlement_buffer_hours: Option<i32>,
     pub jobs_ship_deadline_enabled: Option<bool>,
+    /// Required: the `updated_at` the owner last read. A later edit by someone
+    /// else makes this one stale (409 `stale_settings`), so two owners cannot
+    /// silently overwrite each other's changes.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expected_updated_at: Option<OffsetDateTime>,
 }
 
 fn in_range<T: PartialOrd>(field: &str, v: Option<T>, lo: T, hi: T) -> Result<(), AppError> {
@@ -167,14 +172,21 @@ pub async fn update(db: &PgPool, actor: Uuid, patch: SettingsPatch) -> Result<Se
         ));
     }
     patch.validate()?;
+    let expected = patch
+        .expected_updated_at
+        .ok_or_else(|| AppError::Validation("expected_updated_at is required".into()))?;
 
-    // Lock the row so concurrent PATCHes serialise (last write wins, no lost partial updates),
-    // then validate the merged result against the values being replaced.
+    // Lock the row so concurrent PATCHes serialise, refuse an edit made
+    // against an older version, then validate the merged result against the
+    // values being replaced.
     let mut tx = db.begin().await.context("begin")?;
     let old = sqlx::query_as::<_, Settings>(&format!("{SELECT} FOR UPDATE"))
         .fetch_one(&mut *tx)
         .await
         .context("lock platform_settings")?;
+    if old.updated_at != expected {
+        return Err(AppError::Conflict("stale_settings"));
+    }
     let backstop = patch.backstop_days.unwrap_or(old.backstop_days);
     let release = patch.release_after_hours.unwrap_or(old.release_after_hours);
     if i64::from(backstop) * 24 <= i64::from(release) {

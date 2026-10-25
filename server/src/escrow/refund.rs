@@ -58,6 +58,59 @@ fn db_err(ctx: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
     busy_err("order_busy", ctx)
 }
 
+/// The owner's refund from the admin route, audited with `actor` and `note`.
+/// Beyond what [`refund_order`] accepts, it refunds a **held** `picked_up` or
+/// `delivered` order (a complaint the owner decided for the buyer), without
+/// restoring stock: the goods may be with the buyer (returns are plan 5). An
+/// unheld shipped order is 409 `order_not_held` (hold it first, which stops
+/// its release). Not a no-op on retry: an order already `refund_pending` or
+/// `refunded` (or in any other state) is 409 `invalid_order_state` naming it;
+/// a `completed` order is 409 `already_released`.
+pub async fn owner_refund_order(
+    state: &AppState,
+    order_id: Uuid,
+    actor: Uuid,
+    note: &str,
+) -> Result<RefundOutcome, AppError> {
+    // Decides only whether to take the variant locks (they come before the
+    // order lock); begin_refund restores stock only for an order still `paid`
+    // under the lock.
+    let status: String = sqlx::query_scalar("SELECT status::text FROM orders WHERE id = $1")
+        .bind(order_id)
+        .fetch_optional(&state.db)
+        .await
+        .context("load order")?
+        .ok_or(AppError::NotFound)?;
+    let mut tx = state.db.begin().await.context("begin")?;
+    sqlx::query(LOCK_TIMEOUT)
+        .execute(&mut *tx)
+        .await
+        .context("set lock_timeout")?;
+    let begun = begin(&mut tx, order_id, status == "paid", "owner_decision", true).await?;
+    audit::record(
+        &mut tx,
+        Some(actor),
+        "admin.order_refunded",
+        "order",
+        Some(order_id),
+        json!({
+            "note": note,
+            "prior_status": begun.prior_status,
+            "refund_id": begun.refund_id,
+            "restore_stock": begun.restored,
+        }),
+    )
+    .await?;
+    tx.commit().await.map_err(db_err("commit refund"))?;
+    send_refund(state, begun.refund_id).await
+}
+
+struct Begun {
+    refund_id: Uuid,
+    prior_status: String,
+    restored: bool,
+}
+
 /// Refunds a `paid` order in full, or retries the provider call of an order
 /// already `refund_pending`. `restore_stock` puts the sold units back on hand
 /// (false when they were never taken, e.g. paid after expiry with no stock).
@@ -90,6 +143,20 @@ pub async fn begin_refund(
     restore_stock: bool,
     reason: &str,
 ) -> Result<Uuid, AppError> {
+    Ok(begin(conn, order_id, restore_stock, reason, false)
+        .await?
+        .refund_id)
+}
+
+/// [`begin_refund`]; `owner` widens and tightens it as [`owner_refund_order`]
+/// documents.
+async fn begin(
+    conn: &mut PgConnection,
+    order_id: Uuid,
+    restore_stock: bool,
+    reason: &str,
+    owner: bool,
+) -> Result<Begun, AppError> {
     // (variant, quantity, on-hand stock under the lock)
     let items: Vec<(Uuid, i32, i32)> = if restore_stock {
         let items: Vec<(Uuid, i32)> = sqlx::query_as(
@@ -119,15 +186,16 @@ pub async fn begin_refund(
         Vec::new()
     };
 
-    let (status, items_total, delivery_fee, checkout_id, provider): (
+    let (status, items_total, delivery_fee, checkout_id, provider, held): (
         String,
         i64,
         i64,
         Uuid,
         String,
+        bool,
     ) = sqlx::query_as(
         "SELECT o.status::text, o.items_total_kobo, o.delivery_fee_kobo, o.checkout_id, \
-                    c.provider \
+                    c.provider, o.held_at IS NOT NULL \
              FROM orders o JOIN checkouts c ON c.id = o.checkout_id \
              WHERE o.id = $1 FOR UPDATE OF o",
     )
@@ -136,19 +204,31 @@ pub async fn begin_refund(
     .await
     .map_err(db_err("lock order"))?
     .ok_or(AppError::NotFound)?;
+    let state_err =
+        || AppError::ConflictDetail("invalid_order_state", format!("order is {status}"));
     match status.as_str() {
         "paid" => {}
+        "picked_up" | "delivered" if owner && held => {}
+        "picked_up" | "delivered" if owner => return Err(AppError::Conflict("order_not_held")),
+        "refund_pending" | "refunded" if owner => return Err(state_err()),
         "refund_pending" | "refunded" => {
             let id: Uuid = sqlx::query_scalar("SELECT id FROM refunds WHERE order_id = $1")
                 .bind(order_id)
                 .fetch_one(&mut *conn)
                 .await
                 .context("load refund")?;
-            return Ok(id);
+            return Ok(Begun {
+                refund_id: id,
+                prior_status: status,
+                restored: false,
+            });
         }
         "completed" => return Err(AppError::Conflict("already_released")),
+        _ if owner => return Err(state_err()),
         _ => return Err(AppError::Conflict("not_refundable")),
     }
+    // Only goods still with the seller go back on hand.
+    let restore = restore_stock && status == "paid";
     let amount = items_total
         .checked_add(delivery_fee)
         .ok_or_else(|| anyhow::anyhow!("refund amount overflow"))?;
@@ -161,7 +241,7 @@ pub async fn begin_refund(
     // Units back on hand, clamped at the stock cap (the seller may have
     // restocked meanwhile); the clamped units are recorded in the audit row.
     let mut clamped_units: i64 = 0;
-    for (variant_id, quantity, stock) in &items {
+    for (variant_id, quantity, stock) in items.iter().filter(|_| restore) {
         let wanted = i64::from(*stock) + i64::from(*quantity);
         clamped_units += (wanted - i64::from(MAX_STOCK)).max(0);
         sqlx::query("UPDATE product_variants SET stock = LEAST(stock + $2, $3) WHERE id = $1")
@@ -211,12 +291,16 @@ pub async fn begin_refund(
         json!({
             "refund_id": refund_id,
             "amount_kobo": amount,
-            "restore_stock": restore_stock,
+            "restore_stock": restore,
             "clamped_units": clamped_units,
         }),
     )
     .await?;
-    Ok(refund_id)
+    Ok(Begun {
+        refund_id,
+        prior_status: status,
+        restored: restore,
+    })
 }
 
 #[derive(sqlx::FromRow)]

@@ -1,4 +1,5 @@
 pub mod access_codes;
+pub mod admin;
 pub mod audit;
 pub mod auth;
 pub mod cart;
@@ -95,6 +96,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(checkout::routes::router())
         .merge(orders::routes::router())
         .merge(payments::webhooks::router())
+        .merge(admin::routes::router())
         // Must follow every route: it applies to the method routers registered so far.
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)

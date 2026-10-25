@@ -20,7 +20,9 @@
 //!      every line, `stock -= q` and paid; otherwise the checkout is `refunded`:
 //!      the payment is booked, then every order is refunded (stock untouched).
 //!
-//!    Paid: checkout and orders `paid`, deadlines snapshotted from the settings,
+//!    Paid: checkout and orders `paid`, deadlines and the payout fee schedule
+//!    snapshotted from the settings,
+
 //!    provider fee split across orders, ledger `buyer_funds -T`, `escrow +T` per
 //!    order, provider hold -> `provider_flagged`, the cart lines cleared.
 //! 4. For a webhook, the event is marked processed in that same transaction, or
@@ -359,19 +361,29 @@ async fn apply(
         })
         .collect::<Result<Vec<i64>, _>>()?;
     let shares = split_proportional(fee, &totals);
+    // The seller's payout fee schedule is fixed now, like the deadlines: a
+    // later owner fee change never alters an order already paid.
+    let fees = settings.fee_schedule();
     let mut entries = Vec::with_capacity(orders.len() * 2);
     for (((order_id, _, _), total), share) in orders.iter().zip(&totals).zip(&shares) {
         sqlx::query(
             "UPDATE orders SET status = 'paid', paid_at = now(), cancelled_at = NULL, \
                     collection_fee_share_kobo = $2, \
                     ship_by = now() + make_interval(hours => $3), \
-                    backstop_at = now() + make_interval(days => $4) \
+                    backstop_at = now() + make_interval(days => $4), \
+                    fee_small_kobo = $5, fee_large_kobo = $6, fee_threshold_kobo = $7, \
+                    stamp_duty_kobo = $8, stamp_duty_threshold_kobo = $9 \
              WHERE id = $1",
         )
         .bind(order_id)
         .bind(share)
         .bind(settings.ship_deadline_hours)
         .bind(settings.backstop_days)
+        .bind(fees.small_fee)
+        .bind(fees.large_fee)
+        .bind(fees.threshold)
+        .bind(fees.stamp_duty_kobo)
+        .bind(fees.stamp_duty_threshold)
         .execute(&mut *tx)
         .await
         .map_err(db_err("mark order paid"))?;
