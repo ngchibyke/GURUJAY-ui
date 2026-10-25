@@ -545,6 +545,11 @@ async fn failed_row_is_pushed_back(pool: PgPool) {
     )
     .await;
     assert_eq!(tick(&app).await.auto_cancelled, 1);
+    // A success clears the row's push-back.
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM job_row_failures").await,
+        0
+    );
 }
 
 // ---------------------------------------------------------------- auto-release

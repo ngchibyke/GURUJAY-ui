@@ -508,8 +508,12 @@ async fn paid_after_expiry_refunds_when_stock_gone(pool: PgPool) {
     assert_status(&webhook(&app, "evt-1", &b.reference).await, 200, "received");
 
     assert_eq!(checkout_status(&app, b.checkout_id).await, "refunded");
-    // The fake does not support refunds: the owner refunds by hand.
-    assert_eq!(order_statuses(&app, b.checkout_id).await, vec!["refunded"]);
+    // The fake does not support refunds: the owner refunds by hand, and the
+    // order stays refund_pending until the owner marks the refund done.
+    assert_eq!(
+        order_statuses(&app, b.checkout_id).await,
+        vec!["refund_pending"]
+    );
     let (reference, amount, status): (String, i64, String) =
         sqlx::query_as("SELECT reference, amount_kobo, status::text FROM refunds")
             .fetch_one(&app.pool)
@@ -1024,8 +1028,35 @@ async fn refund_not_supported_goes_manual(pool: PgPool) {
     let (_, order_id) = paid_order(&app, 1).await;
     let out = refund_order(&app.state, order_id, false).await.unwrap();
     assert_eq!(out.status, "manual");
-    assert_eq!(order_status(&app, order_id).await, "refunded");
+    // The buyer has not been paid back yet: the owner refunds by hand and then
+    // marks the refund done (Task 10), which completes the order.
+    assert_eq!(order_status(&app, order_id).await, "refund_pending");
     assert_eq!(refund_row(&app).await.1, "manual");
+}
+
+#[sqlx::test]
+async fn send_refund_refuses_a_refund_out_of_attempts(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (_, order_id) = paid_order(&app, 1).await;
+    app.fake.set_refund_supported(true);
+    app.fake
+        .fail_refund_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    let first = refund_order(&app.state, order_id, false).await.unwrap();
+    assert_eq!(first.status, "requested");
+    // Used up its sends (the sweeper escalates it to manual on its next tick).
+    sqlx::query("UPDATE refunds SET attempts = 8")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    app.fake.clear_refund_failure();
+    let again = send_refund(&app.state, first.refund_id).await.unwrap();
+    assert_eq!(again.status, "requested");
+    assert_eq!(app.fake.calls("refund"), 1, "no 9th provider call");
+    assert_eq!(refund_row(&app).await.3, 8);
+    // A buyer re-cancel goes through the same claim.
+    let again = refund_order(&app.state, order_id, false).await.unwrap();
+    assert_eq!(again.status, "requested");
+    assert_eq!(app.fake.calls("refund"), 1);
 }
 
 #[sqlx::test]

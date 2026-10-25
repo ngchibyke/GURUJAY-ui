@@ -10,10 +10,15 @@
 //!    with the same reference every time, and records the answer:
 //!    - Ok: refund `processing` (the buyer gets the money within about 10
 //!      working days; not `completed`), order `refunded`;
-//!    - NotSupported: refund `manual` (the owner refunds by hand), order `refunded`;
+//!    - NotSupported: refund `manual`, order stays `refund_pending` (the owner
+//!      refunds by hand, then marks the refund done, which makes it `refunded`);
 //!    - Rejected: refund `failed`, order stays `refund_pending` (owner follow-up);
 //!    - Unavailable/Timeout: refund stays `requested` with `last_error`, order
 //!      stays `refund_pending`; a later call retries with the SAME reference.
+//!
+//!    A refund that used up [`MAX_REFUND_ATTEMPTS`] sends is never claimed
+//!    again (the sweeper moves it to `manual`), whoever calls: the job, a buyer
+//!    re-cancel or an owner refund.
 
 use std::time::Duration;
 
@@ -37,6 +42,9 @@ const LOCK_TIMEOUT: &str = "SET LOCAL lock_timeout = '5s'";
 /// Longest wait for the provider's refund answer. Well under the 2-minute
 /// claim, so a slow call cannot outlive its claim; past it the outcome is a Timeout.
 pub const REFUND_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Refund sends (the inline one included) before a `requested` refund goes to
+/// `manual` for the owner (same cap as payouts).
+pub const MAX_REFUND_ATTEMPTS: i32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundOutcome {
@@ -235,11 +243,13 @@ pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutc
                 attempts = attempts + 1, updated_at = now() \
          FROM orders o JOIN checkouts c ON c.id = o.checkout_id \
          WHERE r.id = $1 AND o.id = r.order_id AND r.status = 'requested' \
+           AND r.attempts < $2 \
            AND (r.sending_until IS NULL OR r.sending_until < now()) \
          RETURNING r.order_id, r.reference, r.provider, r.amount_kobo, r.reason, \
                    r.sending_until AS claimed_until, c.reference AS payment_reference",
     )
     .bind(refund_id)
+    .bind(MAX_REFUND_ATTEMPTS)
     .fetch_optional(&state.db)
     .await
     .context("claim refund")?;
@@ -267,7 +277,8 @@ pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutc
     let (status, provider_id, done, error): (&str, Option<String>, bool, Option<&str>) =
         match result {
             Ok(h) => ("processing", Some(h.provider_refund_id), true, None),
-            Err(ProviderError::NotSupported) => ("manual", None, true, None),
+            // The buyer is not paid back until the owner refunds by hand.
+            Err(ProviderError::NotSupported) => ("manual", None, false, None),
             Err(ProviderError::Rejected { .. }) => ("failed", None, false, Some("rejected")),
             Err(ProviderError::Timeout) => ("requested", None, false, Some("timed out")),
             Err(_) => ("requested", None, false, Some("unavailable")),
@@ -327,6 +338,16 @@ pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutc
             "order",
             Some(c.order_id),
             json!({ "refund_id": refund_id, "refund_status": status }),
+        )
+        .await?;
+    } else if status == "manual" {
+        audit::record(
+            &mut tx,
+            None,
+            "refund.manual_required",
+            "refund",
+            Some(refund_id),
+            json!({ "order_id": c.order_id, "reason": "not_supported" }),
         )
         .await?;
     }

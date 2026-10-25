@@ -42,7 +42,9 @@
 //! pushed back by a durable column (`next_attempt_at`, `next_reverify_at`,
 //! `last_polled_at`), so no row stays due forever and fills the batch. A row
 //! whose engine call returns an error is pushed back in `job_row_failures`
-//! (same backoff) and the claims skip it until then.
+//! (same backoff) and the claims skip it until then; a later success clears
+//! the push-back. The reverify and refund jobs back off through their own
+//! columns (set by their claims), so they write no push-back rows.
 //!
 //! **Provider calls.** Ids are processed one at a time, so the jobs make at
 //! most one outbound call at a time, and each provider-calling job handles at
@@ -86,9 +88,7 @@ pub const PROVIDER_CALLS_PER_TICK: i64 = 20;
 pub const SHIP_DEADLINE_PER_TICK: i64 = 20;
 /// A pending payout is polled at most this often.
 const PENDING_POLL_EVERY: &str = "1 hour";
-/// Refund sends (the inline one included) before a `requested` refund goes to
-/// `manual` for the owner (same cap as payouts).
-pub const MAX_REFUND_ATTEMPTS: i32 = 8;
+pub use super::refund::MAX_REFUND_ATTEMPTS;
 // Job names (`job_runs.job`, `job_row_failures.job`).
 const EXPIRE: &str = "expire_checkouts";
 const REVERIFY: &str = "reverify_checkouts";
@@ -289,10 +289,17 @@ async fn claim(state: &AppState, sql: &str, limit: i64) -> Result<Vec<Uuid>, App
     Ok(ids)
 }
 
+/// Whether `job`'s claim honours `job_row_failures` push-backs. The reverify
+/// and refund claims push their rows back through their own columns.
+fn uses_push_back(job: &str) -> bool {
+    !matches!(job, REVERIFY | REFUNDS)
+}
+
 /// Counts one engine call's result into `stats`; `Ok(true)` means it did
 /// something. A row whose call failed is pushed back in `job_row_failures`
 /// (the jobs' usual backoff), so it cannot be reclaimed at the head of the
-/// batch every tick and starve newer due rows.
+/// batch every tick and starve newer due rows; a row whose call succeeded
+/// loses any push-back it had, so a later failure starts the backoff afresh.
 async fn tally(
     state: &AppState,
     stats: &mut Stats,
@@ -300,14 +307,33 @@ async fn tally(
     row_id: Uuid,
     result: Result<bool, AppError>,
 ) {
+    let ok = result.is_ok();
     match result {
         Ok(true) => stats.done += 1,
         Ok(false) => {}
         Err(e) => {
             stats.failed += 1;
             tracing::warn!(job, error = %e, "job row failed; retried after a backoff");
-            push_back(state, job, row_id).await;
         }
+    }
+    if !uses_push_back(job) {
+        return;
+    }
+    if ok {
+        clear_push_back(state, job, row_id).await;
+    } else {
+        push_back(state, job, row_id).await;
+    }
+}
+
+async fn clear_push_back(state: &AppState, job: &str, row_id: Uuid) {
+    if let Err(e) = sqlx::query("DELETE FROM job_row_failures WHERE job = $1 AND row_id = $2")
+        .bind(job)
+        .bind(row_id)
+        .execute(&state.db)
+        .await
+    {
+        tracing::warn!(job, error = %e, "row push-back not cleared");
     }
 }
 
@@ -674,7 +700,14 @@ async fn escalate_failed(state: &AppState, payout_id: Uuid) -> Result<bool, AppE
 // ------------------------------------------------------------------ 7. refunds
 
 async fn refunds(state: &AppState, cancel: &CancellationToken) -> Result<Stats, AppError> {
-    escalate_exhausted_refunds(state).await?;
+    // Escalation failing (a lock timeout, say) must not stop the retries;
+    // exhausted rows are never claimed below (`attempts < cap`) and are
+    // escalated on a later tick.
+    let mut stats = Stats::default();
+    if let Err(e) = escalate_exhausted_refunds(state).await {
+        stats.failed += 1;
+        tracing::warn!(job = REFUNDS, error = %e, "refund escalation failed; retried next tick");
+    }
     // The claim pushes `next_attempt_at` back from the refund's attempt count;
     // send_refund's own 2-minute claim keeps two senders apart. A refund sent
     // (or created) within the last minute is left to its own caller first, so
@@ -700,7 +733,6 @@ async fn refunds(state: &AppState, cancel: &CancellationToken) -> Result<Stats, 
         .await
         .context("claim requested refunds")?;
     tx.commit().await.context("commit claim")?;
-    let mut stats = Stats::default();
     for id in ids {
         if cancel.is_cancelled() {
             break;
@@ -717,6 +749,10 @@ async fn refunds(state: &AppState, cancel: &CancellationToken) -> Result<Stats, 
 /// `refund_pending`: the buyer has not been paid back yet.
 async fn escalate_exhausted_refunds(state: &AppState) -> Result<(), AppError> {
     let mut tx = state.db.begin().await.context("begin")?;
+    sqlx::query(LOCK_TIMEOUT)
+        .execute(&mut *tx)
+        .await
+        .context("set lock_timeout")?;
     let rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
         "UPDATE refunds SET status = 'manual', updated_at = now() \
          WHERE status = 'requested' AND attempts >= $1 \
