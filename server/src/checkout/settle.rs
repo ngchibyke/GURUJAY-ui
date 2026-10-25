@@ -21,10 +21,9 @@
 //!      the payment is booked, then every order is refunded (stock untouched).
 //!
 //!    Paid: checkout and orders `paid`, deadlines and the payout fee schedule
-//!    snapshotted from the settings,
-
-//!    provider fee split across orders, ledger `buyer_funds -T`, `escrow +T` per
-//!    order, provider hold -> `provider_flagged`, the cart lines cleared.
+//!    snapshotted from the settings, provider fee split across orders, ledger
+//!    `buyer_funds -T`, `escrow +T` per order, provider hold ->
+//!    `provider_flagged`, the cart lines cleared.
 //! 4. For a webhook, the event is marked processed in that same transaction, or
 //!    after a confirmed no-op. Pending/unavailable answers leave it unprocessed,
 //!    so the provider's retry is settled again.

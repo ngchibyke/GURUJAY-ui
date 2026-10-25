@@ -57,6 +57,7 @@ pub struct FakeProvider {
     payout_failure: Mutex<Option<ProviderError>>,
     payout_states: Mutex<HashMap<String, PayoutState>>,
     found_payouts: Mutex<HashMap<String, Option<String>>>,
+    find_payout_failure: Mutex<Option<ProviderError>>,
     refund_supported: Mutex<bool>,
     refund_failure: Mutex<Option<ProviderError>>,
     refund_delay: Mutex<Option<std::time::Duration>>,
@@ -141,6 +142,12 @@ impl FakeProvider {
             reference.to_string(),
             provider_payout_id.map(str::to_string),
         );
+    }
+
+    /// Every later `find_payout` call returns this error (after being
+    /// recorded).
+    pub fn fail_find_payout_with(&self, err: ProviderError) {
+        *self.find_payout_failure.lock().unwrap() = Some(err);
     }
 
     /// When true, `refund` succeeds with id `fakerf_<payment_reference>`.
@@ -301,6 +308,9 @@ impl PaymentProvider for FakeProvider {
 
     async fn find_payout(&self, reference: &str) -> Result<Option<PayoutHandle>, ProviderError> {
         self.record("find_payout");
+        if let Some(e) = self.find_payout_failure.lock().unwrap().as_ref() {
+            return Err(copy_err(e));
+        }
         Ok(self
             .found_payouts
             .lock()

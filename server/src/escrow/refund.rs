@@ -385,7 +385,8 @@ pub async fn send_refund(state: &AppState, refund_id: Uuid) -> Result<RefundOutc
     let fenced: Option<Uuid> = sqlx::query_scalar(
         "UPDATE refunds SET status = $2::refund_status, \
                 provider_refund_id = COALESCE($3, provider_refund_id), \
-                last_error = $4, sending_until = NULL, updated_at = now() \
+                last_error = $4, sending_until = NULL, updated_at = now(), \
+                timeouts = timeouts + CASE WHEN $4 = 'timed out' THEN 1 ELSE 0 END \
          WHERE id = $1 AND status = 'requested' AND sending_until = $5 RETURNING id",
     )
     .bind(refund_id)

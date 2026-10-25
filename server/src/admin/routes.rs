@@ -7,7 +7,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post, put},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     Owner, Staff, holidays, money, note, orders, parse_id, provider_reference,
@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/refunds/{id}/mark-refunded", post(mark_refunded))
         .route("/admin/checkouts", get(checkouts))
         .route("/admin/checkouts/{id}/clear-flag", post(clear_flag))
+        .route("/admin/checkouts/{id}/resolve", post(resolve_checkout))
         .route("/admin/reconciliation", get(reconciliation))
         .route("/admin/bank-holidays", get(list_holidays))
         .route(
@@ -95,7 +96,7 @@ async fn backstop(
     staff: Staff,
     AppQuery(q): AppQuery<ListQuery>,
 ) -> Result<Json<Items<AdminOrderView>>, AppError> {
-    let items = views::backstop(&state.db, views::limit(q.limit)?).await?;
+    let items = views::backstop(&state.db, views::limit(q.limit)?, staff.is_owner()).await?;
     viewed(&state, &staff.0, "backstop", items.len()).await?;
     Ok(Json(Items { items }))
 }
@@ -169,7 +170,8 @@ async fn mark_paid(
     let id = parse_id(&id)?;
     let note = note("note", body.note.as_deref(), NOTE_MAX)?;
     let reference = provider_reference(body.provider_reference.as_deref())?;
-    money::mark_paid(&state.db, user.id, id, &note, &reference).await?;
+    // The view's `settled_by` says whether the provider had paid it after all.
+    money::mark_paid(&state, user.id, id, &note, &reference).await?;
     Ok(Json(views::payout(&state.db, id).await?))
 }
 
@@ -187,17 +189,31 @@ async fn requeue(
 
 // ----------------------------------------------------------------- refunds
 
+/// A refund marked refunded, with what the provider was asked.
+#[derive(Serialize)]
+struct MarkedRefund {
+    #[serde(flatten)]
+    refund: RefundView,
+    provider_attempts: i32,
+    /// A send timed out: the provider may have refunded the buyer as well.
+    provider_outcome_unknown: bool,
+}
+
 async fn mark_refunded(
     State(state): State<AppState>,
     Owner(user): Owner,
     Path(id): Path<String>,
     AppJson(body): AppJson<OverrideBody>,
-) -> Result<Json<RefundView>, AppError> {
+) -> Result<Json<MarkedRefund>, AppError> {
     let id = parse_id(&id)?;
     let note = note("note", body.note.as_deref(), NOTE_MAX)?;
     let reference = provider_reference(body.provider_reference.as_deref())?;
-    money::mark_refunded(&state.db, user.id, id, &note, &reference).await?;
-    Ok(Json(views::refund(&state.db, id).await?))
+    let marked = money::mark_refunded(&state.db, user.id, id, &note, &reference).await?;
+    Ok(Json(MarkedRefund {
+        refund: views::refund(&state.db, id).await?,
+        provider_attempts: marked.provider_attempts,
+        provider_outcome_unknown: marked.provider_outcome_unknown,
+    }))
 }
 
 // --------------------------------------------------------------- checkouts
@@ -225,6 +241,21 @@ async fn clear_flag(
     Ok(Json(views::checkout(&state.db, id).await?))
 }
 
+/// Records the owner's own handling of a mismatched or flagged checkout; moves
+/// no money (see [`money::resolve_checkout`]).
+async fn resolve_checkout(
+    State(state): State<AppState>,
+    Owner(user): Owner,
+    Path(id): Path<String>,
+    AppJson(body): AppJson<OverrideBody>,
+) -> Result<Json<CheckoutView>, AppError> {
+    let id = parse_id(&id)?;
+    let note = note("note", body.note.as_deref(), NOTE_MAX)?;
+    let reference = provider_reference(body.provider_reference.as_deref())?;
+    money::resolve_checkout(&state.db, user.id, id, &note, &reference).await?;
+    Ok(Json(views::checkout(&state.db, id).await?))
+}
+
 async fn reconciliation(
     State(state): State<AppState>,
     staff: Staff,
@@ -242,11 +273,11 @@ async fn reconciliation(
 
 async fn list_holidays(
     State(state): State<AppState>,
-    _staff: Staff,
+    staff: Staff,
 ) -> Result<Json<Items<holidays::Holiday>>, AppError> {
-    Ok(Json(Items {
-        items: holidays::list(&state.db).await?,
-    }))
+    let items = holidays::list(&state.db).await?;
+    viewed(&state, &staff.0, "bank_holidays", items.len()).await?;
+    Ok(Json(Items { items }))
 }
 
 async fn set_holiday(

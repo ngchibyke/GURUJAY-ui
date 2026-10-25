@@ -1,7 +1,9 @@
 //! Admin read models and lists. Personal data: ids, amounts, statuses, our
 //! own references and the last four digits of the account paid. Never an
-//! account number, an account name or any buyer data; Support does not see
-//! the bank code either. Every list read is audited (`admin.viewed`).
+//! account number, an account name or any buyer data. Support sees neither
+//! the bank code nor any free text the owner wrote (hold reasons; notes are
+//! only ever in the audit log): those fields are left out of its responses.
+//! Every list read is audited (`admin.viewed`).
 
 use anyhow::Context;
 use serde::Serialize;
@@ -50,6 +52,8 @@ pub struct AdminOrderView {
     pub items_total_kobo: i64,
     pub delivery_fee_kobo: i64,
     pub held: bool,
+    /// Owner only (None, and left out, for Support): free text.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
     pub provider_flagged: bool,
     pub payout_status: Option<String>,
@@ -79,9 +83,13 @@ pub async fn order(db: &PgPool, order_id: Uuid) -> Result<AdminOrderView, AppErr
 }
 
 /// Orders the backstop job flagged (unreleased 30 days after payment) that are
-/// still unfinished, oldest flag first.
-pub async fn backstop(db: &PgPool, limit: i64) -> Result<Vec<AdminOrderView>, AppError> {
-    Ok(sqlx::query_as::<_, AdminOrderView>(&format!(
+/// still unfinished, oldest flag first. `owner`: false hides hold reasons.
+pub async fn backstop(
+    db: &PgPool,
+    limit: i64,
+    owner: bool,
+) -> Result<Vec<AdminOrderView>, AppError> {
+    let mut items = sqlx::query_as::<_, AdminOrderView>(&format!(
         "{ORDER_SELECT} WHERE o.backstop_flagged_at IS NOT NULL \
            AND o.status NOT IN ('completed', 'refunded', 'cancelled') \
          ORDER BY o.backstop_flagged_at, o.id LIMIT $1"
@@ -89,7 +97,13 @@ pub async fn backstop(db: &PgPool, limit: i64) -> Result<Vec<AdminOrderView>, Ap
     .bind(limit)
     .fetch_all(db)
     .await
-    .context("list backstop orders")?)
+    .context("list backstop orders")?;
+    if !owner {
+        for o in &mut items {
+            o.hold_reason = None;
+        }
+    }
+    Ok(items)
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -191,6 +205,8 @@ pub struct CheckoutView {
     pub total_kobo: i64,
     pub collection_fee_kobo: Option<i64>,
     pub provider_flagged: bool,
+    /// The owner recorded handling it outside the system.
+    pub resolved: bool,
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
@@ -198,7 +214,8 @@ pub struct CheckoutView {
 }
 
 const CHECKOUT_SELECT: &str = "SELECT id, reference, status::text AS status, provider, \
-        total_kobo, collection_fee_kobo, provider_flagged, paid_at, created_at FROM checkouts";
+        total_kobo, collection_fee_kobo, provider_flagged, resolved_at IS NOT NULL AS resolved, \
+        paid_at, created_at FROM checkouts";
 
 pub async fn checkout(db: &PgPool, checkout_id: Uuid) -> Result<CheckoutView, AppError> {
     sqlx::query_as::<_, CheckoutView>(&format!("{CHECKOUT_SELECT} WHERE id = $1"))
@@ -210,15 +227,18 @@ pub async fn checkout(db: &PgPool, checkout_id: Uuid) -> Result<CheckoutView, Ap
 }
 
 /// Checkouts needing the owner: `amount_mismatch` (paid the wrong amount,
-/// to refund by hand) or `flagged` (the provider held the payment).
+/// to refund by hand) or `flagged` (the provider held the payment), not yet
+/// resolved by the owner.
 pub async fn checkouts(
     db: &PgPool,
     which: &str,
     limit: i64,
 ) -> Result<Vec<CheckoutView>, AppError> {
     let filter = match which {
-        "amount_mismatch" => "status = 'amount_mismatch' ORDER BY created_at, id",
-        "flagged" => "provider_flagged ORDER BY paid_at, id",
+        "amount_mismatch" => {
+            "status = 'amount_mismatch' AND resolved_at IS NULL ORDER BY created_at, id"
+        }
+        "flagged" => "provider_flagged AND resolved_at IS NULL ORDER BY paid_at, id",
         _ => {
             return Err(AppError::Validation(
                 "status must be amount_mismatch or flagged".into(),

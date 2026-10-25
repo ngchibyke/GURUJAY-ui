@@ -48,9 +48,12 @@
 //!
 //! Lock order (global: `... checkouts -> orders -> payouts`): every step locks
 //! the order first, then the payout row. `payout_accounts` comes after
-//! `payouts` and is only ever read here under `FOR SHARE` (the seller's
-//! account change takes `FOR UPDATE` on it alone), so it cannot deadlock with
-//! the order/payout locks.
+//! `payouts`: the send reads it under `FOR SHARE`, and a reversal
+//! ([`close_reversed_attempt`]) updates it (back to `pending`) while holding
+//! the order and payout locks. The seller's account change and the owner's
+//! verify lock `payout_accounts` alone, never an order or payout after it, so
+//! neither can deadlock with the order/payout locks.
+
 //!
 //! Personal data: the seller's account number is decrypted only for the
 //! provider call and never logged, audited or returned.
@@ -843,6 +846,13 @@ struct SettleLookup {
 
 /// SQL: the payout no longer takes provider answers (see [`SettleLookup`]).
 const CLOSED: &str = "(settled_by IS NOT DISTINCT FROM 'owner' OR reversed_at IS NOT NULL)";
+
+/// Whether a payout the owner might settle by hand may in fact have been paid
+/// by the provider: an `unknown` outcome, or a `manual` payout the provider
+/// accepted or whose outcome stayed unknown. Mark-paid asks the provider first.
+pub fn may_have_paid(status: &str, has_provider_id: bool, last_error: Option<&str>) -> bool {
+    status == "unknown" || (status == "manual" && settleable(status, has_provider_id, last_error))
+}
 
 /// Whether a payout in `status` can still change on the provider's answer.
 fn settleable(status: &str, has_provider_id: bool, last_error: Option<&str>) -> bool {

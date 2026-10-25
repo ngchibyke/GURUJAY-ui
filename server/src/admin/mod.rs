@@ -16,9 +16,14 @@
 //! **Audit and personal data.** Every mutation writes an `admin.*` audit row
 //! with the actor in its own transaction; every list read writes
 //! `admin.viewed`. Lists show ids, amounts, statuses and the last four digits
-//! of an account only: never an account number, never buyer data. Free-text
-//! notes are refused if they hold a run of 10+ digits (an account number).
+//! of an account only: never an account number, never buyer data. Support
+//! never sees owner-written free text (hold reasons, notes). Free-text notes
+//! are refused if they hold a run of 10+ digits (an account number), spaces,
+//! `-` and `.` ignored; a provider reference of exactly ten digits is refused.
 //! Nothing here logs personal data.
+//!
+//! **Double payment.** Mark-paid on a payout the provider may have paid asks
+//! the provider first (see [`money::mark_paid`]).
 
 pub mod holidays;
 pub mod money;
@@ -75,9 +80,13 @@ pub(crate) fn parse_id(key: &str) -> Result<Uuid, AppError> {
     key.parse().map_err(|_| AppError::NotFound)
 }
 
-/// Longest run of ASCII digits in `s`.
+/// Longest run of ASCII digits in `s`, ignoring the separators people write
+/// inside an account number (spaces, `-`, `.`): "0123 456 785" is one run.
 fn longest_digit_run(s: &str) -> usize {
-    s.split(|c: char| !c.is_ascii_digit())
+    s.chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '.'))
+        .collect::<String>()
+        .split(|c: char| !c.is_ascii_digit())
         .map(str::len)
         .max()
         .unwrap_or(0)
@@ -107,7 +116,8 @@ pub(crate) fn note(field: &str, value: Option<&str>, max: usize) -> Result<Strin
 }
 
 /// The bank or provider transaction reference the owner checked: 1..=100 of
-/// `[A-Za-z0-9_./:-]` (matches the column CHECK).
+/// `[A-Za-z0-9_./:-]` (matches the column CHECK). Exactly ten digits is
+/// refused: that is a NUBAN account number, not a transaction reference.
 pub(crate) fn provider_reference(value: Option<&str>) -> Result<String, AppError> {
     let v = value.unwrap_or("").trim();
     let ok = (1..=100).contains(&v.len())
@@ -116,6 +126,11 @@ pub(crate) fn provider_reference(value: Option<&str>) -> Result<String, AppError
     if !ok {
         return Err(AppError::Validation(
             "provider_reference must be 1 to 100 letters, digits or _ . / : -".into(),
+        ));
+    }
+    if v.len() == 10 && v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(AppError::Validation(
+            "provider_reference must not be an account number".into(),
         ));
     }
     Ok(v.to_string())
@@ -132,6 +147,11 @@ mod tests {
         assert!(note("note", Some("   "), 500).is_err());
         assert!(note("note", Some("to 0123456785"), 500).is_err());
         assert!(note("note", Some("order 123456789 ok"), 500).is_ok());
+        // Separators inside the number do not hide it.
+        assert!(note("note", Some("to 0123 456 785"), 500).is_err());
+        assert!(note("note", Some("to 012-345-6785"), 500).is_err());
+        assert!(note("note", Some("to 012.345.6785"), 500).is_err());
+        assert!(note("note", Some("order 12345, ref 67890"), 500).is_ok());
         assert!(note("note", Some("a\u{0}b"), 500).is_err());
         assert!(note("note", Some(&"x".repeat(501)), 500).is_err());
     }
@@ -142,6 +162,11 @@ mod tests {
         assert!(provider_reference(Some("")).is_err());
         assert!(provider_reference(Some("has space")).is_err());
         assert!(provider_reference(Some(&"A".repeat(101))).is_err());
+        // A bare NUBAN is not a reference.
+        assert!(provider_reference(Some("0123456785")).is_err());
+        assert!(provider_reference(Some("012345678")).is_ok());
+        assert!(provider_reference(Some("NIP0123456785")).is_ok());
+
         // NIP session ids are long digit strings: allowed here, not in notes.
         assert!(provider_reference(Some("000013261025123456789012345678")).is_ok());
     }

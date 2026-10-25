@@ -18,8 +18,9 @@ use crate::{
     checkout::service::busy_err,
     error::AppError,
     escrow::{
-        release::{PAYOUT_CALL_TIMEOUT, round_ref},
-        send_payout,
+        SettlePayoutOutcome,
+        release::{PAYOUT_CALL_TIMEOUT, may_have_paid, round_ref},
+        send_payout, settle_payout,
     },
     ledger::{self, Account, Entry},
     payments::{self, PayoutState},
@@ -42,6 +43,8 @@ fn payout_state(status: &str) -> AppError {
 #[derive(sqlx::FromRow)]
 struct LockedPayout {
     status: String,
+    attempts: i32,
+    updated_at: time::OffsetDateTime,
     round: i32,
     amount_kobo: i64,
     order_id: Uuid,
@@ -68,8 +71,8 @@ async fn lock_payout(
     .map_err(db_err("lock order"))?
     .ok_or(AppError::NotFound)?;
     sqlx::query_as(
-        "SELECT p.status::text AS status, p.round, p.amount_kobo, p.order_id, o.checkout_id, \
-                p.reference \
+        "SELECT p.status::text AS status, p.attempts, p.updated_at, p.round, p.amount_kobo, \
+                p.order_id, o.checkout_id, p.reference \
          FROM payouts p JOIN orders o ON o.id = p.order_id WHERE p.id = $1 FOR UPDATE OF p",
     )
     .bind(payout_id)
@@ -78,21 +81,84 @@ async fn lock_payout(
     .map_err(db_err("lock payout"))
 }
 
-/// The owner paid the seller outside the provider (or confirmed with the
-/// provider that it paid). Books `seller_payable -> seller_paid` under the
-/// round's success key (none for a zero payout); provider answers no longer
-/// change the payout afterwards.
+#[derive(sqlx::FromRow)]
+struct PaidCheck {
+    status: String,
+    reference: String,
+    provider: String,
+    provider_payout_id: Option<String>,
+    last_error: Option<String>,
+    attempts: i32,
+    updated_at: time::OffsetDateTime,
+}
+
+/// Who settled the payout on a mark-paid request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkedPaid {
+    /// The owner's hand payment was recorded.
+    ByOwner,
+    /// The provider had paid it: settled from the provider's answer instead.
+    ByProvider,
+}
+
+fn provider_unavailable() -> AppError {
+    AppError::Unavailable("provider_unavailable")
+}
+
+/// The owner paid the seller outside the provider. Books `seller_payable ->
+/// seller_paid` under the round's success key (none for a zero payout);
+/// provider answers no longer change the payout afterwards.
+///
+/// A payout that may have been paid by the provider (`unknown`, or `manual`
+/// after the provider accepted it or its outcome stayed unknown) is checked
+/// with the provider first, outside any transaction, so the seller is never
+/// paid twice:
+/// - the provider has no such payout: the owner's payment is recorded;
+/// - the provider has it: it is settled from the provider's answer
+///   ([`settle_payout`]). Successful -> settled by the provider (real fee
+///   booked), returned as [`MarkedPaid::ByProvider`]; failed/reversed -> 409
+///   naming the new status (the owner may then mark it paid); still pending
+///   -> 409 `payout_pending_at_provider`;
+/// - the provider cannot answer: 503 `provider_unavailable`, nothing changed.
+///
+/// The transaction then re-checks that the payout did not change since it
+/// was read (409 `payout_changed`), so a send that claimed it meanwhile wins.
 pub async fn mark_paid(
-    db: &PgPool,
+    state: &AppState,
     actor: Uuid,
     payout_id: Uuid,
     note: &str,
     provider_reference: &str,
-) -> Result<(), AppError> {
-    let mut tx = db.begin().await.context("begin")?;
+) -> Result<MarkedPaid, AppError> {
+    let before: PaidCheck = sqlx::query_as(
+        "SELECT status::text AS status, reference, provider, provider_payout_id, last_error, \
+                attempts, updated_at \
+         FROM payouts WHERE id = $1",
+    )
+    .bind(payout_id)
+    .fetch_optional(&state.db)
+    .await
+    .context("load payout")?
+    .ok_or(AppError::NotFound)?;
+    if !MARK_PAID_FROM.contains(&before.status.as_str()) {
+        return Err(payout_state(&before.status));
+    }
+    if may_have_paid(
+        &before.status,
+        before.provider_payout_id.is_some(),
+        before.last_error.as_deref(),
+    ) && provider_has_it(state, actor, payout_id, &before).await?
+    {
+        return Ok(MarkedPaid::ByProvider);
+    }
+
+    let mut tx = state.db.begin().await.context("begin")?;
     let p = lock_payout(&mut tx, payout_id).await?;
     if !MARK_PAID_FROM.contains(&p.status.as_str()) {
         return Err(payout_state(&p.status));
+    }
+    if p.attempts != before.attempts || p.updated_at != before.updated_at {
+        return Err(AppError::Conflict("payout_changed"));
     }
     sqlx::query(
         "UPDATE payouts SET status = 'successful', settled_by = 'owner', settled_at = now(), \
@@ -145,19 +211,92 @@ pub async fn mark_paid(
     )
     .await?;
     tx.commit().await.map_err(db_err("commit mark paid"))?;
-    Ok(())
+    Ok(MarkedPaid::ByOwner)
+}
+
+/// Asks the provider about a payout before the owner settles it by hand
+/// (outside any transaction). `Ok(false)`: the provider has no such payout,
+/// go on. `Ok(true)`: the provider paid it and it is now settled. Anything
+/// else is the error to return. A lookup that reached the provider's record is
+/// audited (`admin.payout_provider_checked`).
+async fn provider_has_it(
+    state: &AppState,
+    actor: Uuid,
+    payout_id: Uuid,
+    p: &PaidCheck,
+) -> Result<bool, AppError> {
+    let provider = state
+        .providers
+        .by_name(&p.provider)
+        .ok_or_else(provider_unavailable)?;
+    if p.provider_payout_id.is_none() {
+        let found =
+            tokio::time::timeout(PAYOUT_CALL_TIMEOUT, provider.find_payout(&p.reference)).await;
+        match found {
+            Ok(Ok(None)) => return Ok(false),
+            Ok(Ok(Some(_))) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(provider = provider.name(), error = %e, "payout lookup for mark-paid failed");
+                return Err(provider_unavailable());
+            }
+            Err(_) => {
+                tracing::warn!(
+                    provider = provider.name(),
+                    "payout lookup for mark-paid timed out"
+                );
+                return Err(provider_unavailable());
+            }
+        }
+    }
+    let outcome = settle_payout(state, &p.reference).await?;
+    let label = match &outcome {
+        SettlePayoutOutcome::Settled { status } => status.as_str(),
+        SettlePayoutOutcome::UnknownReference => "reference_changed",
+        SettlePayoutOutcome::RetryLater => "provider_unavailable",
+    };
+    let mut conn = state.db.acquire().await.context("acquire")?;
+    audit::record(
+        &mut conn,
+        Some(actor),
+        "admin.payout_provider_checked",
+        "payout",
+        Some(payout_id),
+        json!({ "prior_status": p.status, "outcome": label }),
+    )
+    .await?;
+    match outcome {
+        SettlePayoutOutcome::Settled { status } if status == "successful" => Ok(true),
+        SettlePayoutOutcome::Settled { status } if status == "failed" => Err(payout_state(&status)),
+        SettlePayoutOutcome::Settled { status } => Err(AppError::ConflictDetail(
+            "payout_pending_at_provider",
+            format!("the provider has this payout and it is not final (payout is {status})"),
+        )),
+        SettlePayoutOutcome::UnknownReference => Err(AppError::Conflict("payout_changed")),
+        SettlePayoutOutcome::RetryLater => Err(provider_unavailable()),
+    }
+}
+
+/// What the provider was asked before a refund was marked refunded by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefundMarked {
+    /// Refund sends made to the provider.
+    pub provider_attempts: i32,
+    /// At least one send timed out: the provider may have paid the buyer too.
+    /// The provider trait has no refund-status lookup to rule it out (Task 11).
+    pub provider_outcome_unknown: bool,
 }
 
 /// The owner refunded the buyer by hand. The money left escrow when the
 /// refund was requested (key `("refund", id)`), so nothing more is booked;
-/// the refund becomes `completed` and its order `refunded`.
+/// the refund becomes `completed` and its order `refunded` (409
+/// `order_state_changed` if the order is no longer `refund_pending`).
 pub async fn mark_refunded(
     db: &PgPool,
     actor: Uuid,
     refund_id: Uuid,
     note: &str,
     provider_reference: &str,
-) -> Result<(), AppError> {
+) -> Result<RefundMarked, AppError> {
     let mut tx = db.begin().await.context("begin")?;
     sqlx::query(LOCK_TIMEOUT)
         .execute(&mut *tx)
@@ -173,12 +312,18 @@ pub async fn mark_refunded(
     .await
     .map_err(db_err("lock order"))?
     .ok_or(AppError::NotFound)?;
-    let (status, amount): (String, i64) =
-        sqlx::query_as("SELECT status::text, amount_kobo FROM refunds WHERE id = $1 FOR UPDATE")
-            .bind(refund_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db_err("lock refund"))?;
+    let (status, amount, attempts, timeouts): (String, i64, i32, i32) = sqlx::query_as(
+        "SELECT status::text, amount_kobo, attempts, timeouts FROM refunds \
+         WHERE id = $1 FOR UPDATE",
+    )
+    .bind(refund_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(db_err("lock refund"))?;
+    let marked = RefundMarked {
+        provider_attempts: attempts,
+        provider_outcome_unknown: timeouts > 0,
+    };
     if !MARK_REFUNDED_FROM.contains(&status.as_str()) {
         return Err(AppError::ConflictDetail(
             "invalid_refund_state",
@@ -196,13 +341,17 @@ pub async fn mark_refunded(
     .execute(&mut *tx)
     .await
     .context("mark refund completed")?;
-    sqlx::query(
+    let order = sqlx::query(
         "UPDATE orders SET status = 'refunded' WHERE id = $1 AND status = 'refund_pending'",
     )
     .bind(order_id)
     .execute(&mut *tx)
     .await
     .context("mark order refunded")?;
+    if order.rows_affected() != 1 {
+        // Dropping the transaction rolls the refund update back.
+        return Err(AppError::Conflict("order_state_changed"));
+    }
     audit::record(
         &mut tx,
         Some(actor),
@@ -215,10 +364,75 @@ pub async fn mark_refunded(
             "provider_reference": provider_reference,
             "order_id": order_id,
             "amount_kobo": amount,
+            "provider_attempts": marked.provider_attempts,
+            "provider_outcome_unknown": marked.provider_outcome_unknown,
         }),
     )
     .await?;
     tx.commit().await.context("commit mark refunded")?;
+    Ok(marked)
+}
+
+/// The owner handled an `amount_mismatch` or provider-flagged checkout outside
+/// the system (refunded the buyer by hand, settled it with the provider) and
+/// records that, with the reference they checked. **This moves no money and
+/// writes no ledger entry**: it only records the owner's handling, so the
+/// checkout leaves the attention lists. A provider flag still gates payouts
+/// until it is cleared (`clear-flag`). 409 `nothing_to_resolve` for a
+/// checkout that needs neither, `already_resolved` on a retry.
+pub async fn resolve_checkout(
+    db: &PgPool,
+    actor: Uuid,
+    checkout_id: Uuid,
+    note: &str,
+    provider_reference: &str,
+) -> Result<(), AppError> {
+    let mut tx = db.begin().await.context("begin")?;
+    sqlx::query(LOCK_TIMEOUT)
+        .execute(&mut *tx)
+        .await
+        .context("set lock_timeout")?;
+    let (status, flagged, resolved): (String, bool, bool) = sqlx::query_as(
+        "SELECT status::text, provider_flagged, resolved_at IS NOT NULL FROM checkouts \
+         WHERE id = $1 FOR UPDATE",
+    )
+    .bind(checkout_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(busy_err("checkout_busy", "lock checkout"))?
+    .ok_or(AppError::NotFound)?;
+    if resolved {
+        return Err(AppError::Conflict("already_resolved"));
+    }
+    if status != "amount_mismatch" && !flagged {
+        return Err(AppError::Conflict("nothing_to_resolve"));
+    }
+    sqlx::query(
+        "UPDATE checkouts SET resolved_at = now(), resolved_by = $2, \
+                resolution_reference = $3 \
+         WHERE id = $1",
+    )
+    .bind(checkout_id)
+    .bind(actor)
+    .bind(provider_reference)
+    .execute(&mut *tx)
+    .await
+    .context("resolve checkout")?;
+    audit::record(
+        &mut tx,
+        Some(actor),
+        "admin.checkout_resolved",
+        "checkout",
+        Some(checkout_id),
+        json!({
+            "prior_status": status,
+            "provider_flagged": flagged,
+            "note": note,
+            "provider_reference": provider_reference,
+        }),
+    )
+    .await?;
+    tx.commit().await.context("commit resolve")?;
     Ok(())
 }
 

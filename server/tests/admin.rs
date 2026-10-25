@@ -403,6 +403,7 @@ async fn support_gets_403_on_every_mutation_route(pool: PgPool) {
         (Method::POST, format!("/admin/payouts/{id}/requeue")),
         (Method::POST, format!("/admin/refunds/{id}/mark-refunded")),
         (Method::POST, format!("/admin/checkouts/{id}/clear-flag")),
+        (Method::POST, format!("/admin/checkouts/{id}/resolve")),
         (Method::PUT, "/admin/bank-holidays/2026-12-25".to_string()),
         (
             Method::DELETE,
@@ -1164,6 +1165,10 @@ async fn bank_holidays_are_edited_by_the_owner_and_audited(pool: PgPool) {
     assert_eq!(set.len(), 2);
     assert_eq!(set[1].1["old_name"], "Christmas Day");
     assert_eq!(audits(&app, "admin.bank_holiday_removed").await.len(), 1);
+    // The list read is audited like the other admin reads.
+    let viewed = audits(&app, "admin.viewed").await;
+    assert_eq!(viewed.len(), 1);
+    assert_eq!(viewed[0].1["view"], "bank_holidays");
 }
 
 // --------------------------------------------------------- fee snapshots
@@ -1199,4 +1204,409 @@ async fn fee_change_does_not_alter_a_paid_orders_payout(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!((amount, fee), (PAYOUT, 3_500));
+}
+
+// ------------------------------------------- fix round 1: mark-paid checks
+
+/// A released payout whose create timed out, so its outcome is `unknown`.
+/// `found`: the provider did take it (find_payout finds it).
+async fn unknown_payout(app: &TestApp, found: bool) -> (Uuid, String) {
+    if found {
+        app.fake.timeout_after_success_payout();
+    } else {
+        app.fake.fail_payout_with(ProviderError::Timeout);
+    }
+    let f = delivered_order(app).await;
+    server::escrow::release_order(
+        &app.state,
+        f.order_id,
+        server::escrow::ReleaseReason::BuyerConfirmed,
+    )
+    .await
+    .unwrap();
+    app.fake.clear_payout_failure();
+    let (id, reference, status): (Uuid, String, String) =
+        sqlx::query_as("SELECT id, reference, status::text FROM payouts")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "unknown");
+    (id, reference)
+}
+
+fn mark_paid_body() -> Value {
+    json!({ "note": "paid by bank transfer", "provider_reference": "TRF-1" })
+}
+
+#[sqlx::test]
+async fn mark_paid_on_a_payout_the_provider_paid_settles_it_normally(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, reference) = unknown_payout(&app, true).await;
+    let owner = app.owner_token().await;
+    app.fake
+        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 3_000 });
+    let finds = app.fake.calls("find_payout");
+    let statuses = app.fake.calls("payout_status");
+    let fees = balance(&app, "provider_fees").await;
+
+    let path = format!("/admin/payouts/{id}/mark-paid");
+    let res = post(&app, &owner, &path, mark_paid_body()).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["status"], "successful");
+    assert_eq!(res.json["settled_by"], "provider");
+    // Our lookup, then settle_payout's status call and its id lookup.
+    assert_eq!(app.fake.calls("find_payout"), finds + 2);
+    assert_eq!(app.fake.calls("payout_status"), statuses + 1);
+    assert_eq!(app.fake.calls("create_payout"), 1);
+    // Booked as the provider's success: the real fee, not owner-settled.
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+    assert_eq!(balance(&app, "provider_fees").await, fees + 3_000);
+    let manual: Option<String> = sqlx::query_scalar("SELECT manual_reference FROM payouts")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(manual, None);
+    assert_eq!(audits(&app, "admin.payout_marked_paid").await.len(), 0);
+    let checked = audits(&app, "admin.payout_provider_checked").await;
+    assert_eq!(checked.len(), 1);
+    assert_eq!(checked[0].0, Some(owner_id(&app).await));
+    assert_eq!(checked[0].1["outcome"], "successful");
+    assert_orders_balance(&app).await;
+    // Settled once: a retry is 409.
+    assert_code(
+        &post(&app, &owner, &path, mark_paid_body()).await,
+        409,
+        "invalid_payout_state",
+    );
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+}
+
+#[sqlx::test]
+async fn mark_paid_proceeds_when_the_provider_never_got_the_payout(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, _) = unknown_payout(&app, false).await;
+    let owner = app.owner_token().await;
+    let finds = app.fake.calls("find_payout");
+    let statuses = app.fake.calls("payout_status");
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/payouts/{id}/mark-paid"),
+        mark_paid_body(),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["settled_by"], "owner");
+    assert_eq!(app.fake.calls("find_payout"), finds + 1);
+    assert_eq!(app.fake.calls("payout_status"), statuses);
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+    let rows = audits(&app, "admin.payout_marked_paid").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1["prior_status"], "unknown");
+}
+
+#[sqlx::test]
+async fn mark_paid_is_503_when_the_provider_cannot_answer(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, _) = unknown_payout(&app, false).await;
+    let owner = app.owner_token().await;
+    app.fake
+        .fail_find_payout_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    let entries = count(&app, "SELECT count(*) FROM ledger_entries").await;
+    let statuses = app.fake.calls("payout_status");
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/payouts/{id}/mark-paid"),
+        mark_paid_body(),
+    )
+    .await;
+    assert_code(&res, 503, "provider_unavailable");
+    assert_eq!(app.fake.calls("payout_status"), statuses);
+    assert_eq!(
+        text(&app, "SELECT status::text FROM payouts").await,
+        "unknown"
+    );
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM ledger_entries").await,
+        entries
+    );
+    assert_eq!(audits(&app, "admin.payout_marked_paid").await.len(), 0);
+}
+
+#[sqlx::test]
+async fn mark_paid_on_a_payout_the_provider_failed_is_409_then_allowed(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, reference) = unknown_payout(&app, true).await;
+    let owner = app.owner_token().await;
+    app.fake
+        .set_payout_state(&reference, PayoutState::Failed { reason: "x".into() });
+    let path = format!("/admin/payouts/{id}/mark-paid");
+    let res = post(&app, &owner, &path, mark_paid_body()).await;
+    assert_code(&res, 409, "invalid_payout_state");
+    assert!(
+        res.json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("failed")
+    );
+    assert_eq!(balance(&app, "seller_paid").await, 0);
+    // Confirmed never paid: the owner may now record a hand payment.
+    let res = post(&app, &owner, &path, mark_paid_body()).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["settled_by"], "owner");
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+    assert_orders_balance(&app).await;
+}
+
+#[sqlx::test]
+async fn mark_paid_refuses_a_payout_still_pending_at_the_provider(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, _) = unknown_payout(&app, true).await;
+    let owner = app.owner_token().await;
+    // The fake answers Pending by default.
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/payouts/{id}/mark-paid"),
+        mark_paid_body(),
+    )
+    .await;
+    assert_code(&res, 409, "payout_pending_at_provider");
+    assert_eq!(balance(&app, "seller_paid").await, 0);
+}
+
+/// M8: mark-paid racing a send that claims the same unknown payout.
+#[sqlx::test]
+async fn mark_paid_racing_a_send_acts_once(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, _) = unknown_payout(&app, false).await;
+    let owner = app.owner_token().await;
+    exec(&app, "UPDATE payouts SET next_attempt_at = NULL").await;
+    let creates = app.fake.calls("create_payout");
+    app.fake
+        .delay_next_payout(std::time::Duration::from_millis(300));
+    let path = format!("/admin/payouts/{id}/mark-paid");
+    let (sent, res) = tokio::join!(
+        server::escrow::send_payout(&app.state, id),
+        post(&app, &owner, &path, mark_paid_body()),
+    );
+    let sent = sent.unwrap();
+    let created = app.fake.calls("create_payout") - creates;
+    let owner_won = res.status == 200;
+    assert!(
+        owner_won ^ (created == 1),
+        "exactly one wins: mark-paid {} {}, creates {created}, send {}",
+        res.status,
+        res.json,
+        sent.status
+    );
+    if owner_won {
+        assert_eq!(sent.status, "successful");
+    } else {
+        assert_eq!(res.status, 409, "{}", res.json);
+        assert_eq!(sent.status, "pending");
+    }
+    assert!(
+        count(
+            &app,
+            "SELECT count(*) FROM ledger_postings WHERE kind = 'payout_success'"
+        )
+        .await
+            <= 1
+    );
+    assert!(balance(&app, "seller_paid").await <= PAYOUT);
+    assert_orders_balance(&app).await;
+}
+
+// -------------------------------------------- fix round 1: checkout resolve
+
+#[sqlx::test]
+async fn resolving_a_checkout_takes_it_off_the_lists(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let flagged = paid_order(&app, true).await;
+    let mismatched = mismatched_checkout(&app, BUYER_2, flagged.variant_id).await;
+    let owner = app.owner_token().await;
+    let entries = count(&app, "SELECT count(*) FROM ledger_entries").await;
+    let body = json!({ "note": "refunded by hand", "provider_reference": "NIP-42" });
+
+    for id in [mismatched, flagged.checkout_id] {
+        let path = format!("/admin/checkouts/{id}/resolve");
+        let res = post(&app, &owner, &path, body.clone()).await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(res.json["resolved"], true);
+        // A retry acts once.
+        assert_code(
+            &post(&app, &owner, &path, body.clone()).await,
+            409,
+            "already_resolved",
+        );
+    }
+    for which in ["amount_mismatch", "flagged"] {
+        let res = get(&app, &owner, &format!("/admin/checkouts?status={which}")).await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(res.json["items"].as_array().unwrap().len(), 0, "{which}");
+    }
+    let res = get(&app, &owner, "/admin/reconciliation").await;
+    assert_eq!(res.json["flagged_checkouts"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        res.json["mismatched_checkouts"].as_array().unwrap().len(),
+        0
+    );
+    // Only the owner's handling is recorded: no money moves.
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM ledger_entries").await,
+        entries
+    );
+    let rows = audits(&app, "admin.checkout_resolved").await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, Some(owner_id(&app).await));
+    assert_eq!(rows[0].1["prior_status"], "amount_mismatch");
+    assert_eq!(rows[0].1["provider_reference"], "NIP-42");
+    assert_eq!(rows[1].1["provider_flagged"], true);
+}
+
+#[sqlx::test]
+async fn resolve_refuses_a_checkout_needing_nothing(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app, false).await;
+    let owner = app.owner_token().await;
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/checkouts/{}/resolve", f.checkout_id),
+        json!({ "note": "n", "provider_reference": "R1" }),
+    )
+    .await;
+    assert_code(&res, 409, "nothing_to_resolve");
+    assert_eq!(audits(&app, "admin.checkout_resolved").await.len(), 0);
+}
+
+// ------------------------------------------------ fix round 1: support views
+
+#[sqlx::test]
+async fn support_does_not_see_hold_reasons(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = delivered_order(&app).await;
+    let owner = app.owner_token().await;
+    let support = app.make_support().await;
+    exec(
+        &app,
+        "UPDATE orders SET backstop_at = now() - interval '1 minute'",
+    )
+    .await;
+    server::escrow::jobs::run_due_jobs(&app.state).await;
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/orders/{}/hold", f.order_id),
+        json!({ "reason": "buyer says the item is fake" }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    let res = get(&app, &owner, "/admin/orders/backstop").await;
+    assert_eq!(
+        res.json["items"][0]["hold_reason"],
+        "buyer says the item is fake"
+    );
+    let res = get(&app, &support, "/admin/orders/backstop").await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let item = &res.json["items"][0];
+    assert_eq!(item["held"], true);
+    assert!(item.get("hold_reason").is_none(), "{item}");
+    assert!(!res.json.to_string().contains("fake"));
+    let res = get(&app, &support, "/admin/reconciliation").await;
+    assert!(!res.json.to_string().contains("fake"));
+}
+
+// ------------------------------------------ fix round 1: refunds and notes
+
+#[sqlx::test]
+async fn mark_refunded_flags_an_unknown_provider_outcome(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app, false).await;
+    let owner = app.owner_token().await;
+    app.fake.set_refund_supported(true);
+    app.fake.fail_refund_with(ProviderError::Timeout);
+    server::escrow::refund::refund_order(&app.state, f.order_id, true)
+        .await
+        .unwrap();
+    // Out of sends: the job escalates it to manual.
+    exec(&app, "UPDATE refunds SET attempts = 8").await;
+    server::escrow::jobs::run_due_jobs(&app.state).await;
+    assert_eq!(
+        text(&app, "SELECT status::text FROM refunds").await,
+        "manual"
+    );
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM refunds")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/refunds/{id}/mark-refunded"),
+        json!({ "note": "paid back by hand", "provider_reference": "NIP-9" }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["status"], "completed");
+    assert_eq!(res.json["provider_attempts"], 8);
+    assert_eq!(res.json["provider_outcome_unknown"], true);
+    let rows = audits(&app, "admin.refund_marked_refunded").await;
+    assert_eq!(rows[0].1["provider_attempts"], 8);
+    assert_eq!(rows[0].1["provider_outcome_unknown"], true);
+}
+
+#[sqlx::test]
+async fn mark_refunded_refuses_when_the_order_moved(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app, false).await;
+    let owner = app.owner_token().await;
+    // Default fake: NotSupported -> manual.
+    server::escrow::refund::refund_order(&app.state, f.order_id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        text(&app, "SELECT status::text FROM refunds").await,
+        "manual"
+    );
+    exec(&app, "UPDATE orders SET status = 'refunded'").await;
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM refunds")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/refunds/{id}/mark-refunded"),
+        json!({ "note": "n", "provider_reference": "R1" }),
+    )
+    .await;
+    assert_code(&res, 409, "order_state_changed");
+    // Rolled back.
+    assert_eq!(
+        text(&app, "SELECT status::text FROM refunds").await,
+        "manual"
+    );
+    assert_eq!(audits(&app, "admin.refund_marked_refunded").await.len(), 0);
+}
+
+#[sqlx::test]
+async fn overrides_refuse_account_numbers_in_any_spelling(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let owner = app.owner_token().await;
+    let path = format!("/admin/payouts/{}/mark-paid", Uuid::new_v4());
+    for body in [
+        json!({ "note": "paid to 0123 456 785", "provider_reference": "R1" }),
+        json!({ "note": "paid to 012-345-6785", "provider_reference": "R1" }),
+        json!({ "note": "paid", "provider_reference": ACCOUNT_NUMBER }),
+    ] {
+        assert_code(
+            &post(&app, &owner, &path, body).await,
+            422,
+            "validation_failed",
+        );
+    }
 }
