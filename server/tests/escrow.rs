@@ -806,6 +806,79 @@ async fn timeout_then_lookup_not_found_recreates_with_same_reference(pool: PgPoo
     assert!(sent.iter().all(|r| r.reference == p.reference));
 }
 
+/// Through the real Mono adapter (mock server): a payout whose create timed
+/// out is looked up; an empty list (unconfirmed filter, REVISIT(Q5,Q6)) keeps
+/// it `unknown` and never re-creates it.
+#[sqlx::test]
+async fn mono_empty_lookup_never_recreates_the_payout(pool: PgPool) {
+    use server::payments::{
+        ProviderRegistry,
+        mono::{AmountUnit, MonoConfig, MonoProvider, Secret},
+    };
+    use std::{sync::Arc, time::Duration};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let app = TestApp::new(pool).await;
+    let f = picked_up_order(&app, 10_000, 10, true).await;
+    app.fake.fail_payout_with(ProviderError::Timeout);
+    release(&app, &f).await;
+    let p = payout(&app).await;
+    assert_eq!(p.status, "unknown");
+    // Hand the payout to Mono, served by a mock that lists nothing.
+    exec(&app, "UPDATE payouts SET provider = 'mono'").await;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v3/payments/disburse/disbursements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "status": "successful",
+            "data": []
+        })))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v3/payments/disburse/disbursements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": {"id": "dup"}})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mono = MonoProvider::new(MonoConfig {
+        secret_key: Secret::new("test_sk_engine"),
+        webhook_secret: Secret::new("whsec_engine"),
+        base_url: server.uri(),
+        live: false,
+        directpay_unit: AmountUnit::Kobo,
+        disburse_unit: Some(AmountUnit::Kobo),
+        disburse_source_account: Some("688a0b672f88771f77d05cf5".into()),
+        payout_recipient_email: Some("payouts@platform.test".into()),
+        connect_timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(15),
+        insecure_http_for_tests: true,
+    })
+    .unwrap();
+    let mut providers = ProviderRegistry::new();
+    providers.register(Arc::new(mono));
+    let mut state = app.state.clone();
+    state.providers = Arc::new(providers);
+
+    for _ in 0..3 {
+        make_due(&app).await;
+        let out = send_payout(&state, p.id).await.unwrap();
+        assert_ne!(out.status, "pending", "never created on an empty lookup");
+    }
+    let after = payout(&app).await;
+    assert!(
+        matches!(after.status.as_str(), "unknown" | "manual"),
+        "{}",
+        after.status
+    );
+    assert_eq!(after.provider_payout_id, None);
+    // `expect(0)` on the POST is verified when the server drops.
+}
+
 #[sqlx::test]
 async fn expired_sending_lease_is_treated_as_unknown(pool: PgPool) {
     let app = TestApp::new(pool).await;

@@ -44,6 +44,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 const SECRET_HEADER: &str = "mono-sec-key";
+/// Largest response body read; anything longer is treated like a failed read.
+pub const MAX_RESPONSE_BODY: usize = 512 * 1024;
 const WEBHOOK_SECRET_HEADER: &str = "mono-webhook-secret";
 
 /// Hosts Mono's hosted payment pages are served from (exact host or a
@@ -274,12 +276,38 @@ impl MonoProvider {
         if let Some(body) = body {
             req = req.json(body);
         }
-        let res = req.send().await.map_err(|e| transport_error(op, call, e))?;
+        let mut res = req.send().await.map_err(|e| transport_error(op, call, e))?;
         let status = res.status();
-        let bytes = res
-            .bytes()
+        // Capped read: an oversize body is a failed read (outcome unknown for a write).
+        let oversize = || {
+            tracing::warn!(
+                provider = MONO_NAME,
+                op,
+                cause = "body_too_large",
+                "mono call failed"
+            );
+            match call {
+                Call::Write => ProviderError::Timeout,
+                Call::Read => ProviderError::Unavailable(anyhow!("mono body too large")),
+            }
+        };
+        if res
+            .content_length()
+            .is_some_and(|n| n > MAX_RESPONSE_BODY as u64)
+        {
+            return Err(oversize());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = res
+            .chunk()
             .await
-            .map_err(|e| transport_error(op, call, e))?;
+            .map_err(|e| transport_error(op, call, e))?
+        {
+            if bytes.len() + chunk.len() > MAX_RESPONSE_BODY {
+                return Err(oversize());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         let body = serde_json::from_slice::<Value>(&bytes).ok();
         Ok(Answer { status, body })
     }
@@ -445,6 +473,20 @@ fn safe_message(body: Option<&Value>) -> String {
     }
 }
 
+/// A refused create that may hide an earlier, successful attempt.
+fn is_possible_duplicate(answer: &Answer) -> bool {
+    if matches!(answer.status.as_u16(), 408 | 409 | 425) {
+        return true;
+    }
+    answer.status.is_client_error()
+        && answer
+            .body
+            .as_ref()
+            .and_then(|b| str_at(b, "message"))
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|m| m.contains("duplicate") || m.contains("already exist"))
+}
+
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
@@ -557,6 +599,16 @@ impl PaymentProvider for MonoProvider {
         let Some(data) = body.get("data").filter(|d| d.is_object()) else {
             return Ok(PaymentStatus::Pending);
         };
+        // A payment from the other mode (sandbox vs live) is never acted on.
+        if bool_at(data, &["livemode", "liveMode"]).is_some_and(|l| l != self.cfg.live) {
+            tracing::warn!(
+                provider = MONO_NAME,
+                op = OP,
+                cause = "livemode_mismatch",
+                "mono payment from the other mode; pending"
+            );
+            return Ok(PaymentStatus::Pending);
+        }
         let status = str_at(data, "status")
             .unwrap_or_default()
             .to_ascii_lowercase();
@@ -617,8 +669,20 @@ impl PaymentProvider for MonoProvider {
             .call(OP, Call::Write, Method::POST, url, Some(&body))
             .await?;
         if !answer.status.is_success() {
-            // A duplicate reference comes back here as Rejected: never treated
-            // as success until Mono confirms it is an idempotent replay (Q5).
+            // REVISIT(Q5): a duplicate reference may mean an earlier attempt
+            // went through. Until Mono documents its answer, 408/409/425 and
+            // any "duplicate" / "already exist" refusal are an unknown outcome
+            // (looked up, never re-created), not Rejected.
+            if is_possible_duplicate(&answer) {
+                tracing::warn!(
+                    provider = MONO_NAME,
+                    op = OP,
+                    status = answer.status.as_u16(),
+                    cause = "possible_duplicate",
+                    "mono call failed"
+                );
+                return Err(ProviderError::Timeout);
+            }
             return Err(status_error(OP, Call::Write, &answer));
         }
         let id = answer
@@ -645,6 +709,8 @@ impl PaymentProvider for MonoProvider {
         let (unit, _, _) = self.disburse()?;
         let id = match provider_payout_id {
             Some(id) => id.to_string(),
+            // find_payout never answers None today (fail closed); the arm
+            // stays for when the lookup is confirmed.
             None => match self.find_payout(reference).await? {
                 Some(handle) => handle.provider_payout_id,
                 None => return Ok(PayoutState::Pending),
@@ -658,11 +724,11 @@ impl PaymentProvider for MonoProvider {
     ///
     /// **Unconfirmed** (research Q6): whether the list accepts a `reference`
     /// filter, and where the array sits (`data`, or `data.disbursements` /
-    /// `data.items`). So: a match on the page -> found; an empty list -> absent
-    /// (filtered to nothing, or no disbursements at all); a page of other
-    /// disbursements -> an error, because the filter may have been ignored and
-    /// ours may be on a later page. Reporting "absent" there could allow a
-    /// second create (double payout).
+    /// `data.items`), and whether in-flight disbursements are listed. So only a
+    /// match on the page is conclusive (found). An empty list or a page of
+    /// other disbursements is an error (`Timeout`, outcome unknown): this
+    /// adapter never reports "absent", because that would let the engine
+    /// create the payout a second time (double payout).
     async fn find_payout(&self, reference: &str) -> Result<Option<PayoutHandle>, ProviderError> {
         const OP: &str = "find_payout";
         self.disburse()?;
@@ -693,17 +759,22 @@ impl PaymentProvider for MonoProvider {
                 })
                 .ok_or_else(|| unparseable(OP));
         }
-        if items.is_empty() {
-            Ok(None)
-        } else {
-            tracing::warn!(
-                provider = MONO_NAME,
-                op = OP,
-                cause = "inconclusive_page",
-                "mono call failed"
-            );
-            Err(ProviderError::Timeout)
-        }
+        // REVISIT(Q5,Q6): fail closed. Until Mono confirms that `?reference=`
+        // filters the list and that in-flight disbursements are listed, an
+        // empty list is not proof of absence: returning None would let the
+        // engine create the payout a second time. The engine keeps the payout
+        // `unknown` and sends it to manual after its lookup cap.
+        tracing::warn!(
+            provider = MONO_NAME,
+            op = OP,
+            cause = if items.is_empty() {
+                "empty_list"
+            } else {
+                "inconclusive_page"
+            },
+            "mono call failed"
+        );
+        Err(ProviderError::Timeout)
     }
 
     /// Not supported: Mono has a v2 "Refund Payment" endpoint keyed by the
@@ -762,9 +833,10 @@ impl PaymentProvider for MonoProvider {
 
         let event_id = match id_at(&v, "event_id") {
             Some(id) => id,
-            // Unconfirmed whether Disburse events carry `event_id`; a stable
-            // synthetic id keeps them deduplicated per event and payout.
-            None => match (is_payout, reference) {
+            // Unconfirmed whether every event carries `event_id`; a stable
+            // synthetic id keeps payment and payout events deduplicated per
+            // event name and reference instead of dropping them.
+            None => match (is_payment || is_payout, reference) {
                 (true, Some(r)) => format!("{event}:{r}"),
                 _ => return Err(malformed()),
             },

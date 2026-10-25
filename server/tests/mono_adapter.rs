@@ -332,6 +332,59 @@ async fn verify_failed_with_payment_not_found_is_pending() {
 }
 
 #[tokio::test]
+async fn verify_400_not_found_is_pending() {
+    let server = MockServer::start().await;
+    mount_verify(
+        &server,
+        400,
+        json!({"status": "failed", "message": "Invalid reference, payment not found", "data": null}),
+    )
+    .await;
+    assert_eq!(
+        provider(&server)
+            .verify_payment("CHK1ABCDEFGHIJKLMNOPQRST")
+            .await
+            .unwrap(),
+        PaymentStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn verify_livemode_mismatch_is_pending() {
+    // A sandbox payment seen by a live provider, and the reverse.
+    let server = MockServer::start().await;
+    mount_verify(
+        &server,
+        200,
+        verify_body("successful", json!({"liveMode": false})),
+    )
+    .await;
+    let mut live = config(&server.uri());
+    live.live = true;
+    assert_eq!(
+        MonoProvider::new(live)
+            .unwrap()
+            .verify_payment("CHK1ABCDEFGHIJKLMNOPQRST")
+            .await
+            .unwrap(),
+        PaymentStatus::Pending
+    );
+    let server = MockServer::start().await;
+    let mut body = verify_body("successful", json!({}));
+    let data = body["data"].as_object_mut().unwrap();
+    data.remove("liveMode");
+    data.insert("livemode".into(), json!(true));
+    mount_verify(&server, 200, body).await;
+    assert_eq!(
+        provider(&server)
+            .verify_payment("CHK1ABCDEFGHIJKLMNOPQRST")
+            .await
+            .unwrap(),
+        PaymentStatus::Pending
+    );
+}
+
+#[tokio::test]
 async fn verify_explicit_failed_is_failed() {
     let server = MockServer::start().await;
     let mut body = verify_body("failed", json!({}));
@@ -747,16 +800,20 @@ async fn find_payout_by_reference() {
             provider_payout_id: "6745ab12cd".into()
         })
     );
+}
 
+#[tokio::test]
+async fn find_payout_empty_list_is_not_proof_of_absence() {
+    // REVISIT(Q5,Q6): until Mono confirms the filter and that in-flight
+    // disbursements are listed, an empty list is an unknown outcome.
     let server = MockServer::start().await;
     mount_list(&server, json!([])).await;
-    assert_eq!(
+    assert!(matches!(
         provider(&server)
             .find_payout("PO12345678901234567890")
-            .await
-            .unwrap(),
-        None
-    );
+            .await,
+        Err(ProviderError::Timeout)
+    ));
 }
 
 #[tokio::test]
@@ -803,15 +860,75 @@ async fn payout_status_without_id_looks_the_payout_up_first() {
         PayoutState::Successful { fee_kobo: 3500 }
     );
 
+    // No id and an empty lookup: the status cannot be known.
     let server = MockServer::start().await;
     mount_list(&server, json!([])).await;
-    assert_eq!(
+    assert!(
         provider(&server)
             .payout_status("PO12345678901234567890", None)
             .await
-            .unwrap(),
-        PayoutState::Pending
+            .is_err()
     );
+}
+
+#[tokio::test]
+async fn create_payout_possible_duplicate_is_unknown_not_rejected() {
+    let cases = [
+        (409, json!({"status": "failed", "message": "Conflict"})),
+        (408, json!({})),
+        (425, json!({})),
+        (
+            400,
+            json!({"status": "failed", "message": "Duplicate reference"}),
+        ),
+        (
+            422,
+            json!({"status": "failed", "message": "Reference ALREADY EXISTS"}),
+        ),
+        (
+            400,
+            json!({"status": "failed", "message": "Disbursement already existed"}),
+        ),
+    ];
+    for (code, body) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v3/payments/disburse/disbursements"))
+            .respond_with(ResponseTemplate::new(code).set_body_json(body.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(
+            matches!(
+                provider(&server).create_payout(payout_req()).await,
+                Err(ProviderError::Timeout)
+            ),
+            "{code} {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn oversize_bodies_are_failed_reads() {
+    let big = "x".repeat(server::payments::mono::MAX_RESPONSE_BODY + 1);
+    let server = MockServer::start().await;
+    mount_verify(&server, 200, json!({ "status": "successful", "pad": big })).await;
+    Mock::given(method("POST"))
+        .and(path("/v3/payments/disburse/disbursements"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "data": {"id": "x"}, "pad": big })),
+        )
+        .mount(&server)
+        .await;
+    let mono = provider(&server);
+    assert!(matches!(
+        mono.verify_payment("CHK1ABCDEFGHIJKLMNOPQRST").await,
+        Err(ProviderError::Unavailable(_))
+    ));
+    assert!(matches!(
+        mono.create_payout(payout_req()).await,
+        Err(ProviderError::Timeout)
+    ));
 }
 
 // ---------------------------------------------------- refunds and lookups
@@ -1032,6 +1149,43 @@ fn webhook_livemode_must_match_configured_mode() {
         hook(&test_mode, &camel).unwrap(),
         WebhookEvent::Ignored { .. }
     ));
+}
+
+#[test]
+fn webhook_livemode_mismatch_on_transaction_event_is_ignored() {
+    let mono = MonoProvider::new(config("http://127.0.0.1:1")).unwrap();
+    for key in ["livemode", "liveMode"] {
+        let mut body = transaction_event("event.disbursement.transaction.successful");
+        body["data"][key] = json!(true);
+        assert_eq!(
+            hook(&mono, &body).unwrap(),
+            WebhookEvent::Ignored {
+                event_id: "evt_02".into()
+            },
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn webhook_payment_event_without_event_id_gets_a_stable_one() {
+    let mono = MonoProvider::new(config("http://127.0.0.1:1")).unwrap();
+    let mut body = payment_event("direct_debit.payment_successful", false);
+    body.as_object_mut().unwrap().remove("event_id");
+    let first = hook(&mono, &body).unwrap();
+    assert_eq!(first, hook(&mono, &body).unwrap());
+    let WebhookEvent::Payment {
+        event_id,
+        reference,
+    } = first
+    else {
+        panic!("expected payment")
+    };
+    assert_eq!(reference, "CHK1ABCDEFGHIJKLMNOPQRST");
+    assert_eq!(
+        event_id,
+        "direct_debit.payment_successful:CHK1ABCDEFGHIJKLMNOPQRST"
+    );
 }
 
 #[test]

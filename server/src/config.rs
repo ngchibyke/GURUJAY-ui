@@ -69,7 +69,7 @@ fn redirect_url(raw: Option<String>, dev: bool) -> Result<String> {
 /// - `MONO_BASE_URL` is not https;
 /// - `MONO_DIRECTPAY_AMOUNT_UNIT` (default `kobo`) or
 ///   `MONO_DISBURSE_AMOUNT_UNIT` is set to anything but `kobo` / `naira`;
-/// - in live mode: the key is a `test_sk_` key, or `MONO_DISBURSE_AMOUNT_UNIT`,
+/// - in live mode: the key does not start with `live_sk_`, or `MONO_DISBURSE_AMOUNT_UNIT`,
 ///   `MONO_DISBURSE_SOURCE_ACCOUNT` or `MONO_PAYOUT_RECIPIENT_EMAIL` is missing;
 /// - outside live mode: the key is a `live_sk_` key.
 ///
@@ -84,8 +84,9 @@ fn mono_config(var: &impl Fn(&str) -> Option<String>, live: bool) -> Result<Opti
     let Some(secret_key) = get("MONO_SECRET_KEY") else {
         return Ok(None);
     };
-    if live && secret_key.starts_with("test_sk_") {
-        bail!("MONO_SECRET_KEY is a test key but APP_ENV is production");
+    // Fail closed: production accepts only a key that says it is live.
+    if live && !secret_key.starts_with("live_sk_") {
+        bail!("MONO_SECRET_KEY must be a live key (live_sk_) when APP_ENV is production");
     }
     if !live && secret_key.starts_with("live_sk_") {
         bail!("MONO_SECRET_KEY is a live key but APP_ENV is not production");
@@ -315,7 +316,15 @@ mod tests {
         let mut test_key_in_prod = without(MONO_LIVE, "MONO_SECRET_KEY");
         test_key_in_prod.push(("MONO_SECRET_KEY", "test_sk_abcdef"));
         let err = load(&test_key_in_prod).unwrap_err();
-        assert!(err.to_string().contains("test key"), "{err}");
+        assert!(err.to_string().contains("live key"), "{err}");
+        // Anything that does not say live is refused in production.
+        for key in ["sk_abcdef", "LIVE_SK_abc", "abc_live_sk_"] {
+            let mut env = without(MONO_LIVE, "MONO_SECRET_KEY");
+            env.push(("MONO_SECRET_KEY", key));
+            let err = load(&env).unwrap_err().to_string();
+            assert!(err.contains("live key"), "{key}: {err}");
+            assert!(!err.contains(key), "{key}: value echoed");
+        }
         let err = load(&[
             ("MONO_SECRET_KEY", "live_sk_abcdef"),
             ("MONO_WEBHOOK_SECRET", "whsec"),

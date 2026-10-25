@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         }
         None => tracing::warn!("MONO_SECRET_KEY not set: no payment provider is configured"),
     }
+    require_payment_provider(&config.app_env, config.mono.is_some())?;
 
     let state = AppState {
         db,
@@ -156,6 +157,15 @@ async fn shutdown_signal() {
     }
 }
 
+/// Production refuses to start without a payment provider: every checkout
+/// would fail and webhooks would 404.
+fn require_payment_provider(app_env: &str, mono_configured: bool) -> anyhow::Result<()> {
+    if app_env == "production" && !mono_configured {
+        bail!("APP_ENV is production but no payment provider is configured (set MONO_SECRET_KEY)");
+    }
+    Ok(())
+}
+
 fn flag(args: &[String], name: &str) -> anyhow::Result<String> {
     let pos = args
         .iter()
@@ -208,6 +218,16 @@ mod tests {
             panic!("expected create-owner")
         };
         assert_eq!(rest, args(&["--phone", "080", "--name", "N"]));
+    }
+
+    #[test]
+    fn production_requires_a_payment_provider() {
+        let err = require_payment_provider("production", false).unwrap_err();
+        assert!(err.to_string().contains("MONO_SECRET_KEY"), "{err}");
+        assert!(require_payment_provider("production", true).is_ok());
+        for env in ["development", "test", "staging"] {
+            assert!(require_payment_provider(env, false).is_ok(), "{env}");
+        }
     }
 
     #[test]
