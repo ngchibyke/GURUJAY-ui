@@ -118,6 +118,12 @@ pub enum ProviderError {
     Timeout,
     /// A webhook's signature/secret did not match.
     InvalidSignature,
+    /// A payout lookup reached the provider, but its answer cannot tell
+    /// whether our payout exists (e.g. an empty or unfiltered list). Automatic
+    /// paths treat it exactly like [`Timeout`](Self::Timeout) and never
+    /// re-create; only an owner who checked the provider's dashboard may act
+    /// on it (attested mark-paid / re-queue).
+    Inconclusive,
 }
 
 impl ProviderError {
@@ -128,6 +134,7 @@ impl ProviderError {
             ProviderError::Unavailable(_) => "unavailable",
             ProviderError::Timeout => "timed out",
             ProviderError::InvalidSignature => "invalid webhook signature",
+            ProviderError::Inconclusive => "inconclusive lookup",
         }
     }
 }
@@ -146,6 +153,7 @@ impl fmt::Debug for ProviderError {
             ProviderError::Unavailable(_) => f.write_str("Unavailable(..)"),
             ProviderError::Timeout => f.write_str("Timeout"),
             ProviderError::InvalidSignature => f.write_str("InvalidSignature"),
+            ProviderError::Inconclusive => f.write_str("Inconclusive"),
         }
     }
 }
@@ -160,7 +168,8 @@ impl From<ProviderError> for AppError {
             ProviderError::InvalidSignature => AppError::InvalidSignature,
             ProviderError::Rejected { .. }
             | ProviderError::Unavailable(_)
-            | ProviderError::Timeout => AppError::ProviderUnavailable,
+            | ProviderError::Timeout
+            | ProviderError::Inconclusive => AppError::ProviderUnavailable,
         }
     }
 }

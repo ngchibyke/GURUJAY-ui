@@ -842,6 +842,55 @@ async fn reversal_requires_reverification_and_requeue_mints_a_new_reference(pool
 }
 
 #[sqlx::test]
+async fn requeue_inconclusive_lookup_needs_the_owners_attestation(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (f, payout_id, old_ref) = reversed_payout(&app).await;
+    let owner = app.owner_token().await;
+    let view = get(
+        &app,
+        &owner,
+        &format!("/admin/stores/{}/payout-account", f.store_id),
+    )
+    .await;
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/stores/{}/payout-account/verify", f.store_id),
+        json!({ "account_name": "ADA OBI", "changed_at": view.json["changed_at"] }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    app.fake
+        .fail_payout_status_with(ProviderError::Inconclusive);
+    let path = format!("/admin/payouts/{payout_id}/requeue");
+
+    // Without attestation: 409, same reference, nothing sent.
+    let res = post(&app, &owner, &path, json!({ "note": "seller fixed it" })).await;
+    assert_code(&res, 409, "provider_lookup_inconclusive");
+    assert_eq!(text(&app, "SELECT reference FROM payouts").await, old_ref);
+    assert_eq!(app.fake.calls("create_payout"), 1);
+    assert_eq!(audits(&app, "admin.payout_requeued").await.len(), 0);
+
+    // With attestation: a new reference, sent, and the attestation audited.
+    let res = post(
+        &app,
+        &owner,
+        &path,
+        json!({ "note": "checked Mono dashboard: not paid", "attest_provider_checked": true }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let new_ref = res.json["reference"].as_str().unwrap().to_string();
+    assert_ne!(new_ref, old_ref);
+    assert_eq!(app.fake.calls("create_payout"), 2);
+    let rows = audits(&app, "admin.payout_requeued").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1["attested"], true);
+    assert_eq!(rows[0].1["lookup"], "inconclusive");
+    assert_eq!(rows[0].1["previous_reference"], old_ref);
+}
+
+#[sqlx::test]
 async fn requeue_needs_a_reversal(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let owner = app.owner_token().await;
@@ -1332,6 +1381,73 @@ async fn mark_paid_is_503_when_the_provider_cannot_answer(pool: PgPool) {
         entries
     );
     assert_eq!(audits(&app, "admin.payout_marked_paid").await.len(), 0);
+}
+
+#[sqlx::test]
+async fn mark_paid_inconclusive_lookup_needs_the_owners_attestation(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, _) = unknown_payout(&app, false).await;
+    let owner = app.owner_token().await;
+    app.fake.fail_find_payout_with(ProviderError::Inconclusive);
+    let entries = count(&app, "SELECT count(*) FROM ledger_entries").await;
+    let path = format!("/admin/payouts/{id}/mark-paid");
+
+    // Without attestation: 409 and nothing changes.
+    let res = post(&app, &owner, &path, mark_paid_body()).await;
+    assert_code(&res, 409, "provider_lookup_inconclusive");
+    let mut declined = mark_paid_body();
+    declined["attest_provider_checked"] = json!(false);
+    assert_code(
+        &post(&app, &owner, &path, declined).await,
+        409,
+        "provider_lookup_inconclusive",
+    );
+    assert_eq!(
+        text(&app, "SELECT status::text FROM payouts").await,
+        "unknown"
+    );
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM ledger_entries").await,
+        entries
+    );
+    assert_eq!(audits(&app, "admin.payout_marked_paid").await.len(), 0);
+    assert_eq!(app.fake.calls("create_payout"), 1);
+
+    // With attestation: the owner's payment is recorded and audited as such.
+    let mut body = mark_paid_body();
+    body["attest_provider_checked"] = json!(true);
+    let res = post(&app, &owner, &path, body).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["status"], "successful");
+    assert_eq!(res.json["settled_by"], "owner");
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+    let rows = audits(&app, "admin.payout_marked_paid").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, Some(owner_id(&app).await));
+    assert_eq!(rows[0].1["attested"], true);
+    assert_eq!(rows[0].1["lookup"], "inconclusive");
+    assert_eq!(app.fake.calls("create_payout"), 1, "never re-created");
+    assert_orders_balance(&app).await;
+}
+
+#[sqlx::test]
+async fn mark_paid_audit_records_no_attestation_when_lookup_was_conclusive(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, _) = unknown_payout(&app, false).await;
+    let owner = app.owner_token().await;
+    let mut body = mark_paid_body();
+    body["attest_provider_checked"] = json!(true);
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/payouts/{id}/mark-paid"),
+        body,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let rows = audits(&app, "admin.payout_marked_paid").await;
+    assert_eq!(rows[0].1["attested"], false);
+    assert_eq!(rows[0].1["lookup"], "absent");
 }
 
 #[sqlx::test]

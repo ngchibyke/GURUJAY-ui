@@ -162,6 +162,17 @@ async fn receive(
             SettlePayoutOutcome::RetryLater => {
                 Err(AppError::Unavailable("payout_status_unavailable"))
             }
+            // Retrying cannot settle it (the owner must): 200 so the provider
+            // stops, but the event stays unprocessed so a later delivery is
+            // handled again.
+            SettlePayoutOutcome::Inconclusive => {
+                tracing::warn!(
+                    provider = name,
+                    cause = "payout_lookup_inconclusive",
+                    "payout webhook not settled"
+                );
+                Ok(status("received"))
+            }
             _ => {
                 sqlx::query(
                     "UPDATE provider_events SET processed_at = now() \

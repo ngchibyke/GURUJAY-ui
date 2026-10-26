@@ -726,7 +726,7 @@ impl PaymentProvider for MonoProvider {
     /// filter, and where the array sits (`data`, or `data.disbursements` /
     /// `data.items`), and whether in-flight disbursements are listed. So only a
     /// match on the page is conclusive (found). An empty list or a page of
-    /// other disbursements is an error (`Timeout`, outcome unknown): this
+    /// other disbursements is [`ProviderError::Inconclusive`]: this
     /// adapter never reports "absent", because that would let the engine
     /// create the payout a second time (double payout).
     async fn find_payout(&self, reference: &str) -> Result<Option<PayoutHandle>, ProviderError> {
@@ -763,7 +763,8 @@ impl PaymentProvider for MonoProvider {
         // filters the list and that in-flight disbursements are listed, an
         // empty list is not proof of absence: returning None would let the
         // engine create the payout a second time. The engine keeps the payout
-        // `unknown` and sends it to manual after its lookup cap.
+        // `unknown` and sends it to manual after its lookup cap; an owner may
+        // close it with an attested mark-paid / re-queue.
         tracing::warn!(
             provider = MONO_NAME,
             op = OP,
@@ -772,9 +773,9 @@ impl PaymentProvider for MonoProvider {
             } else {
                 "inconclusive_page"
             },
-            "mono call failed"
+            "mono lookup inconclusive"
         );
-        Err(ProviderError::Timeout)
+        Err(ProviderError::Inconclusive)
     }
 
     /// Not supported: Mono has a v2 "Refund Payment" endpoint keyed by the
@@ -835,7 +836,8 @@ impl PaymentProvider for MonoProvider {
             Some(id) => id,
             // Unconfirmed whether every event carries `event_id`; a stable
             // synthetic id keeps payment and payout events deduplicated per
-            // event name and reference instead of dropping them.
+            // event name and reference instead of dropping them. Merging two
+            // deliveries is safe: settlement re-verifies with Mono each time.
             None => match (is_payment || is_payout, reference) {
                 (true, Some(r)) => format!("{event}:{r}"),
                 _ => return Err(malformed()),

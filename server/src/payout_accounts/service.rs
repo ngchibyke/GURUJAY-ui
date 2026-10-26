@@ -323,7 +323,8 @@ async fn decide(
         }
         Err(ProviderError::Unavailable(_))
         | Err(ProviderError::Timeout)
-        | Err(ProviderError::InvalidSignature) => Ok(Decision::pending("lookup_unavailable", None)),
+        | Err(ProviderError::InvalidSignature)
+        | Err(ProviderError::Inconclusive) => Ok(Decision::pending("lookup_unavailable", None)),
     }
 }
 

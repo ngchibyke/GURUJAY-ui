@@ -805,14 +805,14 @@ async fn find_payout_by_reference() {
 #[tokio::test]
 async fn find_payout_empty_list_is_not_proof_of_absence() {
     // REVISIT(Q5,Q6): until Mono confirms the filter and that in-flight
-    // disbursements are listed, an empty list is an unknown outcome.
+    // disbursements are listed, an empty list cannot tell either way.
     let server = MockServer::start().await;
     mount_list(&server, json!([])).await;
     assert!(matches!(
         provider(&server)
             .find_payout("PO12345678901234567890")
             .await,
-        Err(ProviderError::Timeout)
+        Err(ProviderError::Inconclusive)
     ));
 }
 
@@ -827,12 +827,35 @@ async fn find_payout_cannot_conclude_absent_from_an_unfiltered_page() {
         json!([{"id": "other", "reference": "PO99999999999999999999"}]),
     )
     .await;
-    assert!(
+    assert!(matches!(
         provider(&server)
             .find_payout("PO12345678901234567890")
-            .await
-            .is_err()
-    );
+            .await,
+        Err(ProviderError::Inconclusive)
+    ));
+}
+
+#[tokio::test]
+async fn find_payout_transport_timeout_stays_timeout() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v3/payments/disburse/disbursements"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(list_body(json!([])))
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&server)
+        .await;
+    let mut cfg = config(&server.uri());
+    cfg.timeout = Duration::from_millis(300);
+    assert!(matches!(
+        MonoProvider::new(cfg)
+            .unwrap()
+            .find_payout("PO12345678901234567890")
+            .await,
+        Err(ProviderError::Timeout)
+    ));
 }
 
 #[tokio::test]
@@ -863,12 +886,12 @@ async fn payout_status_without_id_looks_the_payout_up_first() {
     // No id and an empty lookup: the status cannot be known.
     let server = MockServer::start().await;
     mount_list(&server, json!([])).await;
-    assert!(
+    assert!(matches!(
         provider(&server)
             .payout_status("PO12345678901234567890", None)
-            .await
-            .is_err()
-    );
+            .await,
+        Err(ProviderError::Inconclusive)
+    ));
 }
 
 #[tokio::test]

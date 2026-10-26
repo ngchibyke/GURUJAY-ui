@@ -23,7 +23,7 @@ use crate::{
         send_payout, settle_payout,
     },
     ledger::{self, Account, Entry},
-    payments::{self, PayoutState},
+    payments::{self, PayoutState, ProviderError},
 };
 
 fn db_err(ctx: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
@@ -105,6 +105,36 @@ fn provider_unavailable() -> AppError {
     AppError::Unavailable("provider_unavailable")
 }
 
+fn lookup_inconclusive() -> AppError {
+    AppError::ConflictDetail(
+        "provider_lookup_inconclusive",
+        "The provider cannot tell whether this payout exists. Check the provider's dashboard, \
+         then repeat with \"attest_provider_checked\": true"
+            .into(),
+    )
+}
+
+/// What the provider lookup before an owner override found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    /// No lookup was needed (the payout cannot have been paid by the provider).
+    NotNeeded,
+    /// The provider has no such payout.
+    Absent,
+    /// The provider could not tell; the owner attested they checked.
+    Inconclusive,
+}
+
+impl Lookup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Lookup::NotNeeded => "not_needed",
+            Lookup::Absent => "absent",
+            Lookup::Inconclusive => "inconclusive",
+        }
+    }
+}
+
 /// The owner paid the seller outside the provider. Books `seller_payable ->
 /// seller_paid` under the round's success key (none for a zero payout);
 /// provider answers no longer change the payout afterwards.
@@ -119,7 +149,11 @@ fn provider_unavailable() -> AppError {
 ///   booked), returned as [`MarkedPaid::ByProvider`]; failed/reversed -> 409
 ///   naming the new status (the owner may then mark it paid); still pending
 ///   -> 409 `payout_pending_at_provider`;
-/// - the provider cannot answer: 503 `provider_unavailable`, nothing changed.
+/// - the provider cannot answer: 503 `provider_unavailable`, nothing changed;
+/// - the provider answers but cannot tell (inconclusive lookup): 409
+///   `provider_lookup_inconclusive`, unless `attested` (the owner checked the
+///   provider's dashboard), when the owner's payment is recorded and the audit
+///   says `attested: true, lookup: "inconclusive"`.
 ///
 /// The transaction then re-checks that the payout did not change since it
 /// was read (409 `payout_changed`), so a send that claimed it meanwhile wins.
@@ -129,6 +163,7 @@ pub async fn mark_paid(
     payout_id: Uuid,
     note: &str,
     provider_reference: &str,
+    attested: bool,
 ) -> Result<MarkedPaid, AppError> {
     let before: PaidCheck = sqlx::query_as(
         "SELECT status::text AS status, reference, provider, provider_payout_id, last_error, \
@@ -143,14 +178,18 @@ pub async fn mark_paid(
     if !MARK_PAID_FROM.contains(&before.status.as_str()) {
         return Err(payout_state(&before.status));
     }
-    if may_have_paid(
+    let lookup = if may_have_paid(
         &before.status,
         before.provider_payout_id.is_some(),
         before.last_error.as_deref(),
-    ) && provider_has_it(state, actor, payout_id, &before).await?
-    {
-        return Ok(MarkedPaid::ByProvider);
-    }
+    ) {
+        match provider_has_it(state, actor, payout_id, &before, attested).await? {
+            None => return Ok(MarkedPaid::ByProvider),
+            Some(lookup) => lookup,
+        }
+    } else {
+        Lookup::NotNeeded
+    };
 
     let mut tx = state.db.begin().await.context("begin")?;
     let p = lock_payout(&mut tx, payout_id).await?;
@@ -207,6 +246,8 @@ pub async fn mark_paid(
             "provider_reference": provider_reference,
             "amount_kobo": p.amount_kobo,
             "round": p.round,
+            "attested": attested && lookup == Lookup::Inconclusive,
+            "lookup": lookup.as_str(),
         }),
     )
     .await?;
@@ -215,16 +256,18 @@ pub async fn mark_paid(
 }
 
 /// Asks the provider about a payout before the owner settles it by hand
-/// (outside any transaction). `Ok(false)`: the provider has no such payout,
-/// go on. `Ok(true)`: the provider paid it and it is now settled. Anything
-/// else is the error to return. A lookup that reached the provider's record is
-/// audited (`admin.payout_provider_checked`).
+/// (outside any transaction). `Ok(Some(lookup))`: go on (the provider has no
+/// such payout, or could not tell and the owner attested). `Ok(None)`: the
+/// provider paid it and it is now settled. Anything else is the error to
+/// return. A lookup that reached the provider's record is audited
+/// (`admin.payout_provider_checked`).
 async fn provider_has_it(
     state: &AppState,
     actor: Uuid,
     payout_id: Uuid,
     p: &PaidCheck,
-) -> Result<bool, AppError> {
+    attested: bool,
+) -> Result<Option<Lookup>, AppError> {
     let provider = state
         .providers
         .by_name(&p.provider)
@@ -233,8 +276,12 @@ async fn provider_has_it(
         let found =
             tokio::time::timeout(PAYOUT_CALL_TIMEOUT, provider.find_payout(&p.reference)).await;
         match found {
-            Ok(Ok(None)) => return Ok(false),
+            Ok(Ok(None)) => return Ok(Some(Lookup::Absent)),
             Ok(Ok(Some(_))) => {}
+            Ok(Err(ProviderError::Inconclusive)) if attested => {
+                return Ok(Some(Lookup::Inconclusive));
+            }
+            Ok(Err(ProviderError::Inconclusive)) => return Err(lookup_inconclusive()),
             Ok(Err(e)) => {
                 tracing::warn!(provider = provider.name(), error = %e, "payout lookup for mark-paid failed");
                 return Err(provider_unavailable());
@@ -253,6 +300,7 @@ async fn provider_has_it(
         SettlePayoutOutcome::Settled { status } => status.as_str(),
         SettlePayoutOutcome::UnknownReference => "reference_changed",
         SettlePayoutOutcome::RetryLater => "provider_unavailable",
+        SettlePayoutOutcome::Inconclusive => "inconclusive",
     };
     let mut conn = state.db.acquire().await.context("acquire")?;
     audit::record(
@@ -265,7 +313,7 @@ async fn provider_has_it(
     )
     .await?;
     match outcome {
-        SettlePayoutOutcome::Settled { status } if status == "successful" => Ok(true),
+        SettlePayoutOutcome::Settled { status } if status == "successful" => Ok(None),
         SettlePayoutOutcome::Settled { status } if status == "failed" => Err(payout_state(&status)),
         SettlePayoutOutcome::Settled { status } => Err(AppError::ConflictDetail(
             "payout_pending_at_provider",
@@ -273,6 +321,8 @@ async fn provider_has_it(
         )),
         SettlePayoutOutcome::UnknownReference => Err(AppError::Conflict("payout_changed")),
         SettlePayoutOutcome::RetryLater => Err(provider_unavailable()),
+        SettlePayoutOutcome::Inconclusive if attested => Ok(Some(Lookup::Inconclusive)),
+        SettlePayoutOutcome::Inconclusive => Err(lookup_inconclusive()),
     }
 }
 
@@ -507,7 +557,10 @@ struct VerifiedAccount {
 /// failed payouts to `manual`), once the seller's payout account has been
 /// re-verified (409 `payout_account_unverified`), and once the provider
 /// confirms the old reference was not paid (409
-/// `payout_not_confirmed_reversed`; 502 when it cannot answer). The provider
+/// `payout_not_confirmed_reversed`; 502 when it cannot answer; 409
+/// `provider_lookup_inconclusive` when it answers but cannot tell, unless
+/// `attested`: the owner checked the provider's dashboard and attests the old
+/// reference was not paid, which the audit records). The provider
 /// call runs before the transaction; the transaction re-checks that the
 /// payout did not change meanwhile. The account is re-snapshotted, and the
 /// payout is sent at once (a failed send is left to the job).
@@ -516,6 +569,7 @@ pub async fn requeue(
     actor: Uuid,
     payout_id: Uuid,
     note: &str,
+    attested: bool,
 ) -> Result<(), AppError> {
     let before: RequeueRow = sqlx::query_as(REQUEUE_SELECT)
         .bind(payout_id)
@@ -540,9 +594,11 @@ pub async fn requeue(
         provider.payout_status(&before.reference, before.provider_payout_id.as_deref()),
     )
     .await;
-    match answer {
-        Ok(Ok(PayoutState::Failed { .. } | PayoutState::Reversed { .. })) => {}
+    let lookup = match answer {
+        Ok(Ok(PayoutState::Failed { .. } | PayoutState::Reversed { .. })) => "confirmed",
         Ok(Ok(_)) => return Err(AppError::Conflict("payout_not_confirmed_reversed")),
+        Ok(Err(ProviderError::Inconclusive)) if attested => "inconclusive",
+        Ok(Err(ProviderError::Inconclusive)) => return Err(lookup_inconclusive()),
         Ok(Err(e)) => {
             tracing::warn!(provider = provider.name(), error = %e, "payout status for re-queue failed");
             return Err(AppError::ProviderUnavailable);
@@ -554,7 +610,7 @@ pub async fn requeue(
             );
             return Err(AppError::ProviderUnavailable);
         }
-    }
+    };
 
     let mut tx = state.db.begin().await.context("begin")?;
     lock_payout(&mut tx, payout_id).await?;
@@ -600,6 +656,8 @@ pub async fn requeue(
             "note": note,
             "previous_reference": now.reference,
             "reference": reference,
+            "attested": attested && lookup == "inconclusive",
+            "lookup": lookup,
         }),
     )
     .await?;

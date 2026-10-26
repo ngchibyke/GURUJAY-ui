@@ -138,6 +138,11 @@ pub enum SettlePayoutOutcome {
     UnknownReference,
     /// The provider could not be asked now; a webhook answers 503.
     RetryLater,
+    /// The provider answered but cannot tell whether the payout exists (no
+    /// provider id, inconclusive lookup). Nothing changed; retrying will not
+    /// help until the owner acts, so a webhook answers 200 without marking the
+    /// event processed.
+    Inconclusive,
 }
 
 fn db_err(ctx: &'static str) -> impl FnOnce(sqlx::Error) -> AppError {
@@ -798,7 +803,9 @@ async fn call_provider(state: &AppState, row: &SendRow, claim: &Claim, mode: Mod
         Ok(Err(ProviderError::Unavailable(_))) => Sent::Unavailable,
         Ok(Err(ProviderError::Timeout)) | Err(_) => Sent::Unknown("timed_out"),
         Ok(Err(ProviderError::NotSupported)) => Sent::NotSupported,
-        Ok(Err(ProviderError::InvalidSignature)) => Sent::Unknown("unexpected_answer"),
+        Ok(Err(ProviderError::InvalidSignature | ProviderError::Inconclusive)) => {
+            Sent::Unknown("unexpected_answer")
+        }
     }
 }
 
@@ -914,6 +921,10 @@ pub async fn settle_payout_from(
     .await;
     let answer = match answer {
         Ok(Ok(a)) => a,
+        Ok(Err(ProviderError::Inconclusive)) => {
+            tracing::warn!(provider = provider.name(), "payout status inconclusive");
+            return Ok(SettlePayoutOutcome::Inconclusive);
+        }
         Ok(Err(e)) => {
             tracing::warn!(provider = provider.name(), error = %e, "payout status failed");
             return Ok(SettlePayoutOutcome::RetryLater);

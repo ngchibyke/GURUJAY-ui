@@ -63,6 +63,18 @@ struct HoldBody {
 struct OverrideBody {
     note: Option<String>,
     provider_reference: Option<String>,
+    /// The owner checked the provider's dashboard: lets an inconclusive
+    /// provider lookup proceed (recorded in the audit).
+    attest_provider_checked: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequeueBody {
+    note: Option<String>,
+    /// The owner checked the provider's dashboard and attests the old
+    /// reference was not paid (only used when the lookup is inconclusive).
+    attest_provider_checked: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -171,7 +183,8 @@ async fn mark_paid(
     let note = note("note", body.note.as_deref(), NOTE_MAX)?;
     let reference = provider_reference(body.provider_reference.as_deref())?;
     // The view's `settled_by` says whether the provider had paid it after all.
-    money::mark_paid(&state, user.id, id, &note, &reference).await?;
+    let attested = body.attest_provider_checked.unwrap_or(false);
+    money::mark_paid(&state, user.id, id, &note, &reference, attested).await?;
     Ok(Json(views::payout(&state.db, id).await?))
 }
 
@@ -179,11 +192,12 @@ async fn requeue(
     State(state): State<AppState>,
     Owner(user): Owner,
     Path(id): Path<String>,
-    AppJson(body): AppJson<NoteBody>,
+    AppJson(body): AppJson<RequeueBody>,
 ) -> Result<Json<PayoutView>, AppError> {
     let id = parse_id(&id)?;
     let note = note("note", body.note.as_deref(), NOTE_MAX)?;
-    money::requeue(&state, user.id, id, &note).await?;
+    let attested = body.attest_provider_checked.unwrap_or(false);
+    money::requeue(&state, user.id, id, &note, attested).await?;
     Ok(Json(views::payout(&state.db, id).await?))
 }
 

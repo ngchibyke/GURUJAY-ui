@@ -57,6 +57,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    // Before connecting or migrating: a production server with no payment
+    // provider would fail every checkout. Admin commands still run.
+    if matches!(command, Command::Serve) {
+        require_payment_provider(&config.app_env, config.mono.is_some())?;
+    }
     let db = pool_options(10).connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
 
@@ -69,7 +74,6 @@ async fn main() -> anyhow::Result<()> {
         }
         None => tracing::warn!("MONO_SECRET_KEY not set: no payment provider is configured"),
     }
-    require_payment_provider(&config.app_env, config.mono.is_some())?;
 
     let state = AppState {
         db,

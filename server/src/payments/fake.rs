@@ -36,6 +36,7 @@ fn copy_err(e: &ProviderError) -> ProviderError {
         }
         ProviderError::Timeout => ProviderError::Timeout,
         ProviderError::InvalidSignature => ProviderError::InvalidSignature,
+        ProviderError::Inconclusive => ProviderError::Inconclusive,
     }
 }
 
@@ -58,6 +59,7 @@ pub struct FakeProvider {
     payout_states: Mutex<HashMap<String, PayoutState>>,
     found_payouts: Mutex<HashMap<String, Option<String>>>,
     find_payout_failure: Mutex<Option<ProviderError>>,
+    payout_status_failure: Mutex<Option<ProviderError>>,
     refund_supported: Mutex<bool>,
     refund_failure: Mutex<Option<ProviderError>>,
     refund_delay: Mutex<Option<std::time::Duration>>,
@@ -148,6 +150,12 @@ impl FakeProvider {
     /// recorded).
     pub fn fail_find_payout_with(&self, err: ProviderError) {
         *self.find_payout_failure.lock().unwrap() = Some(err);
+    }
+
+    /// Every later `payout_status` call returns this error (after being
+    /// recorded), e.g. [`ProviderError::Inconclusive`].
+    pub fn fail_payout_status_with(&self, err: ProviderError) {
+        *self.payout_status_failure.lock().unwrap() = Some(err);
     }
 
     /// When true, `refund` succeeds with id `fakerf_<payment_reference>`.
@@ -297,6 +305,9 @@ impl PaymentProvider for FakeProvider {
         _provider_payout_id: Option<&str>,
     ) -> Result<PayoutState, ProviderError> {
         self.record("payout_status");
+        if let Some(e) = self.payout_status_failure.lock().unwrap().as_ref() {
+            return Err(copy_err(e));
+        }
         Ok(self
             .payout_states
             .lock()

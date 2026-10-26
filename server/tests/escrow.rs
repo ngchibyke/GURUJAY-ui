@@ -806,11 +806,13 @@ async fn timeout_then_lookup_not_found_recreates_with_same_reference(pool: PgPoo
     assert!(sent.iter().all(|r| r.reference == p.reference));
 }
 
-/// Through the real Mono adapter (mock server): a payout whose create timed
-/// out is looked up; an empty list (unconfirmed filter, REVISIT(Q5,Q6)) keeps
-/// it `unknown` and never re-creates it.
-#[sqlx::test]
-async fn mono_empty_lookup_never_recreates_the_payout(pool: PgPool) {
+const MONO_WEBHOOK_SECRET: &str = "whsec_engine";
+
+/// An `unknown` payout (its create timed out at the Fake) handed to Mono, and
+/// a state whose only provider is the real Mono adapter on a mock server that
+/// lists no disbursements (inconclusive lookup) and refuses to be asked to
+/// create one (`expect(0)`, checked when the server drops).
+async fn unknown_mono_payout(app: &TestApp) -> (server::AppState, wiremock::MockServer, PayoutRow) {
     use server::payments::{
         ProviderRegistry,
         mono::{AmountUnit, MonoConfig, MonoProvider, Secret},
@@ -821,14 +823,12 @@ async fn mono_empty_lookup_never_recreates_the_payout(pool: PgPool) {
         matchers::{method, path},
     };
 
-    let app = TestApp::new(pool).await;
-    let f = picked_up_order(&app, 10_000, 10, true).await;
+    let f = picked_up_order(app, 10_000, 10, true).await;
     app.fake.fail_payout_with(ProviderError::Timeout);
-    release(&app, &f).await;
-    let p = payout(&app).await;
+    release(app, &f).await;
+    let p = payout(app).await;
     assert_eq!(p.status, "unknown");
-    // Hand the payout to Mono, served by a mock that lists nothing.
-    exec(&app, "UPDATE payouts SET provider = 'mono'").await;
+    exec(app, "UPDATE payouts SET provider = 'mono'").await;
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v3/payments/disburse/disbursements"))
@@ -847,7 +847,7 @@ async fn mono_empty_lookup_never_recreates_the_payout(pool: PgPool) {
         .await;
     let mono = MonoProvider::new(MonoConfig {
         secret_key: Secret::new("test_sk_engine"),
-        webhook_secret: Secret::new("whsec_engine"),
+        webhook_secret: Secret::new(MONO_WEBHOOK_SECRET),
         base_url: server.uri(),
         live: false,
         directpay_unit: AmountUnit::Kobo,
@@ -863,7 +863,16 @@ async fn mono_empty_lookup_never_recreates_the_payout(pool: PgPool) {
     providers.register(Arc::new(mono));
     let mut state = app.state.clone();
     state.providers = Arc::new(providers);
+    (state, server, p)
+}
 
+/// Through the real Mono adapter (mock server): a payout whose create timed
+/// out is looked up; an empty list (unconfirmed filter, REVISIT(Q5,Q6)) keeps
+/// it `unknown` and never re-creates it.
+#[sqlx::test]
+async fn mono_empty_lookup_never_recreates_the_payout(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (state, _server, p) = unknown_mono_payout(&app).await;
     for _ in 0..3 {
         make_due(&app).await;
         let out = send_payout(&state, p.id).await.unwrap();
@@ -877,6 +886,104 @@ async fn mono_empty_lookup_never_recreates_the_payout(pool: PgPool) {
     );
     assert_eq!(after.provider_payout_id, None);
     // `expect(0)` on the POST is verified when the server drops.
+}
+
+/// A Mono payout webhook whose status cannot be told (no provider id,
+/// inconclusive lookup): 200 so Mono stops retrying, event left unprocessed,
+/// payout untouched.
+#[sqlx::test]
+async fn mono_webhook_for_an_inconclusive_payout_is_200_and_unprocessed(pool: PgPool) {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    let app = TestApp::new(pool).await;
+    let (state, _server, p) = unknown_mono_payout(&app).await;
+    let body = json!({
+        "event": "event.disbursement.transaction.successful",
+        "event_id": "evt_inconclusive_1",
+        "data": {
+            "disbursement_reference": p.reference,
+            "reference": p.reference,
+            "amount": p.amount_kobo,
+            "status": "successful"
+        }
+    });
+    for _ in 0..2 {
+        let res = server::build_app(state.clone())
+            .oneshot(
+                Request::post("/webhooks/mono")
+                    .header("content-type", "application/json")
+                    .header("mono-webhook-secret", MONO_WEBHOOK_SECRET)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Never "duplicate": the event stays unprocessed for a later delivery.
+        assert_eq!(json["status"], "received");
+    }
+    let processed: Option<OffsetDateTime> = sqlx::query_scalar(
+        "SELECT processed_at FROM provider_events WHERE provider = 'mono' AND event_id = $1",
+    )
+    .bind("evt_inconclusive_1")
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(processed, None);
+    let after = payout(&app).await;
+    assert_eq!(after.status, "unknown");
+    assert_eq!(after.provider_payout_id, None);
+}
+
+/// Owner mark-paid against the real Mono adapter: inconclusive lookup is 409
+/// without attestation (nothing changes), owner-settled and audited with it.
+#[sqlx::test]
+async fn mono_mark_paid_inconclusive_needs_attestation(pool: PgPool) {
+    use server::admin::money::{MarkedPaid, mark_paid};
+
+    let app = TestApp::new(pool).await;
+    app.owner_token().await;
+    let owner: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE role = 'owner'")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    let (state, _server, p) = unknown_mono_payout(&app).await;
+    let paid_before = balance(&app, "seller_paid").await;
+
+    let err = mark_paid(&state, owner, p.id, "paid by transfer", "TRF-9", false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            AppError::ConflictDetail("provider_lookup_inconclusive", _)
+        ),
+        "{err:?}"
+    );
+    assert_eq!(payout(&app).await.status, "unknown");
+    assert_eq!(balance(&app, "seller_paid").await, paid_before);
+
+    let done = mark_paid(&state, owner, p.id, "paid by transfer", "TRF-9", true)
+        .await
+        .unwrap();
+    assert_eq!(done, MarkedPaid::ByOwner);
+    assert_eq!(payout(&app).await.status, "successful");
+    assert_eq!(
+        balance(&app, "seller_paid").await,
+        paid_before + p.amount_kobo
+    );
+    let detail: serde_json::Value = sqlx::query_scalar(
+        "SELECT detail FROM audit_log WHERE action = 'admin.payout_marked_paid'",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(detail["attested"], true);
+    assert_eq!(detail["lookup"], "inconclusive");
 }
 
 #[sqlx::test]
