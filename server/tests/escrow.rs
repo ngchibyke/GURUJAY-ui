@@ -1505,3 +1505,339 @@ async fn success_without_payout_id_stores_the_found_id(pool: PgPool) {
     assert_eq!(after.status, "successful");
     assert_eq!(after.provider_payout_id.as_deref(), Some("x8"));
 }
+
+// ---------------------------------------------------------------- end to end
+
+/// The whole happy path across two stores, through the HTTP routes wherever
+/// one exists (checkout, payment and payout webhooks, order views) and the
+/// engine otherwise (pickup/delivery transitions, the job tick). Every kobo
+/// amount below is worked out by hand from the default fee schedule, not read
+/// back from the code under test.
+#[sqlx::test]
+async fn happy_path_end_to_end(pool: PgPool) {
+    use server::escrow::jobs::run_due_jobs;
+
+    let app = TestApp::new(pool).await;
+    let hook = |kind: &str, event_id: &str, reference: &str| {
+        json!({ "event_id": event_id, "kind": kind, "reference": reference })
+            .to_string()
+            .into_bytes()
+    };
+    let headers = [(FAKE_SIGNATURE_HEADER, FAKE_WEBHOOK_SECRET)];
+
+    // 1. Two sellers, each with an active store and a verified payout account.
+    // Store A sells one unit at N15,000 (stamp duty applies); store B two
+    // units at N3,000 (a N6,000 order, no stamp duty).
+    let a = app
+        .make_active_store_with_product(SELLER, "Mama Put", 1_500_000, 5)
+        .await;
+    let b = app
+        .make_active_store_with_product("08011111112", "Iya Basira", 300_000, 10)
+        .await;
+    for store in [a.store_id, b.store_id] {
+        let (status, account): (String, String) = sqlx::query_as(
+            "SELECT s.status::text, pa.status::text FROM stores s \
+             JOIN payout_accounts pa ON pa.store_id = s.id WHERE s.id = $1",
+        )
+        .bind(store)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+        assert_eq!((status.as_str(), account.as_str()), ("active", "verified"));
+    }
+    let (_, buyer) = app.sign_up_verified(BUYER).await;
+    assert_eq!(app.set_cart(&buyer, a.variant_id, 1).await.status, 200);
+    assert_eq!(app.set_cart(&buyer, b.variant_id, 2).await.status, 200);
+
+    // 2. Checkout, then the payment webhook.
+    let res = app.checkout(&buyer, METHOD).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    const TOTAL: i64 = 1_500_000 + 2 * 300_000;
+    assert_eq!(res.json["total_kobo"], TOTAL);
+    let checkout_id: Uuid = res.json["checkout_id"].as_str().unwrap().parse().unwrap();
+    let reference = res.json["reference"].as_str().unwrap().to_string();
+    assert_eq!(app.reserved(a.variant_id).await, 1);
+    assert_eq!(app.reserved(b.variant_id).await, 2);
+
+    // Provider collection fee N21, shared by order total: 1,500 / 600.
+    const COLLECTION_FEE: i64 = 2_100;
+    app.fake.set_payment(
+        &reference,
+        PaymentStatus::Successful {
+            amount_kobo: TOTAL,
+            fee_kobo: COLLECTION_FEE,
+            currency: "NGN".into(),
+            held: false,
+            reference: reference.clone(),
+        },
+    );
+    let res = app
+        .send_raw(
+            Method::POST,
+            "/webhooks/fake",
+            &headers,
+            hook("payment", "pay-1", &reference),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["status"], "received");
+
+    let res = app
+        .request(
+            Method::GET,
+            &format!("/checkout/{checkout_id}"),
+            None,
+            Some(&buyer),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["status"], "paid");
+    let orders = res.json["orders"].as_array().unwrap();
+    assert_eq!(orders.len(), 2);
+    let order_of = |store: Uuid| -> Uuid {
+        let o = orders
+            .iter()
+            .find(|o| o["store_id"] == store.to_string())
+            .expect("an order per store");
+        assert_eq!(o["status"], "paid");
+        assert_eq!(o["delivery_fee_kobo"], 0);
+        o["order_id"].as_str().unwrap().parse().unwrap()
+    };
+    let (order_a, order_b) = (order_of(a.store_id), order_of(b.store_id));
+    // Stock committed, reservation released.
+    assert_eq!(app.stock(a.variant_id).await, 4);
+    assert_eq!(app.reserved(a.variant_id).await, 0);
+    assert_eq!(app.stock(b.variant_id).await, 8);
+    assert_eq!(app.reserved(b.variant_id).await, 0);
+
+    // Expected payouts, by hand (cut 5%; payout fee N35, plus N50 stamp duty
+    // when the pre-fee payout is at least N10,000):
+    //   A: 1,500,000 - 75,000 cut - 1,500 fee share = 1,423,500 -> fee 8,500 -> 1,415,000
+    //   B:   600,000 - 30,000 cut -   600 fee share =   569,400 -> fee 3,500 ->   565,900
+    const CUT_A: i64 = 75_000;
+    const CUT_B: i64 = 30_000;
+    const SHARE_A: i64 = 1_500;
+    const SHARE_B: i64 = 600;
+    const FEE_A: i64 = 3_500 + 5_000;
+    const FEE_B: i64 = 3_500;
+    const PAYOUT_A: i64 = 1_415_000;
+    const PAYOUT_B: i64 = 565_900;
+    assert_eq!(1_500_000 - CUT_A - SHARE_A - FEE_A, PAYOUT_A);
+    assert_eq!(600_000 - CUT_B - SHARE_B - FEE_B, PAYOUT_B);
+
+    // Each seller sees their own order and the payout they can expect.
+    for (listing, order, expected) in [(&a, order_a, PAYOUT_A), (&b, order_b, PAYOUT_B)] {
+        let res = app
+            .request(
+                Method::GET,
+                &format!("/orders/{order}"),
+                None,
+                Some(&listing.seller_token),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(res.json["status"], "paid");
+        assert_eq!(res.json["expected_payout_kobo"], expected);
+    }
+
+    // 3. Each seller's order is picked up, then delivered (no routes yet).
+    let now = OffsetDateTime::now_utc();
+    for order in [order_a, order_b] {
+        mark_picked_up(&app.pool, order, now).await.unwrap();
+        mark_delivered(&app.pool, order, now).await.unwrap();
+        assert_eq!(order_status(&app, order).await, "delivered");
+    }
+
+    // 4. Nothing releases before the 72h deadline; at 73h both do.
+    let r = run_due_jobs(&app.state).await;
+    assert_eq!(r.released, 0, "{r:?}");
+    exec(
+        &app,
+        "UPDATE orders SET release_at = now() - interval '1 hour'",
+    )
+    .await;
+    let r = run_due_jobs(&app.state).await;
+    assert_eq!((r.released, r.failed), (2, 0), "{r:?}");
+    for order in [order_a, order_b] {
+        assert_eq!(order_status(&app, order).await, "completed");
+    }
+    let payouts: Vec<(Uuid, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT order_id, reference, status::text, amount_kobo, fee_kobo FROM payouts",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(payouts.len(), 2);
+    let payout_of = |order: Uuid| {
+        payouts
+            .iter()
+            .find(|p| p.0 == order)
+            .cloned()
+            .expect("a payout per order")
+    };
+    let (pa, pb) = (payout_of(order_a), payout_of(order_b));
+    assert_eq!((pa.3, pa.4), (PAYOUT_A, FEE_A));
+    assert_eq!((pb.3, pb.4), (PAYOUT_B, FEE_B));
+    // The buyer's payment has not settled at the provider yet: still waiting.
+    assert_eq!((pa.2.as_str(), pb.2.as_str()), ("scheduled", "scheduled"));
+    assert!(app.fake.payouts().is_empty());
+
+    // Past the settlement wait, the next tick sends both.
+    exec(
+        &app,
+        "UPDATE payouts SET send_after = now() - interval '1 minute'",
+    )
+    .await;
+    let r = run_due_jobs(&app.state).await;
+    assert_eq!((r.payouts_processed, r.failed), (2, 0), "{r:?}");
+    let mut sent: Vec<(String, i64, String, String)> = app
+        .fake
+        .payouts()
+        .into_iter()
+        .map(|p| (p.reference, p.amount_kobo, p.bank_code, p.account_number))
+        .collect();
+    sent.sort_by_key(|p| p.1);
+    let account = || ("058".to_string(), ACCOUNT_NUMBER.to_string());
+    assert_eq!(
+        sent,
+        [
+            (pb.1.clone(), PAYOUT_B, account().0, account().1),
+            (pa.1.clone(), PAYOUT_A, account().0, account().1),
+        ]
+    );
+
+    // 5. Payout webhooks: both successful (provider transfer fees N12 / N10).
+    const PROVIDER_PAYOUT_FEE_A: i64 = 1_200;
+    const PROVIDER_PAYOUT_FEE_B: i64 = 1_000;
+    for (p, fee, event) in [
+        (&pa, PROVIDER_PAYOUT_FEE_A, "po-a"),
+        (&pb, PROVIDER_PAYOUT_FEE_B, "po-b"),
+    ] {
+        app.fake
+            .set_payout_state(&p.1, PayoutState::Successful { fee_kobo: fee });
+        let res = app
+            .send_raw(
+                Method::POST,
+                "/webhooks/fake",
+                &headers,
+                hook("payout", event, &p.1),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(res.json["status"], "received");
+    }
+    for (listing, order) in [(&a, order_a), (&b, order_b)] {
+        let res = app
+            .request(
+                Method::GET,
+                &format!("/orders/{order}"),
+                None,
+                Some(&listing.seller_token),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(res.json["status"], "completed");
+        assert_eq!(res.json["payout"]["status"], "successful");
+    }
+
+    // 6. Ledger, per order and in total.
+    for (order, items, payout, revenue, fees) in [
+        (
+            order_a,
+            1_500_000,
+            PAYOUT_A,
+            CUT_A + FEE_A - PROVIDER_PAYOUT_FEE_A,
+            SHARE_A + PROVIDER_PAYOUT_FEE_A,
+        ),
+        (
+            order_b,
+            600_000,
+            PAYOUT_B,
+            CUT_B + FEE_B - PROVIDER_PAYOUT_FEE_B,
+            SHARE_B + PROVIDER_PAYOUT_FEE_B,
+        ),
+    ] {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT account::text, sum(amount_kobo)::bigint FROM ledger_entries \
+             WHERE order_id = $1 GROUP BY account ORDER BY account::text",
+        )
+        .bind(order)
+        .fetch_all(&app.pool)
+        .await
+        .unwrap();
+        let rows: Vec<(&str, i64)> = rows.iter().map(|(a, n)| (a.as_str(), *n)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("buyer_funds", -items),
+                ("escrow", 0),
+                ("platform_revenue", revenue),
+                ("provider_fees", fees),
+                ("seller_paid", payout),
+                ("seller_payable", 0),
+            ],
+            "order {order}"
+        );
+        assert_eq!(rows.iter().map(|r| r.1).sum::<i64>(), 0, "order sums to 0");
+    }
+    assert_orders_balance(&app).await;
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM ledger_entries WHERE order_id IS NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(balance(&app, "escrow").await, 0);
+    assert_eq!(balance(&app, "seller_payable").await, 0);
+    assert_eq!(balance(&app, "seller_paid").await, 1_415_000 + 565_900);
+    // (75,000 + 8,500 - 1,200) + (30,000 + 3,500 - 1,000)
+    assert_eq!(balance(&app, "platform_revenue").await, 114_800);
+    // 2,100 collection + 1,200 + 1,000 transfer fees
+    assert_eq!(balance(&app, "provider_fees").await, 4_300);
+    assert_eq!(balance(&app, "buyer_funds").await, -TOTAL);
+
+    // Audit trail of the money flow.
+    let actions: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT action, count(*) FROM audit_log \
+         WHERE action LIKE 'checkout.%' OR action LIKE 'order.%' OR action LIKE 'payout.%' \
+         GROUP BY action ORDER BY action",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    let actions: Vec<(&str, i64)> = actions.iter().map(|(a, n)| (a.as_str(), *n)).collect();
+    assert_eq!(
+        actions,
+        [
+            ("checkout.created", 1),
+            ("checkout.paid", 1),
+            ("order.delivered", 2),
+            ("order.picked_up", 2),
+            ("order.released", 2),
+            ("payout.send_attempt", 2),
+            ("payout.settled", 2),
+        ]
+    );
+    let released: Vec<(Uuid, serde_json::Value)> =
+        sqlx::query_as("SELECT subject_id, detail FROM audit_log WHERE action = 'order.released'")
+            .fetch_all(&app.pool)
+            .await
+            .unwrap();
+    for (order, payout, fee) in [(order_a, PAYOUT_A, FEE_A), (order_b, PAYOUT_B, FEE_B)] {
+        let (_, d) = released.iter().find(|(id, _)| *id == order).unwrap();
+        assert_eq!(d["reason"], "auto_after_delivery");
+        assert_eq!(d["payout_kobo"], payout);
+        assert_eq!(d["payout_fee_kobo"], fee);
+    }
+    // The payout account number never reaches the audit log.
+    assert_eq!(
+        count(
+            &app,
+            &format!("SELECT count(*) FROM audit_log WHERE detail::text LIKE '%{ACCOUNT_NUMBER}%'")
+        )
+        .await,
+        0
+    );
+}
