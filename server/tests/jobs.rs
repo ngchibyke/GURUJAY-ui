@@ -72,6 +72,16 @@ async fn tick(app: &TestApp) -> JobReport {
     run_due_jobs(&app.state).await
 }
 
+/// The ship-deadline job ships switched off (no pickup route before plan 3);
+/// tests of the job itself switch it on.
+async fn ship_deadline_on(app: &TestApp) {
+    exec(
+        app,
+        "UPDATE platform_settings SET jobs_ship_deadline_enabled = true",
+    )
+    .await;
+}
+
 /// A pending checkout for one unit; returns (checkout id, reference, buyer token, listing variant).
 async fn pending_checkout(app: &TestApp) -> (Uuid, String, String, Uuid, Uuid) {
     let listing = app
@@ -260,9 +270,35 @@ async fn lost_webhook_reverify_backs_off_and_stops_after_48h(pool: PgPool) {
 
 // ---------------------------------------------------------------- ship deadline
 
+/// I1: with no pickup route yet, the job would refund every paid order and
+/// strike its seller, so a fresh database ships with it off.
+#[sqlx::test]
+async fn ship_deadline_is_off_on_a_fresh_database(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    exec(
+        &app,
+        "UPDATE orders SET ship_by = now() - interval '1 hour'",
+    )
+    .await;
+    let r = tick(&app).await;
+    assert_eq!(r.auto_cancelled, 0);
+    assert_eq!(order_status(&app, f.order_id).await, "paid");
+    assert_eq!(count(&app, "SELECT count(*) FROM seller_strikes").await, 0);
+    assert_eq!(count(&app, "SELECT count(*) FROM refunds").await, 0);
+    let default: String = text(
+        &app,
+        "SELECT column_default FROM information_schema.columns \
+         WHERE table_name = 'platform_settings' AND column_name = 'jobs_ship_deadline_enabled'",
+    )
+    .await;
+    assert_eq!(default, "false");
+}
+
 #[sqlx::test]
 async fn ship_deadline_48h_refunds_and_strikes(pool: PgPool) {
     let app = TestApp::new(pool).await;
+    ship_deadline_on(&app).await;
     let f = paid_order(&app).await;
     app.fake.set_refund_supported(true);
     assert_eq!(app.stock(f.variant_id).await, 4);
@@ -324,6 +360,7 @@ async fn ship_deadline_48h_refunds_and_strikes(pool: PgPool) {
 #[sqlx::test]
 async fn ship_deadline_kill_switch_and_held_orders_skip(pool: PgPool) {
     let app = TestApp::new(pool).await;
+    ship_deadline_on(&app).await;
     let f = paid_order(&app).await;
     exec(
         &app,
@@ -392,6 +429,7 @@ async fn ship_deadline_kill_switch_and_held_orders_skip(pool: PgPool) {
 #[sqlx::test]
 async fn ship_deadline_after_a_racing_buyer_cancel_gives_no_strike(pool: PgPool) {
     let app = TestApp::new(pool).await;
+    ship_deadline_on(&app).await;
     let f = paid_order(&app).await;
     exec(
         &app,
@@ -440,6 +478,7 @@ async fn ship_deadline_after_a_racing_buyer_cancel_gives_no_strike(pool: PgPool)
 #[sqlx::test]
 async fn ship_deadline_skips_flagged_payments(pool: PgPool) {
     let app = TestApp::new(pool).await;
+    ship_deadline_on(&app).await;
     let f = paid_order(&app).await;
     app.fake.set_refund_supported(true);
     exec(
@@ -471,6 +510,7 @@ async fn ship_deadline_skips_flagged_payments(pool: PgPool) {
 #[sqlx::test]
 async fn ship_deadline_caps_refunds_per_tick(pool: PgPool) {
     let app = TestApp::new(pool).await;
+    ship_deadline_on(&app).await;
     let listing = app
         .make_active_store_with_product(SELLER, "Mama Put", PRICE, 100)
         .await;
@@ -516,6 +556,7 @@ async fn ship_deadline_caps_refunds_per_tick(pool: PgPool) {
 #[sqlx::test]
 async fn failed_row_is_pushed_back(pool: PgPool) {
     let app = TestApp::new(pool).await;
+    ship_deadline_on(&app).await;
     let f = paid_order(&app).await;
     exec(
         &app,
@@ -1143,6 +1184,7 @@ async fn snapshot(app: &TestApp) -> Snapshot {
 #[sqlx::test]
 async fn job_rerun_is_idempotent(pool: PgPool) {
     let app = TestApp::new(pool).await;
+    ship_deadline_on(&app).await;
     app.fake.set_refund_supported(true);
     // One order due on each of release, ship deadline and backstop, plus an
     // expired checkout.

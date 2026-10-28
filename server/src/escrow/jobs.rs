@@ -12,6 +12,8 @@
 //!    a full refund (stock back on hand) plus a `seller_strikes` row, in one
 //!    transaction, then the refund is sent. Capped per tick, and switched off
 //!    by `platform_settings.jobs_ship_deadline_enabled` (owner kill switch).
+//!    It ships OFF (migration 0019): until plan 3 adds a pickup route nothing
+//!    can move an order out of `paid`, so it would refund every paid order.
 //! 4. `auto_release`: `delivered` orders past their stored `release_at`, not
 //!    held, whose checkout is not `provider_flagged` ->
 //!    [`release_order`]`(AutoAfterDelivery)`.

@@ -74,3 +74,4 @@ These are tracked in the roadmap:
 - Rate limits per network address on sign-up and sign-in.
 - A restricted production database role.
 - Legal review of the escrow setup, and data-protection (DPO) review.
+- The ship-deadline job (`platform_settings.jobs_ship_deadline_enabled`) stays **off** until plan 3 ships a pickup route. Until then nothing can move an order out of `paid`, so the job would refund every paid order and strike its seller.

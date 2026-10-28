@@ -994,7 +994,12 @@ async fn hold_and_unhold_are_state_conditional_and_audited(pool: PgPool) {
         409,
         "already_held",
     );
-    // The ship-deadline job skips a held order.
+    // The ship-deadline job (switched on: it ships off) skips a held order.
+    exec(
+        &app,
+        "UPDATE platform_settings SET jobs_ship_deadline_enabled = true",
+    )
+    .await;
     exec(
         &app,
         "UPDATE orders SET ship_by = now() - interval '1 hour'",
