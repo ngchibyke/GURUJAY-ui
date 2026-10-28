@@ -270,6 +270,11 @@ pub struct Reconciliation {
     /// Payouts the provider reported paying a different amount for. The last
     /// [`ALERT_WINDOW_DAYS`] days, newest first.
     pub payout_amount_mismatches: Vec<PayoutAmountMismatch>,
+    /// Scheduled payouts that have waited more than [`BLOCKED_AFTER_DAYS`]
+    /// days on something only a person can fix: a held order, a provider flag
+    /// on the payment, or a payout account that is missing or not verified
+    /// (M9). Oldest first.
+    pub blocked_payouts: Vec<PayoutView>,
     /// Rows per section; a full section has more behind it.
     pub limit: i64,
 }
@@ -277,6 +282,10 @@ pub struct Reconciliation {
 /// How far back the audit-log alert sections of [`Reconciliation`] look.
 /// The alerts have no acknowledgement: they age out instead.
 pub const ALERT_WINDOW_DAYS: i32 = 30;
+
+/// How long a scheduled payout may wait on a person before the
+/// reconciliation lists it as blocked.
+pub const BLOCKED_AFTER_DAYS: i32 = 7;
 
 /// A `payout.provider_outcome_after_close` alert.
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -310,8 +319,22 @@ pub async fn reconciliation(db: &PgPool, owner: bool) -> Result<Reconciliation, 
     .fetch_all(db)
     .await
     .context("list attention payouts")?;
+    let mut blocked_payouts = sqlx::query_as::<_, PayoutView>(&format!(
+        "{PAYOUT_SELECT} JOIN checkouts c ON c.id = o.checkout_id \
+         LEFT JOIN payout_accounts a ON a.store_id = o.store_id \
+         WHERE p.status = 'scheduled' \
+           AND COALESCE(p.send_after, p.created_at) < now() - make_interval(days => $2) \
+           AND (o.held_at IS NOT NULL OR c.provider_flagged \
+                OR a.store_id IS NULL OR a.status <> 'verified') \
+         ORDER BY COALESCE(p.send_after, p.created_at), p.id LIMIT $1"
+    ))
+    .bind(MAX_LIMIT)
+    .bind(BLOCKED_AFTER_DAYS)
+    .fetch_all(db)
+    .await
+    .context("list blocked payouts")?;
     if !owner {
-        for p in &mut payouts {
+        for p in payouts.iter_mut().chain(blocked_payouts.iter_mut()) {
             p.bank_code = None;
         }
     }
@@ -355,6 +378,7 @@ pub async fn reconciliation(db: &PgPool, owner: bool) -> Result<Reconciliation, 
         mismatched_checkouts: checkouts(db, "amount_mismatch", MAX_LIMIT).await?,
         late_provider_outcomes,
         payout_amount_mismatches,
+        blocked_payouts,
         limit: MAX_LIMIT,
     })
 }

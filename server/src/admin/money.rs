@@ -44,7 +44,6 @@ fn payout_state(status: &str) -> AppError {
 struct LockedPayout {
     status: String,
     attempts: i32,
-    updated_at: time::OffsetDateTime,
     round: i32,
     amount_kobo: i64,
     order_id: Uuid,
@@ -71,7 +70,7 @@ async fn lock_payout(
     .map_err(db_err("lock order"))?
     .ok_or(AppError::NotFound)?;
     sqlx::query_as(
-        "SELECT p.status::text AS status, p.attempts, p.updated_at, p.round, p.amount_kobo, \
+        "SELECT p.status::text AS status, p.attempts, p.round, p.amount_kobo, \
                 p.order_id, o.checkout_id, p.reference \
          FROM payouts p JOIN orders o ON o.id = p.order_id WHERE p.id = $1 FOR UPDATE OF p",
     )
@@ -89,7 +88,6 @@ struct PaidCheck {
     provider_payout_id: Option<String>,
     last_error: Option<String>,
     attempts: i32,
-    updated_at: time::OffsetDateTime,
 }
 
 /// Who settled the payout on a mark-paid request.
@@ -150,13 +148,21 @@ impl Lookup {
 ///   naming the new status (the owner may then mark it paid); still pending
 ///   -> 409 `payout_pending_at_provider`;
 /// - the provider cannot answer: 503 `provider_unavailable`, nothing changed;
-/// - the provider answers but cannot tell (inconclusive lookup): 409
-///   `provider_lookup_inconclusive`, unless `attested` (the owner checked the
-///   provider's dashboard), when the owner's payment is recorded and the audit
-///   says `attested: true, lookup: "inconclusive"`.
+/// - the provider answers but cannot tell whether it has the payout
+///   (inconclusive lookup): 409 `provider_lookup_inconclusive`, unless
+///   `attested` (the owner checked the provider's dashboard), when the owner's
+///   payment is recorded and the audit says `attested: true, lookup:
+///   "inconclusive"`;
+/// - the provider has the payout but cannot tell its status: 409
+///   `payout_pending_at_provider`, never attestable (it may still pay it).
 ///
-/// The transaction then re-checks that the payout did not change since it
-/// was read (409 `payout_changed`), so a send that claimed it meanwhile wins.
+/// A `failed` payout is not looked up again (M2): `failed` is only ever set
+/// from the provider's own final answer to a status lookup (failed or
+/// reversed), so another lookup would only repeat that answer.
+///
+/// The transaction then re-checks that the payout's status and attempts did
+/// not change since it was read (409 `payout_changed`), so a send that
+/// claimed it meanwhile wins; a `defer` bumping only `updated_at` does not.
 pub async fn mark_paid(
     state: &AppState,
     actor: Uuid,
@@ -167,7 +173,7 @@ pub async fn mark_paid(
 ) -> Result<MarkedPaid, AppError> {
     let before: PaidCheck = sqlx::query_as(
         "SELECT status::text AS status, reference, provider, provider_payout_id, last_error, \
-                attempts, updated_at \
+                attempts \
          FROM payouts WHERE id = $1",
     )
     .bind(payout_id)
@@ -196,7 +202,9 @@ pub async fn mark_paid(
     if !MARK_PAID_FROM.contains(&p.status.as_str()) {
         return Err(payout_state(&p.status));
     }
-    if p.attempts != before.attempts || p.updated_at != before.updated_at {
+    // Status and attempts only: a `defer` (held order, unverified account)
+    // bumps `updated_at` without claiming the payout.
+    if p.status != before.status || p.attempts != before.attempts {
         return Err(AppError::Conflict("payout_changed"));
     }
     sqlx::query(
@@ -312,17 +320,22 @@ async fn provider_has_it(
         json!({ "prior_status": p.status, "outcome": label }),
     )
     .await?;
+    // Here the provider has the payout (it gave us an id, or the lookup found
+    // it), so a status it cannot tell is a payout it may still pay: never
+    // attestable.
+    let pending = |status: &str| {
+        AppError::ConflictDetail(
+            "payout_pending_at_provider",
+            format!("the provider has this payout and it is not final (payout is {status})"),
+        )
+    };
     match outcome {
         SettlePayoutOutcome::Settled { status } if status == "successful" => Ok(None),
         SettlePayoutOutcome::Settled { status } if status == "failed" => Err(payout_state(&status)),
-        SettlePayoutOutcome::Settled { status } => Err(AppError::ConflictDetail(
-            "payout_pending_at_provider",
-            format!("the provider has this payout and it is not final (payout is {status})"),
-        )),
+        SettlePayoutOutcome::Settled { status } => Err(pending(&status)),
         SettlePayoutOutcome::UnknownReference => Err(AppError::Conflict("payout_changed")),
         SettlePayoutOutcome::RetryLater => Err(provider_unavailable()),
-        SettlePayoutOutcome::Inconclusive if attested => Ok(Some(Lookup::Inconclusive)),
-        SettlePayoutOutcome::Inconclusive => Err(lookup_inconclusive()),
+        SettlePayoutOutcome::Inconclusive => Err(pending(&p.status)),
     }
 }
 
@@ -427,9 +440,11 @@ pub async fn mark_refunded(
 /// the system (refunded the buyer by hand, settled it with the provider) and
 /// records that, with the reference they checked. **This moves no money and
 /// writes no ledger entry**: it only records the owner's handling, so the
-/// checkout leaves the attention lists. A provider flag still gates payouts
-/// until it is cleared (`clear-flag`). 409 `nothing_to_resolve` for a
-/// checkout that needs neither, `already_resolved` on a retry.
+/// checkout leaves the attention lists. A provider-flagged checkout is 409
+/// `clear_flag_first`: the flag gates its payouts, and resolving it would take
+/// them off every list (a cleared flag leaves the flagged list by itself).
+/// 409 `nothing_to_resolve` for a checkout that needs nothing,
+/// `already_resolved` on a retry.
 pub async fn resolve_checkout(
     db: &PgPool,
     actor: Uuid,
@@ -454,7 +469,13 @@ pub async fn resolve_checkout(
     if resolved {
         return Err(AppError::Conflict("already_resolved"));
     }
-    if status != "amount_mismatch" && !flagged {
+    // A resolved checkout leaves the flagged list, but a provider flag keeps
+    // gating its payouts: resolving first would hide them. The owner clears
+    // the flag (or not) first.
+    if flagged {
+        return Err(AppError::Conflict("clear_flag_first"));
+    }
+    if status != "amount_mismatch" {
         return Err(AppError::Conflict("nothing_to_resolve"));
     }
     sqlx::query(
@@ -557,7 +578,7 @@ struct VerifiedAccount {
 /// failed payouts to `manual`), once the seller's payout account has been
 /// re-verified (409 `payout_account_unverified`), and once the provider
 /// confirms the old reference was not paid (409
-/// `payout_not_confirmed_reversed`; 502 when it cannot answer; 409
+/// `payout_not_confirmed_reversed`; 503 `provider_unavailable` when it cannot answer; 409
 /// `provider_lookup_inconclusive` when it answers but cannot tell, unless
 /// `attested`: the owner checked the provider's dashboard and attests the old
 /// reference was not paid, which the audit records). The provider
@@ -588,7 +609,7 @@ pub async fn requeue(
     let provider = state
         .providers
         .by_name(&before.provider)
-        .ok_or(AppError::ProviderUnavailable)?;
+        .ok_or_else(provider_unavailable)?;
     let answer = tokio::time::timeout(
         PAYOUT_CALL_TIMEOUT,
         provider.payout_status(&before.reference, before.provider_payout_id.as_deref()),
@@ -601,14 +622,14 @@ pub async fn requeue(
         Ok(Err(ProviderError::Inconclusive)) => return Err(lookup_inconclusive()),
         Ok(Err(e)) => {
             tracing::warn!(provider = provider.name(), error = %e, "payout status for re-queue failed");
-            return Err(AppError::ProviderUnavailable);
+            return Err(provider_unavailable());
         }
         Err(_) => {
             tracing::warn!(
                 provider = provider.name(),
                 "payout status for re-queue timed out"
             );
-            return Err(AppError::ProviderUnavailable);
+            return Err(provider_unavailable());
         }
     };
 

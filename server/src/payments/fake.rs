@@ -64,6 +64,7 @@ pub struct FakeProvider {
     refund_failure: Mutex<Option<ProviderError>>,
     refund_delay: Mutex<Option<std::time::Duration>>,
     payout_delay: Mutex<Option<std::time::Duration>>,
+    find_payout_delay: Mutex<Option<std::time::Duration>>,
     lookup: Mutex<Option<Result<String, ProviderError>>>,
     calls: Mutex<HashMap<&'static str, usize>>,
     initiated: Mutex<Vec<InitiatePayment>>,
@@ -183,6 +184,12 @@ impl FakeProvider {
     /// `delay` before returning it (a slow provider; one-shot).
     pub fn delay_next_payout(&self, delay: std::time::Duration) {
         *self.payout_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// The next `find_payout` call decides its answer on entry, then waits
+    /// `delay` before returning it (one-shot).
+    pub fn delay_next_find_payout(&self, delay: std::time::Duration) {
+        *self.find_payout_delay.lock().unwrap() = Some(delay);
     }
 
     pub fn clear_refund_failure(&self) {
@@ -326,14 +333,19 @@ impl PaymentProvider for FakeProvider {
         if let Some(e) = self.find_payout_failure.lock().unwrap().as_ref() {
             return Err(copy_err(e));
         }
-        Ok(self
+        let found = self
             .found_payouts
             .lock()
             .unwrap()
             .get(reference)
             .cloned()
             .flatten()
-            .map(|provider_payout_id| PayoutHandle { provider_payout_id }))
+            .map(|provider_payout_id| PayoutHandle { provider_payout_id });
+        let delay = self.find_payout_delay.lock().unwrap().take();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        Ok(found)
     }
 
     async fn refund(&self, req: RefundRequest) -> Result<RefundHandle, ProviderError> {

@@ -280,7 +280,8 @@ async fn reconciliation(
         + r.flagged_checkouts.len()
         + r.mismatched_checkouts.len()
         + r.late_provider_outcomes.len()
-        + r.payout_amount_mismatches.len();
+        + r.payout_amount_mismatches.len()
+        + r.blocked_payouts.len();
     viewed(&state, &staff.0, "reconciliation", rows).await?;
     Ok(Json(r))
 }

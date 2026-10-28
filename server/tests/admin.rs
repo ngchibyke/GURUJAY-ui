@@ -1575,18 +1575,27 @@ async fn resolving_a_checkout_takes_it_off_the_lists(pool: PgPool) {
     let entries = count(&app, "SELECT count(*) FROM ledger_entries").await;
     let body = json!({ "note": "refunded by hand", "provider_reference": "NIP-42" });
 
-    for id in [mismatched, flagged.checkout_id] {
-        let path = format!("/admin/checkouts/{id}/resolve");
-        let res = post(&app, &owner, &path, body.clone()).await;
-        assert_eq!(res.status, 200, "{}", res.json);
-        assert_eq!(res.json["resolved"], true);
-        // A retry acts once.
-        assert_code(
-            &post(&app, &owner, &path, body.clone()).await,
-            409,
-            "already_resolved",
-        );
-    }
+    let path = format!("/admin/checkouts/{mismatched}/resolve");
+    let res = post(&app, &owner, &path, body.clone()).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["resolved"], true);
+    // A retry acts once.
+    assert_code(
+        &post(&app, &owner, &path, body.clone()).await,
+        409,
+        "already_resolved",
+    );
+    // (2): a flagged checkout is not resolved (that would hide its gated
+    // payout); clearing the flag takes it off the list.
+    let path = format!("/admin/checkouts/{}/resolve", flagged.checkout_id);
+    assert_code(
+        &post(&app, &owner, &path, body.clone()).await,
+        409,
+        "clear_flag_first",
+    );
+    let path = format!("/admin/checkouts/{}/clear-flag", flagged.checkout_id);
+    let res = post(&app, &owner, &path, json!({ "note": "checked" })).await;
+    assert_eq!(res.status, 200, "{}", res.json);
     for which in ["amount_mismatch", "flagged"] {
         let res = get(&app, &owner, &format!("/admin/checkouts?status={which}")).await;
         assert_eq!(res.status, 200, "{}", res.json);
@@ -1604,11 +1613,10 @@ async fn resolving_a_checkout_takes_it_off_the_lists(pool: PgPool) {
         entries
     );
     let rows = audits(&app, "admin.checkout_resolved").await;
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, Some(owner_id(&app).await));
     assert_eq!(rows[0].1["prior_status"], "amount_mismatch");
     assert_eq!(rows[0].1["provider_reference"], "NIP-42");
-    assert_eq!(rows[1].1["provider_flagged"], true);
 }
 
 #[sqlx::test]
@@ -1998,4 +2006,203 @@ async fn payout_matching_amount_raises_no_alert(pool: PgPool) {
     settle_payout(&app.state, &reference).await.unwrap();
     assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
     assert!(audits(&app, "payout.amount_mismatch").await.is_empty());
+}
+
+// --------------------------------------------- final wave: override checks
+
+/// (3): a `defer` bumping `updated_at` (held order, unverified account) while
+/// mark-paid asks the provider does not turn into a spurious 409.
+#[sqlx::test]
+async fn mark_paid_ignores_an_updated_at_bump_during_the_lookup(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, _) = unknown_payout(&app, false).await;
+    let owner = app.owner_token().await;
+    app.fake
+        .delay_next_find_payout(std::time::Duration::from_millis(400));
+    let path = format!("/admin/payouts/{id}/mark-paid");
+    let bump = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        exec(
+            &app,
+            "UPDATE payouts SET updated_at = now() + interval '1 second'",
+        )
+        .await;
+    };
+    let (res, ()) = tokio::join!(post(&app, &owner, &path, mark_paid_body()), bump);
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["settled_by"], "owner");
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+}
+
+/// (9): once the provider is known to have the payout, a status it cannot
+/// tell is 409 `payout_pending_at_provider`, even with the owner's attestation.
+#[sqlx::test]
+async fn mark_paid_found_then_inconclusive_is_never_attestable(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (id, _) = unknown_payout(&app, true).await;
+    let owner = app.owner_token().await;
+    app.fake.fail_payout_status_with(ProviderError::Inconclusive);
+    let path = format!("/admin/payouts/{id}/mark-paid");
+    let mut body = mark_paid_body();
+    body["attest_provider_checked"] = json!(true);
+    for b in [mark_paid_body(), body] {
+        let res = post(&app, &owner, &path, b).await;
+        assert_code(&res, 409, "payout_pending_at_provider");
+    }
+    assert_eq!(
+        text(&app, "SELECT status::text FROM payouts").await,
+        "unknown"
+    );
+    assert_eq!(balance(&app, "seller_paid").await, 0);
+    assert_eq!(audits(&app, "admin.payout_marked_paid").await.len(), 0);
+}
+
+/// M2 (documented choice): a `failed` payout holds the provider's own final
+/// answer, so mark-paid does not ask again, even with a provider id.
+#[sqlx::test]
+async fn mark_paid_on_a_failed_payout_does_not_ask_the_provider_again(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (_, id, reference) = pending_payout(&app).await;
+    app.fake
+        .set_payout_state(&reference, PayoutState::Failed { reason: "x".into() });
+    settle_payout(&app.state, &reference).await.unwrap();
+    exec(&app, "UPDATE payouts SET provider_payout_id = 'PROV-1'").await;
+    assert_eq!(text(&app, "SELECT status::text FROM payouts").await, "failed");
+    let finds = app.fake.calls("find_payout");
+    let statuses = app.fake.calls("payout_status");
+    let owner = app.owner_token().await;
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/payouts/{id}/mark-paid"),
+        mark_paid_body(),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["settled_by"], "owner");
+    assert_eq!(app.fake.calls("find_payout"), finds);
+    assert_eq!(app.fake.calls("payout_status"), statuses);
+    assert_eq!(audits(&app, "admin.payout_marked_paid").await[0].1["lookup"], "not_needed");
+}
+
+/// M7: re-queue answers 503 `provider_unavailable` like mark-paid.
+#[sqlx::test]
+async fn requeue_is_503_when_the_provider_cannot_answer(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (f, payout_id, _) = reversed_payout(&app).await;
+    let owner = app.owner_token().await;
+    let view = get(
+        &app,
+        &owner,
+        &format!("/admin/stores/{}/payout-account", f.store_id),
+    )
+    .await;
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/stores/{}/payout-account/verify", f.store_id),
+        json!({ "account_name": "ADA OBI", "changed_at": view.json["changed_at"] }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    app.fake
+        .fail_payout_status_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/payouts/{payout_id}/requeue"),
+        json!({ "note": "seller fixed the account" }),
+    )
+    .await;
+    assert_code(&res, 503, "provider_unavailable");
+    assert_eq!(audits(&app, "admin.payout_requeued").await.len(), 0);
+}
+
+/// M8: the payout-account admin routes check the role before the body.
+#[sqlx::test]
+async fn payout_account_admin_routes_check_the_role_before_the_body(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = delivered_order(&app).await;
+    let support = app.make_support().await;
+    let (_, seller) = app.sign_up_verified("08033333331").await;
+    let path = format!("/admin/stores/{}/payout-account/verify", f.store_id);
+    for token in [&support, &seller] {
+        let res = post(&app, token, &path, json!(["not", "a", "body"])).await;
+        assert_eq!(res.status, 403, "{}", res.json);
+        let res = get(
+            &app,
+            token,
+            &format!("/admin/stores/{}/payout-account", f.store_id),
+        )
+        .await;
+        assert_eq!(res.status, 403, "{}", res.json);
+    }
+    // The owner with the same body gets the body error.
+    let owner = app.owner_token().await;
+    let res = post(&app, &owner, &path, json!(["not", "a", "body"])).await;
+    assert!(res.status == 400 || res.status == 422, "{}", res.json);
+}
+
+async fn blocked(app: &TestApp, token: String) -> Vec<Value> {
+    let res = get(app, &token, "/admin/reconciliation").await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    res.json["blocked_payouts"].as_array().unwrap().clone()
+}
+
+/// M9: a scheduled payout waiting over 7 days on a person (held order,
+/// flagged payment, unverified account) is on the attention list.
+#[sqlx::test]
+async fn reconciliation_lists_payouts_blocked_for_a_week(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (f, id, _) = pending_payout(&app).await;
+    let owner = app.owner_token().await;
+    exec(
+        &app,
+        "UPDATE payouts SET status = 'scheduled', send_after = now() - interval '6 days'",
+    )
+    .await;
+    exec(&app, "UPDATE orders SET held_at = now(), hold_reason = 'x'").await;
+    assert!(blocked(&app, owner.clone()).await.is_empty(), "under a week");
+
+    exec(&app, "UPDATE payouts SET send_after = now() - interval '8 days'").await;
+    let items = blocked(&app, owner.clone()).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], id.to_string());
+    // Support sees it too, without the bank code.
+    let items = blocked(&app, app.make_support().await).await;
+    assert_eq!(items.len(), 1);
+    assert!(items[0]["bank_code"].is_null());
+
+    // Each blocker on its own lists it; nothing blocking, it is not listed.
+    exec(&app, "UPDATE orders SET held_at = NULL, hold_reason = NULL").await;
+    assert!(blocked(&app, owner.clone()).await.is_empty(), "not blocked");
+    exec(&app, "UPDATE checkouts SET provider_flagged = true").await;
+    assert_eq!(blocked(&app, owner.clone()).await.len(), 1, "flagged");
+    exec(&app, "UPDATE checkouts SET provider_flagged = false").await;
+    exec(
+        &app,
+        &format!(
+            "UPDATE payout_accounts SET status = 'pending', verified_by = NULL, \
+             verified_at = NULL WHERE store_id = '{}'",
+            f.store_id
+        ),
+    )
+    .await;
+    assert_eq!(blocked(&app, owner.clone()).await.len(), 1, "unverified");
+}
+
+/// M5: the database refuses a negative payout and a successful payout that
+/// does not say who settled it.
+#[sqlx::test]
+async fn payouts_refuse_negative_amounts_and_unattributed_success(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    pending_payout(&app).await;
+    for sql in [
+        "UPDATE payouts SET amount_kobo = -1",
+        "UPDATE payouts SET status = 'successful', settled_by = NULL",
+    ] {
+        let err = sqlx::query(sql).execute(&app.pool).await.unwrap_err();
+        assert!(err.to_string().contains("check constraint"), "{sql}: {err}");
+    }
+    exec(&app, "UPDATE payouts SET status = 'successful', settled_by = 'provider'").await;
 }

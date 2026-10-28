@@ -53,7 +53,6 @@
 //! the order and payout locks. The seller's account change and the owner's
 //! verify lock `payout_accounts` alone, never an order or payout after it, so
 //! neither can deadlock with the order/payout locks.
-
 //!
 //! Personal data: the seller's account number is decrypted only for the
 //! provider call and never logged, audited or returned.

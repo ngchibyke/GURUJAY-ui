@@ -8,7 +8,8 @@ use uuid::Uuid;
 use super::service::{self, PayoutAccountView, SetPayoutAccount, VerifyPayoutAccount};
 use crate::{
     AppState,
-    auth::{AuthUser, Role},
+    admin::Owner,
+    auth::AuthUser,
     error::AppError,
     extract::AppJson,
     stores::routes::require_seller,
@@ -50,10 +51,9 @@ async fn show(
 
 async fn admin_show(
     State(state): State<AppState>,
-    user: AuthUser,
+    Owner(user): Owner,
     Path(id): Path<String>,
 ) -> Result<Json<PayoutAccountView>, AppError> {
-    user.require_role(Role::Owner)?;
     Ok(Json(
         service::get_for_admin(&state, user.id, parse_id(&id)?).await?,
     ))
@@ -61,11 +61,10 @@ async fn admin_show(
 
 async fn verify(
     State(state): State<AppState>,
-    user: AuthUser,
+    Owner(user): Owner,
     Path(id): Path<String>,
     AppJson(body): AppJson<VerifyPayoutAccount>,
 ) -> Result<Json<PayoutAccountView>, AppError> {
-    user.require_role(Role::Owner)?;
     Ok(Json(
         service::owner_verify(&state, user.id, parse_id(&id)?, body).await?,
     ))

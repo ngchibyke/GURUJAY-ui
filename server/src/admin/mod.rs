@@ -80,10 +80,63 @@ pub(crate) fn parse_id(key: &str) -> Result<Uuid, AppError> {
     key.parse().map_err(|_| AppError::NotFound)
 }
 
+/// Whether `c[i..]` starts with `n` ASCII digits.
+fn digits_at(c: &[char], i: usize, n: usize) -> bool {
+    c.len() >= i + n && c[i..i + n].iter().all(char::is_ascii_digit)
+}
+
+/// The length of an ISO date (`2026-10-28`) or a clock time (`9:05`,
+/// `14.30`) starting at `c[i]`, if one does. Neither may continue into more
+/// digits; a time may not continue into `<separator><digit>` either, so a
+/// dotted number ("12.34.56.7890") is never read as a time.
+fn date_or_time_at(c: &[char], i: usize) -> Option<usize> {
+    if i > 0 && c[i - 1].is_ascii_digit() {
+        return None;
+    }
+    let ends = |end: usize| !c.get(end).is_some_and(char::is_ascii_digit);
+    if digits_at(c, i, 4)
+        && c.get(i + 4) == Some(&'-')
+        && digits_at(c, i + 5, 2)
+        && c.get(i + 7) == Some(&'-')
+        && digits_at(c, i + 8, 2)
+        && ends(i + 10)
+    {
+        return Some(10);
+    }
+    for hour in [1, 2] {
+        let end = i + hour + 3;
+        if digits_at(c, i, hour)
+            && matches!(c.get(i + hour), Some(':' | '.'))
+            && digits_at(c, i + hour + 1, 2)
+            && ends(end)
+            && !(matches!(c.get(end), Some(' ' | '-' | '.' | ':'))
+                && c.get(end + 1).is_some_and(char::is_ascii_digit))
+        {
+            return Some(hour + 3);
+        }
+    }
+    None
+}
+
 /// Longest run of ASCII digits in `s`, ignoring the separators people write
 /// inside an account number (spaces, `-`, `.`): "0123 456 785" is one run.
+/// ISO dates and clock times are not digits for this count (item (5)): "on
+/// 2026-10-28 at 14:30" has no long run.
 fn longest_digit_run(s: &str) -> usize {
-    s.chars()
+    let c: Vec<char> = s.chars().collect();
+    let mut masked = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < c.len() {
+        if let Some(n) = date_or_time_at(&c, i) {
+            masked.push('_');
+            i += n;
+        } else {
+            masked.push(c[i]);
+            i += 1;
+        }
+    }
+    masked
+        .chars()
         .filter(|c| !matches!(c, ' ' | '-' | '.'))
         .collect::<String>()
         .split(|c: char| !c.is_ascii_digit())
@@ -153,6 +206,31 @@ mod tests {
         assert!(note("note", Some("to 012.345.6785"), 500).is_err());
         assert!(note("note", Some("order 12345, ref 67890"), 500).is_ok());
         assert!(note("note", Some("a\u{0}b"), 500).is_err());
+    }
+
+    /// Item (5): dates and times are not account numbers; numbers still are.
+    #[test]
+    fn notes_allow_dates_and_times_but_not_account_numbers() {
+        for ok in [
+            "paid on 2026-10-28 at 14:30",
+            "paid 2026-10-28 10:30:15",
+            "transfer at 9.05 on 2026-10-28",
+            "between 10:30-11:00 on 2026-10-28",
+            "2026-10-28 2026-10-29",
+        ] {
+            assert!(note("note", Some(ok), 500).is_ok(), "{ok}");
+        }
+        for bad in [
+            "0123 456 7890",
+            "0123-456-7890",
+            "to 0123456785 on 2026-10-28",
+            "2026-10-28 0123456785",
+            "at 14:30 0123 456 785",
+            "12.34.56.7890",
+            "2026-10-280123456785",
+        ] {
+            assert!(note("note", Some(bad), 500).is_err(), "{bad}");
+        }
         assert!(note("note", Some(&"x".repeat(501)), 500).is_err());
     }
 
