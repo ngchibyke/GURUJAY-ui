@@ -18,7 +18,7 @@ Payments and escrow (part 2):
 
 - **Paying:** a cart becomes one checkout paid through Mono DirectPay (behind a provider layer that can be switched), split into one order per store. Stock is reserved while the buyer pays.
 - **Held funds and ledger:** every money movement is a balanced entry in an append-only, double-entry ledger, and the platform takes a 5% cut.
-- **Payouts:** sellers register a payout account, which is verified and stored encrypted. Funds are released to the seller through Mono Disburse after the buyer confirms, or 3 days after delivery.
+- **Payouts:** sellers register a payout account, which is verified and stored encrypted. Funds are released to the seller through Mono Disburse after the buyer confirms, or 3 days after delivery. The pickup and delivery steps arrive in part 3, so until then orders stay at `paid` and nothing is released automatically.
 - **Refunds and cancellations:** refunds are retried by a background sweeper.
 - **Background jobs:** expiry, lost-webhook re-verification, auto-release, the 30-day backstop queue and payout polling.
 - **Owner admin:** release, refund and hold orders; mark payouts paid or refunds refunded by hand; re-queue reversed payouts. A reconciliation list shows everything that needs attention. Every staff read and override is audited.
