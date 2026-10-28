@@ -7,11 +7,7 @@ use uuid::Uuid;
 
 use super::service::{self, PayoutAccountView, SetPayoutAccount, VerifyPayoutAccount};
 use crate::{
-    AppState,
-    admin::Owner,
-    auth::AuthUser,
-    error::AppError,
-    extract::AppJson,
+    AppState, admin::Owner, auth::AuthUser, error::AppError, extract::AppJson,
     stores::routes::require_seller,
 };
 

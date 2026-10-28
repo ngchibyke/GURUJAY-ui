@@ -204,8 +204,13 @@ async fn pending_payout(app: &TestApp) -> (Fixture, Uuid, String) {
 /// A paid-out payout whose success was then reversed by the bank.
 async fn reversed_payout(app: &TestApp) -> (Fixture, Uuid, String) {
     let (f, id, reference) = pending_payout(app).await;
-    app.fake
-        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 3_000, amount_kobo: None });
+    app.fake.set_payout_state(
+        &reference,
+        PayoutState::Successful {
+            fee_kobo: 3_000,
+            amount_kobo: None,
+        },
+    );
     settle_payout(&app.state, &reference).await.unwrap();
     app.fake.set_payout_state(
         &reference,
@@ -807,8 +812,13 @@ async fn reversal_requires_reverification_and_requeue_mints_a_new_reference(pool
     assert_eq!(res.status, 200, "{}", res.json);
 
     // The provider must confirm the old reference was not paid.
-    app.fake
-        .set_payout_state(&old_ref, PayoutState::Successful { fee_kobo: 0, amount_kobo: None });
+    app.fake.set_payout_state(
+        &old_ref,
+        PayoutState::Successful {
+            fee_kobo: 0,
+            amount_kobo: None,
+        },
+    );
     let res = post(&app, &owner, &path, body.clone()).await;
     assert_code(&res, 409, "payout_not_confirmed_reversed");
     assert_eq!(app.fake.calls("payout_status"), calls + 1);
@@ -844,8 +854,13 @@ async fn reversal_requires_reverification_and_requeue_mints_a_new_reference(pool
     );
 
     // The second success books once more under its own round.
-    app.fake
-        .set_payout_state(&new_ref, PayoutState::Successful { fee_kobo: 2_000, amount_kobo: None });
+    app.fake.set_payout_state(
+        &new_ref,
+        PayoutState::Successful {
+            fee_kobo: 2_000,
+            amount_kobo: None,
+        },
+    );
     settle_payout(&app.state, &new_ref).await.unwrap();
     assert_eq!(
         count(
@@ -1321,8 +1336,13 @@ async fn mark_paid_on_a_payout_the_provider_paid_settles_it_normally(pool: PgPoo
     let app = TestApp::new(pool).await;
     let (id, reference) = unknown_payout(&app, true).await;
     let owner = app.owner_token().await;
-    app.fake
-        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 3_000, amount_kobo: None });
+    app.fake.set_payout_state(
+        &reference,
+        PayoutState::Successful {
+            fee_kobo: 3_000,
+            amount_kobo: None,
+        },
+    );
     let finds = app.fake.calls("find_payout");
     let statuses = app.fake.calls("payout_status");
     let fees = balance(&app, "provider_fees").await;
@@ -1820,12 +1840,8 @@ async fn late_provider_success_on_an_owner_settled_payout_alerts(pool: PgPool) {
     let alerts = || audits(&app, "payout.provider_outcome_after_close");
 
     // A provider failure is consistent with the owner paying: no alert.
-    app.fake.set_payout_state(
-        &reference,
-        PayoutState::Failed {
-            reason: "x".into(),
-        },
-    );
+    app.fake
+        .set_payout_state(&reference, PayoutState::Failed { reason: "x".into() });
     assert_received(&payout_webhook(&app, "po-1", &reference).await);
     assert!(alerts().await.is_empty());
 
@@ -2041,7 +2057,8 @@ async fn mark_paid_found_then_inconclusive_is_never_attestable(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let (id, _) = unknown_payout(&app, true).await;
     let owner = app.owner_token().await;
-    app.fake.fail_payout_status_with(ProviderError::Inconclusive);
+    app.fake
+        .fail_payout_status_with(ProviderError::Inconclusive);
     let path = format!("/admin/payouts/{id}/mark-paid");
     let mut body = mark_paid_body();
     body["attest_provider_checked"] = json!(true);
@@ -2067,7 +2084,10 @@ async fn mark_paid_on_a_failed_payout_does_not_ask_the_provider_again(pool: PgPo
         .set_payout_state(&reference, PayoutState::Failed { reason: "x".into() });
     settle_payout(&app.state, &reference).await.unwrap();
     exec(&app, "UPDATE payouts SET provider_payout_id = 'PROV-1'").await;
-    assert_eq!(text(&app, "SELECT status::text FROM payouts").await, "failed");
+    assert_eq!(
+        text(&app, "SELECT status::text FROM payouts").await,
+        "failed"
+    );
     let finds = app.fake.calls("find_payout");
     let statuses = app.fake.calls("payout_status");
     let owner = app.owner_token().await;
@@ -2082,7 +2102,10 @@ async fn mark_paid_on_a_failed_payout_does_not_ask_the_provider_again(pool: PgPo
     assert_eq!(res.json["settled_by"], "owner");
     assert_eq!(app.fake.calls("find_payout"), finds);
     assert_eq!(app.fake.calls("payout_status"), statuses);
-    assert_eq!(audits(&app, "admin.payout_marked_paid").await[0].1["lookup"], "not_needed");
+    assert_eq!(
+        audits(&app, "admin.payout_marked_paid").await[0].1["lookup"],
+        "not_needed"
+    );
 }
 
 /// M7: re-queue answers 503 `provider_unavailable` like mark-paid.
@@ -2162,9 +2185,16 @@ async fn reconciliation_lists_payouts_blocked_for_a_week(pool: PgPool) {
     )
     .await;
     exec(&app, "UPDATE orders SET held_at = now(), hold_reason = 'x'").await;
-    assert!(blocked(&app, owner.clone()).await.is_empty(), "under a week");
+    assert!(
+        blocked(&app, owner.clone()).await.is_empty(),
+        "under a week"
+    );
 
-    exec(&app, "UPDATE payouts SET send_after = now() - interval '8 days'").await;
+    exec(
+        &app,
+        "UPDATE payouts SET send_after = now() - interval '8 days'",
+    )
+    .await;
     let items = blocked(&app, owner.clone()).await;
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["id"], id.to_string());
@@ -2204,5 +2234,9 @@ async fn payouts_refuse_negative_amounts_and_unattributed_success(pool: PgPool) 
         let err = sqlx::query(sql).execute(&app.pool).await.unwrap_err();
         assert!(err.to_string().contains("check constraint"), "{sql}: {err}");
     }
-    exec(&app, "UPDATE payouts SET status = 'successful', settled_by = 'provider'").await;
+    exec(
+        &app,
+        "UPDATE payouts SET status = 'successful', settled_by = 'provider'",
+    )
+    .await;
 }

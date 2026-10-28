@@ -1089,8 +1089,13 @@ async fn pending_payout(app: &TestApp) -> PayoutRow {
 async fn payout_success_moves_payable_to_paid(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let p = pending_payout(&app).await;
-    app.fake
-        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 3_000, amount_kobo: None });
+    app.fake.set_payout_state(
+        &p.reference,
+        PayoutState::Successful {
+            fee_kobo: 3_000,
+            amount_kobo: None,
+        },
+    );
     assert_eq!(
         settle_payout(&app.state, &p.reference).await.unwrap(),
         SettlePayoutOutcome::Settled {
@@ -1123,8 +1128,13 @@ async fn payout_success_moves_payable_to_paid(pool: PgPool) {
 async fn reversal_posts_once(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let p = pending_payout(&app).await;
-    app.fake
-        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 3_000, amount_kobo: None });
+    app.fake.set_payout_state(
+        &p.reference,
+        PayoutState::Successful {
+            fee_kobo: 3_000,
+            amount_kobo: None,
+        },
+    );
     settle_payout(&app.state, &p.reference).await.unwrap();
     app.fake.set_payout_state(
         &p.reference,
@@ -1164,8 +1174,13 @@ async fn reversal_posts_once(pool: PgPool) {
 async fn failed_after_success_reported_as_failed_also_reverses(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let p = pending_payout(&app).await;
-    app.fake
-        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 0, amount_kobo: None });
+    app.fake.set_payout_state(
+        &p.reference,
+        PayoutState::Successful {
+            fee_kobo: 0,
+            amount_kobo: None,
+        },
+    );
     settle_payout(&app.state, &p.reference).await.unwrap();
     app.fake.set_payout_state(
         &p.reference,
@@ -1226,8 +1241,13 @@ async fn pending_over_24h_goes_manual_not_failed(pool: PgPool) {
     assert_eq!(app.fake.calls("create_payout"), 1);
 
     // A late success still settles a manual payout the provider accepted.
-    app.fake
-        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 0, amount_kobo: None });
+    app.fake.set_payout_state(
+        &p.reference,
+        PayoutState::Successful {
+            fee_kobo: 0,
+            amount_kobo: None,
+        },
+    );
     settle_payout(&app.state, &p.reference).await.unwrap();
     assert_eq!(payout(&app).await.status, "successful");
     assert_eq!(balance(&app, "seller_paid").await, 945_000);
@@ -1255,8 +1275,13 @@ fn payout_hook(event_id: &str, reference: &str) -> Vec<u8> {
 async fn payout_webhook_settles_status(pool: PgPool) {
     let app = TestApp::new(pool).await;
     let p = pending_payout(&app).await;
-    app.fake
-        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 3_000, amount_kobo: None });
+    app.fake.set_payout_state(
+        &p.reference,
+        PayoutState::Successful {
+            fee_kobo: 3_000,
+            amount_kobo: None,
+        },
+    );
     let headers = [(FAKE_SIGNATURE_HEADER, FAKE_WEBHOOK_SECRET)];
     let res = app
         .send_raw(
@@ -1481,8 +1506,13 @@ async fn unknown_escalates_to_manual_after_max_attempts_and_still_settles(pool: 
 
     // It did go out after all: the success settles it and records the id.
     app.fake.set_found_payout(&p.reference, Some("x7"));
-    app.fake
-        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 0, amount_kobo: None });
+    app.fake.set_payout_state(
+        &p.reference,
+        PayoutState::Successful {
+            fee_kobo: 0,
+            amount_kobo: None,
+        },
+    );
     settle_payout(&app.state, &p.reference).await.unwrap();
     let settled = payout(&app).await;
     assert_eq!(settled.status, "successful");
@@ -1500,8 +1530,13 @@ async fn success_without_payout_id_stores_the_found_id(pool: PgPool) {
     assert_eq!(p.status, "unknown");
     assert_eq!(p.provider_payout_id, None);
     app.fake.set_found_payout(&p.reference, Some("x8"));
-    app.fake
-        .set_payout_state(&p.reference, PayoutState::Successful { fee_kobo: 0, amount_kobo: None });
+    app.fake.set_payout_state(
+        &p.reference,
+        PayoutState::Successful {
+            fee_kobo: 0,
+            amount_kobo: None,
+        },
+    );
     settle_payout(&app.state, &p.reference).await.unwrap();
     let after = payout(&app).await;
     assert_eq!(after.status, "successful");
@@ -1715,8 +1750,13 @@ async fn happy_path_end_to_end(pool: PgPool) {
         (&pa, PROVIDER_PAYOUT_FEE_A, "po-a"),
         (&pb, PROVIDER_PAYOUT_FEE_B, "po-b"),
     ] {
-        app.fake
-            .set_payout_state(&p.1, PayoutState::Successful { fee_kobo: fee, amount_kobo: None });
+        app.fake.set_payout_state(
+            &p.1,
+            PayoutState::Successful {
+                fee_kobo: fee,
+                amount_kobo: None,
+            },
+        );
         let res = app
             .send_raw(
                 Method::POST,

@@ -355,10 +355,7 @@ async fn amount_mismatch_flagged(pool: PgPool) {
     );
     // I2: the orders leave `pending_payment` (which has no other exit) in the
     // same transaction; the money is the owner's resolve/refund flow.
-    assert_eq!(
-        order_statuses(&app, b.checkout_id).await,
-        vec!["cancelled"]
-    );
+    assert_eq!(order_statuses(&app, b.checkout_id).await, vec!["cancelled"]);
     let cancelled: Vec<(Uuid, Value)> = sqlx::query_as(
         "SELECT subject_id, detail FROM audit_log WHERE action = 'order.cancelled' \
          AND subject_type = 'order'",
@@ -428,10 +425,7 @@ async fn verify_for_other_reference_settles_nothing(pool: PgPool) {
     assert_status(&webhook(&app, "evt-1", &b.reference).await, 200, "received");
     assert_ne!(checkout_status(&app, b.checkout_id).await, "paid");
     // Flagged as a mismatch: its orders are cancelled, never paid.
-    assert_eq!(
-        order_statuses(&app, b.checkout_id).await,
-        vec!["cancelled"]
-    );
+    assert_eq!(order_statuses(&app, b.checkout_id).await, vec!["cancelled"]);
     assert!(ledger_rows(&app).await.is_empty());
     assert_eq!(app.stock(b.listing.variant_id).await, 5);
 }

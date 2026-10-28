@@ -109,7 +109,9 @@ pub enum StaffRole {
 enum Audience {
     Buyer,
     /// The seller view; `false` leaves out the buyer's display name.
-    Seller { buyer_name: bool },
+    Seller {
+        buyer_name: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]

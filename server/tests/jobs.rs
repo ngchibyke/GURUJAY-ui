@@ -864,8 +864,13 @@ async fn pending_payout_polled_at_most_hourly(pool: PgPool) {
         "UPDATE payouts SET last_polled_at = now() - interval '61 minutes'",
     )
     .await;
-    app.fake
-        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 1_000, amount_kobo: None });
+    app.fake.set_payout_state(
+        &reference,
+        PayoutState::Successful {
+            fee_kobo: 1_000,
+            amount_kobo: None,
+        },
+    );
     assert_eq!(tick(&app).await.payouts_processed, 1);
     assert_eq!(payout_status(&app).await, "successful");
 }
@@ -1453,7 +1458,11 @@ async fn refund_escalation_failure_still_lets_the_sweeper_send(pool: PgPool) {
     assert_eq!(app.fake.calls("refund"), calls + 1);
     assert_eq!(order_status(&app, second).await, "refunded");
     assert_eq!(
-        count(&app, "SELECT count(*) FROM refunds WHERE status = 'requested'").await,
+        count(
+            &app,
+            "SELECT count(*) FROM refunds WHERE status = 'requested'"
+        )
+        .await,
         1
     );
 
@@ -1487,7 +1496,10 @@ async fn refund_and_reverify_errors_write_no_push_back_rows(pool: PgPool) {
         .make_active_store_with_product("08011111112", "Buka", PRICE, 5)
         .await;
     let (_, buyer) = app.sign_up_verified("08022222229").await;
-    assert_eq!(app.set_cart(&buyer, listing.variant_id, 1).await.status, 200);
+    assert_eq!(
+        app.set_cart(&buyer, listing.variant_id, 1).await.status,
+        200
+    );
     let res = app.checkout(&buyer, METHOD).await;
     assert_eq!(res.status, 201, "{}", res.json);
     let reference = res.json["reference"].as_str().unwrap().to_string();

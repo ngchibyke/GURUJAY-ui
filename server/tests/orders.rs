@@ -645,12 +645,14 @@ async fn expected_payout_uses_the_order_fee_snapshot(pool: PgPool) {
     assert_eq!(expected_payout(&app, &f).await, json!(490));
 
     // Fees above the order: 0, never negative (release books max(0) too).
-    sqlx::query("UPDATE orders SET fee_small_kobo = 20000, fee_large_kobo = 20000, \
+    sqlx::query(
+        "UPDATE orders SET fee_small_kobo = 20000, fee_large_kobo = 20000, \
                  fee_threshold_kobo = 5000000, stamp_duty_kobo = 0, \
-                 stamp_duty_threshold_kobo = 0")
-        .execute(&app.pool)
-        .await
-        .unwrap();
+                 stamp_duty_threshold_kobo = 0",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
     assert_eq!(expected_payout(&app, &f).await, json!(0));
 
     // Cancelled by the buyer: nothing is expected, so the field is left out.

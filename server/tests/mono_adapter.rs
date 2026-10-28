@@ -727,12 +727,18 @@ async fn status_of(body: Value) -> PayoutState {
 async fn payout_status_mapping() {
     assert_eq!(
         status_of(disbursement("completed", "successful", json!(3000))).await,
-        PayoutState::Successful { fee_kobo: 3000, amount_kobo: Some(945_000) }
+        PayoutState::Successful {
+            fee_kobo: 3000,
+            amount_kobo: Some(945_000)
+        }
     );
     // No per-distribution fee: the batch total_fee is used.
     assert_eq!(
         status_of(disbursement("completed", "successful", Value::Null)).await,
-        PayoutState::Successful { fee_kobo: 3500, amount_kobo: Some(945_000) }
+        PayoutState::Successful {
+            fee_kobo: 3500,
+            amount_kobo: Some(945_000)
+        }
     );
     // A completed batch can carry a failed distribution (recorded sample).
     assert!(matches!(
@@ -908,7 +914,10 @@ async fn payout_status_without_id_looks_the_payout_up_first() {
             .payout_status("PO12345678901234567890", None)
             .await
             .unwrap(),
-        PayoutState::Successful { fee_kobo: 3500, amount_kobo: Some(945_000) }
+        PayoutState::Successful {
+            fee_kobo: 3500,
+            amount_kobo: Some(945_000)
+        }
     );
 
     // No id and an empty lookup: the status cannot be known.

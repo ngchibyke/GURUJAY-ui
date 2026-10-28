@@ -953,10 +953,7 @@ async fn check_late_outcome(
             return Ok(Some(SettlePayoutOutcome::RetryLater));
         }
         Err(_) => {
-            tracing::warn!(
-                provider = provider.name(),
-                "closed payout status timed out"
-            );
+            tracing::warn!(provider = provider.name(), "closed payout status timed out");
             return Ok(Some(SettlePayoutOutcome::RetryLater));
         }
     };
