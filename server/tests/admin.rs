@@ -10,7 +10,10 @@ use server::{
     checkout::{SettleOutcome, settle_payment},
     escrow::{SettlePayoutOutcome, settle_payout},
     orders::service::{mark_delivered, mark_picked_up},
-    payments::{PaymentStatus, PayoutState, ProviderError},
+    payments::{
+        PaymentStatus, PayoutState, ProviderError,
+        fake::{FAKE_SIGNATURE_HEADER, FAKE_WEBHOOK_SECRET},
+    },
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -202,7 +205,7 @@ async fn pending_payout(app: &TestApp) -> (Fixture, Uuid, String) {
 async fn reversed_payout(app: &TestApp) -> (Fixture, Uuid, String) {
     let (f, id, reference) = pending_payout(app).await;
     app.fake
-        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 3_000 });
+        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 3_000, amount_kobo: None });
     settle_payout(&app.state, &reference).await.unwrap();
     app.fake.set_payout_state(
         &reference,
@@ -805,7 +808,7 @@ async fn reversal_requires_reverification_and_requeue_mints_a_new_reference(pool
 
     // The provider must confirm the old reference was not paid.
     app.fake
-        .set_payout_state(&old_ref, PayoutState::Successful { fee_kobo: 0 });
+        .set_payout_state(&old_ref, PayoutState::Successful { fee_kobo: 0, amount_kobo: None });
     let res = post(&app, &owner, &path, body.clone()).await;
     assert_code(&res, 409, "payout_not_confirmed_reversed");
     assert_eq!(app.fake.calls("payout_status"), calls + 1);
@@ -842,7 +845,7 @@ async fn reversal_requires_reverification_and_requeue_mints_a_new_reference(pool
 
     // The second success books once more under its own round.
     app.fake
-        .set_payout_state(&new_ref, PayoutState::Successful { fee_kobo: 2_000 });
+        .set_payout_state(&new_ref, PayoutState::Successful { fee_kobo: 2_000, amount_kobo: None });
     settle_payout(&app.state, &new_ref).await.unwrap();
     assert_eq!(
         count(
@@ -1319,7 +1322,7 @@ async fn mark_paid_on_a_payout_the_provider_paid_settles_it_normally(pool: PgPoo
     let (id, reference) = unknown_payout(&app, true).await;
     let owner = app.owner_token().await;
     app.fake
-        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 3_000 });
+        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 3_000, amount_kobo: None });
     let finds = app.fake.calls("find_payout");
     let statuses = app.fake.calls("payout_status");
     let fees = balance(&app, "provider_fees").await;
@@ -1751,4 +1754,248 @@ async fn overrides_refuse_account_numbers_in_any_spelling(pool: PgPool) {
             "validation_failed",
         );
     }
+}
+
+// ------------------------------------------------- late provider outcomes
+
+/// A payout webhook for `reference` through the route (fake provider).
+async fn payout_webhook(app: &TestApp, event_id: &str, reference: &str) -> TestResponse {
+    let body = json!({ "event_id": event_id, "kind": "payout", "reference": reference });
+    app.send_raw(
+        Method::POST,
+        "/webhooks/fake",
+        &[(FAKE_SIGNATURE_HEADER, FAKE_WEBHOOK_SECRET)],
+        body.to_string().into_bytes(),
+    )
+    .await
+}
+
+fn assert_received(res: &TestResponse) {
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["status"], "received", "{}", res.json);
+}
+
+/// A manual payout (the provider cannot pay out) the owner then paid by hand.
+async fn owner_settled_payout(app: &TestApp) -> (Uuid, String) {
+    app.fake.fail_payout_with(ProviderError::NotSupported);
+    let f = delivered_order(app).await;
+    server::escrow::release_order(
+        &app.state,
+        f.order_id,
+        server::escrow::ReleaseReason::BuyerConfirmed,
+    )
+    .await
+    .unwrap();
+    let (id, reference): (Uuid, String) = sqlx::query_as("SELECT id, reference FROM payouts")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    let owner = app.owner_token().await;
+    let res = post(
+        app,
+        &owner,
+        &format!("/admin/payouts/{id}/mark-paid"),
+        json!({ "note": "paid by bank transfer", "provider_reference": "TRF-1" }),
+    )
+    .await;
+    assert_eq!(res.json["settled_by"], "owner", "{}", res.json);
+    (id, reference)
+}
+
+/// (1)+(8): a provider success on a payout the owner already paid by hand is
+/// a double payment. It changes nothing, the webhook still answers 200, and
+/// it raises one alert (audit row and attention list) with no account data.
+#[sqlx::test]
+async fn late_provider_success_on_an_owner_settled_payout_alerts(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (payout_id, reference) = owner_settled_payout(&app).await;
+    let alerts = || audits(&app, "payout.provider_outcome_after_close");
+
+    // A provider failure is consistent with the owner paying: no alert.
+    app.fake.set_payout_state(
+        &reference,
+        PayoutState::Failed {
+            reason: "x".into(),
+        },
+    );
+    assert_received(&payout_webhook(&app, "po-1", &reference).await);
+    assert!(alerts().await.is_empty());
+
+    // The provider cannot be asked: 503 so it redelivers; nothing recorded.
+    app.fake
+        .fail_payout_status_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    let res = payout_webhook(&app, "po-2", &reference).await;
+    assert_code(&res, 503, "payout_status_unavailable");
+    assert!(alerts().await.is_empty());
+    app.fake.clear_payout_status_failure();
+
+    // It paid the seller as well.
+    app.fake.set_payout_state(
+        &reference,
+        PayoutState::Successful {
+            fee_kobo: 3_000,
+            amount_kobo: Some(PAYOUT),
+        },
+    );
+    assert_received(&payout_webhook(&app, "po-3", &reference).await);
+    let rows = alerts().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, None);
+    assert_eq!(
+        rows[0].1,
+        json!({
+            "reference_kind": "owner_settled",
+            "outcome": "successful",
+            "payout_id": payout_id,
+        })
+    );
+    // Nothing else changed: still the owner's, booked once.
+    assert_eq!(text(&app, "SELECT settled_by FROM payouts").await, "owner");
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM ledger_postings WHERE kind = 'payout_success'"
+        )
+        .await,
+        1
+    );
+    assert!(!all_audit_text(&app).await.contains(ACCOUNT_NUMBER));
+
+    // On the attention list, for the owner and for Support.
+    let owner = app.owner_token().await;
+    let support = app.make_support().await;
+    for token in [&owner, &support] {
+        let res = get(&app, token, "/admin/reconciliation").await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        let items = res.json["late_provider_outcomes"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{}", res.json);
+        assert_eq!(items[0]["payout_id"], payout_id.to_string());
+        assert_eq!(items[0]["reference_kind"], "owner_settled");
+        assert_eq!(items[0]["outcome"], "successful");
+        assert!(!res.json.to_string().contains(ACCOUNT_NUMBER));
+    }
+}
+
+/// (1)+(8): a provider success on a retired reference (a reversed attempt the
+/// owner re-queued under a new reference) is a double payment too. Its
+/// reversal repeats what `payout_attempts` already records: no alert.
+#[sqlx::test]
+async fn late_provider_success_on_a_retired_reference_alerts(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (f, payout_id, old_ref) = reversed_payout(&app).await;
+    let owner = app.owner_token().await;
+    let alerts = || audits(&app, "payout.provider_outcome_after_close");
+    let view = get(
+        &app,
+        &owner,
+        &format!("/admin/stores/{}/payout-account", f.store_id),
+    )
+    .await;
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/stores/{}/payout-account/verify", f.store_id),
+        json!({ "account_name": "ADA OBI", "changed_at": view.json["changed_at"] }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = post(
+        &app,
+        &owner,
+        &format!("/admin/payouts/{payout_id}/requeue"),
+        json!({ "note": "seller fixed the account" }),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let new_ref = res.json["reference"].as_str().unwrap().to_string();
+
+    // The old reference's reversal again: already recorded, no alert.
+    assert_received(&payout_webhook(&app, "po-old-1", &old_ref).await);
+    assert!(alerts().await.is_empty());
+
+    // Then the bank reports the old reference paid after all.
+    app.fake.set_payout_state(
+        &old_ref,
+        PayoutState::Successful {
+            fee_kobo: 0,
+            amount_kobo: None,
+        },
+    );
+    assert_received(&payout_webhook(&app, "po-old-2", &old_ref).await);
+    let rows = alerts().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1,
+        json!({
+            "reference_kind": "retired_attempt",
+            "outcome": "successful",
+            "payout_id": payout_id,
+        })
+    );
+    // The event is processed (a redelivery is a duplicate); the live payout
+    // under its new reference is untouched.
+    assert_eq!(
+        payout_webhook(&app, "po-old-2", &old_ref).await.json["status"],
+        "duplicate"
+    );
+    assert_eq!(text(&app, "SELECT reference FROM payouts").await, new_ref);
+    assert_eq!(alerts().await.len(), 1);
+    let res = get(&app, &owner, "/admin/reconciliation").await;
+    let items = res.json["late_provider_outcomes"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{}", res.json);
+    assert_eq!(items[0]["reference_kind"], "retired_attempt");
+}
+
+/// (10): the provider reports a different amount than the payout booked. The
+/// money has moved, so it still settles (booked at the payout's own amount),
+/// with an alert carrying both numbers.
+#[sqlx::test]
+async fn payout_amount_mismatch_settles_and_alerts(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (_, payout_id, reference) = pending_payout(&app).await;
+    app.fake.set_payout_state(
+        &reference,
+        PayoutState::Successful {
+            fee_kobo: 3_000,
+            amount_kobo: Some(PAYOUT - 100),
+        },
+    );
+    assert_eq!(
+        settle_payout(&app.state, &reference).await.unwrap(),
+        SettlePayoutOutcome::Settled {
+            status: "successful".into()
+        }
+    );
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+    assert_orders_balance(&app).await;
+    let rows = audits(&app, "payout.amount_mismatch").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1,
+        json!({ "payout_id": payout_id, "expected_kobo": PAYOUT, "reported_kobo": PAYOUT - 100 })
+    );
+    let owner = app.owner_token().await;
+    let res = get(&app, &owner, "/admin/reconciliation").await;
+    let items = res.json["payout_amount_mismatches"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{}", res.json);
+    assert_eq!(items[0]["payout_id"], payout_id.to_string());
+    assert_eq!(items[0]["expected_kobo"], PAYOUT);
+    assert_eq!(items[0]["reported_kobo"], PAYOUT - 100);
+}
+
+#[sqlx::test]
+async fn payout_matching_amount_raises_no_alert(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let (_, _, reference) = pending_payout(&app).await;
+    app.fake.set_payout_state(
+        &reference,
+        PayoutState::Successful {
+            fee_kobo: 3_000,
+            amount_kobo: Some(PAYOUT),
+        },
+    );
+    settle_payout(&app.state, &reference).await.unwrap();
+    assert_eq!(balance(&app, "seller_paid").await, PAYOUT);
+    assert!(audits(&app, "payout.amount_mismatch").await.is_empty());
 }

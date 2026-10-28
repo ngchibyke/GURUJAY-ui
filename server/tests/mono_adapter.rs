@@ -727,12 +727,12 @@ async fn status_of(body: Value) -> PayoutState {
 async fn payout_status_mapping() {
     assert_eq!(
         status_of(disbursement("completed", "successful", json!(3000))).await,
-        PayoutState::Successful { fee_kobo: 3000 }
+        PayoutState::Successful { fee_kobo: 3000, amount_kobo: Some(945_000) }
     );
     // No per-distribution fee: the batch total_fee is used.
     assert_eq!(
         status_of(disbursement("completed", "successful", Value::Null)).await,
-        PayoutState::Successful { fee_kobo: 3500 }
+        PayoutState::Successful { fee_kobo: 3500, amount_kobo: Some(945_000) }
     );
     // A completed batch can carry a failed distribution (recorded sample).
     assert!(matches!(
@@ -753,6 +753,34 @@ async fn payout_status_mapping() {
         .unwrap()
         .remove("distributions");
     assert_eq!(status_of(batch_only).await, PayoutState::Pending);
+}
+
+/// (10): the distribution's own amount is reported (in kobo) so the engine
+/// can cross-check it; missing or unreadable is None, never an error (the
+/// payout is still settled from the status).
+#[tokio::test]
+async fn payout_status_reports_the_distribution_amount() {
+    let mut body = disbursement("completed", "successful", json!(3000));
+    body["data"]["distributions"][0]["amount"] = json!("944999");
+    assert_eq!(
+        status_of(body).await,
+        PayoutState::Successful {
+            fee_kobo: 3000,
+            amount_kobo: Some(944_999)
+        }
+    );
+    for missing in [Value::Null, json!("n/a")] {
+        let mut body = disbursement("completed", "successful", json!(3000));
+        body["data"]["distributions"][0]["amount"] = missing.clone();
+        assert_eq!(
+            status_of(body).await,
+            PayoutState::Successful {
+                fee_kobo: 3000,
+                amount_kobo: None
+            },
+            "{missing}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -880,7 +908,7 @@ async fn payout_status_without_id_looks_the_payout_up_first() {
             .payout_status("PO12345678901234567890", None)
             .await
             .unwrap(),
-        PayoutState::Successful { fee_kobo: 3500 }
+        PayoutState::Successful { fee_kobo: 3500, amount_kobo: Some(945_000) }
     );
 
     // No id and an empty lookup: the status cannot be known.

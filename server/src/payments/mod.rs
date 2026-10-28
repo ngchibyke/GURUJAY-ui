@@ -249,6 +249,11 @@ pub enum PayoutState {
     Pending,
     Successful {
         fee_kobo: i64,
+        /// The amount the provider says it paid, in kobo, when it reports
+        /// one. Settlement compares it with the payout's own amount and
+        /// raises `payout.amount_mismatch` when they differ (the payout is
+        /// still settled: the money has moved).
+        amount_kobo: Option<i64>,
     },
     Failed {
         reason: String,

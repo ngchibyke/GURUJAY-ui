@@ -865,7 +865,7 @@ async fn pending_payout_polled_at_most_hourly(pool: PgPool) {
     )
     .await;
     app.fake
-        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 1_000 });
+        .set_payout_state(&reference, PayoutState::Successful { fee_kobo: 1_000, amount_kobo: None });
     assert_eq!(tick(&app).await.payouts_processed, 1);
     assert_eq!(payout_status(&app).await, "successful");
 }

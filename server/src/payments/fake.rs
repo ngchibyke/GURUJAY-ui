@@ -158,6 +158,10 @@ impl FakeProvider {
         *self.payout_status_failure.lock().unwrap() = Some(err);
     }
 
+    pub fn clear_payout_status_failure(&self) {
+        *self.payout_status_failure.lock().unwrap() = None;
+    }
+
     /// When true, `refund` succeeds with id `fakerf_<payment_reference>`.
     pub fn set_refund_supported(&self, supported: bool) {
         *self.refund_supported.lock().unwrap() = supported;

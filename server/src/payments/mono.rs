@@ -371,7 +371,13 @@ impl MonoProvider {
                     None => 0,
                     Some(v) => from_mono_amount(v, unit).ok_or_else(|| unparseable(OP))?,
                 };
-                PayoutState::Successful { fee_kobo }
+                // Only a cross-check (the engine pays what it booked), so a
+                // missing or unreadable amount is None, never an error.
+                let amount_kobo = dist.get("amount").and_then(|v| from_mono_amount(v, unit));
+                PayoutState::Successful {
+                    fee_kobo,
+                    amount_kobo,
+                }
             }
             // Fixed text only: Mono's own message can echo the account.
             "failed" => PayoutState::Failed {
@@ -699,7 +705,8 @@ impl PaymentProvider for MonoProvider {
     /// `GET /v3/payments/disburse/disbursements/{id}` (the id is looked up by
     /// reference first when we never got one). The state comes from our
     /// distribution's status: `successful` -> Successful (fee from the
-    /// distribution, else the batch `total_fee`, else 0), `failed` -> Failed,
+    /// distribution, else the batch `total_fee`, else 0; amount from the
+    /// distribution's `amount` via `from_mono_amount`, if readable), `failed` -> Failed,
     /// `reversed` -> Reversed, anything else (or no distribution) -> Pending.
     async fn payout_status(
         &self,

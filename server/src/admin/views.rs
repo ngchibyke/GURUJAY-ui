@@ -262,8 +262,42 @@ pub struct Reconciliation {
     pub refunds: Vec<RefundView>,
     pub flagged_checkouts: Vec<CheckoutView>,
     pub mismatched_checkouts: Vec<CheckoutView>,
+    /// Provider outcomes on references that no longer take them (a payout
+    /// the owner settled by hand, a reversed attempt re-queued under a new
+    /// reference): a success there may be a double payment. The last
+    /// [`ALERT_WINDOW_DAYS`] days, newest first.
+    pub late_provider_outcomes: Vec<LateProviderOutcome>,
+    /// Payouts the provider reported paying a different amount for. The last
+    /// [`ALERT_WINDOW_DAYS`] days, newest first.
+    pub payout_amount_mismatches: Vec<PayoutAmountMismatch>,
     /// Rows per section; a full section has more behind it.
     pub limit: i64,
+}
+
+/// How far back the audit-log alert sections of [`Reconciliation`] look.
+/// The alerts have no acknowledgement: they age out instead.
+pub const ALERT_WINDOW_DAYS: i32 = 30;
+
+/// A `payout.provider_outcome_after_close` alert.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct LateProviderOutcome {
+    pub payout_id: Option<Uuid>,
+    /// `owner_settled` or `retired_attempt`.
+    pub reference_kind: Option<String>,
+    /// `successful`, `reversed` or `unconfirmed`.
+    pub outcome: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+/// A `payout.amount_mismatch` alert.
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct PayoutAmountMismatch {
+    pub payout_id: Option<Uuid>,
+    pub expected_kobo: Option<i64>,
+    pub reported_kobo: Option<i64>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
 }
 
 /// Everything waiting on the owner, oldest first, [`MAX_LIMIT`] per section.
@@ -288,11 +322,39 @@ pub async fn reconciliation(db: &PgPool, owner: bool) -> Result<Reconciliation, 
     .fetch_all(db)
     .await
     .context("list attention refunds")?;
+    let late_provider_outcomes = sqlx::query_as::<_, LateProviderOutcome>(
+        "SELECT subject_id AS payout_id, detail->>'reference_kind' AS reference_kind, \
+                detail->>'outcome' AS outcome, at \
+         FROM audit_log \
+         WHERE action = 'payout.provider_outcome_after_close' \
+           AND at > now() - make_interval(days => $2) \
+         ORDER BY at DESC, id DESC LIMIT $1",
+    )
+    .bind(MAX_LIMIT)
+    .bind(ALERT_WINDOW_DAYS)
+    .fetch_all(db)
+    .await
+    .context("list late provider outcomes")?;
+    let payout_amount_mismatches = sqlx::query_as::<_, PayoutAmountMismatch>(
+        "SELECT subject_id AS payout_id, (detail->>'expected_kobo')::bigint AS expected_kobo, \
+                (detail->>'reported_kobo')::bigint AS reported_kobo, at \
+         FROM audit_log \
+         WHERE action = 'payout.amount_mismatch' \
+           AND at > now() - make_interval(days => $2) \
+         ORDER BY at DESC, id DESC LIMIT $1",
+    )
+    .bind(MAX_LIMIT)
+    .bind(ALERT_WINDOW_DAYS)
+    .fetch_all(db)
+    .await
+    .context("list payout amount mismatches")?;
     Ok(Reconciliation {
         payouts,
         refunds,
         flagged_checkouts: checkouts(db, "flagged", MAX_LIMIT).await?,
         mismatched_checkouts: checkouts(db, "amount_mismatch", MAX_LIMIT).await?,
+        late_provider_outcomes,
+        payout_amount_mismatches,
         limit: MAX_LIMIT,
     })
 }

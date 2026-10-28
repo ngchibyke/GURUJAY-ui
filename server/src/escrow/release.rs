@@ -837,11 +837,13 @@ struct SettleRow {
     round: i32,
     provider_payout_id: Option<String>,
     closed: bool,
+    owner_settled: bool,
     now: OffsetDateTime,
 }
 
 #[derive(sqlx::FromRow)]
 struct SettleLookup {
+    id: Uuid,
     status: String,
     provider: String,
     provider_payout_id: Option<String>,
@@ -849,10 +851,154 @@ struct SettleLookup {
     /// Owner-settled (mark-paid) or a reversed attempt awaiting re-queue:
     /// provider answers no longer apply.
     closed: bool,
+    owner_settled: bool,
 }
 
 /// SQL: the payout no longer takes provider answers (see [`SettleLookup`]).
 const CLOSED: &str = "(settled_by IS NOT DISTINCT FROM 'owner' OR reversed_at IS NOT NULL)";
+/// SQL: the owner settled the payout by hand (mark-paid).
+const OWNER_SETTLED: &str = "(settled_by IS NOT DISTINCT FROM 'owner')";
+
+/// A payout reference that no longer takes provider answers, for the
+/// `payout.provider_outcome_after_close` alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosedRef {
+    /// The payout's reference; the owner settled it by hand (mark-paid).
+    OwnerSettled,
+    /// A reference kept only in `payout_attempts`: a reversed attempt the
+    /// owner re-queued under a new reference.
+    Retired,
+}
+
+impl ClosedRef {
+    fn as_str(self) -> &'static str {
+        match self {
+            ClosedRef::OwnerSettled => "owner_settled",
+            ClosedRef::Retired => "retired_attempt",
+        }
+    }
+}
+
+/// The provider answer for a closed reference worth an alert: a success (the
+/// seller may have been paid twice), or, for an owner-settled payout, a
+/// reversal (the provider had paid it). A retired attempt was closed by its
+/// reversal, so another reversal (or a failure) is no news.
+fn late_outcome_label(answer: &PayoutState, kind: ClosedRef) -> Option<&'static str> {
+    match answer {
+        PayoutState::Successful { .. } => Some("successful"),
+        PayoutState::Reversed { .. } if kind == ClosedRef::OwnerSettled => Some("reversed"),
+        _ => None,
+    }
+}
+
+/// The alert for a provider outcome on a closed reference: an audit row in
+/// its own transaction (no account data: the kind, the outcome and the payout
+/// id) and a warn line with the cause only. It lists the payout under the
+/// reconciliation's `late_provider_outcomes`. Nothing else changes.
+async fn alert_late_outcome(
+    db: &PgPool,
+    payout_id: Uuid,
+    kind: ClosedRef,
+    outcome: &str,
+) -> Result<(), AppError> {
+    let mut conn = db.acquire().await.context("acquire")?;
+    audit::record(
+        &mut conn,
+        None,
+        "payout.provider_outcome_after_close",
+        "payout",
+        Some(payout_id),
+        json!({
+            "reference_kind": kind.as_str(),
+            "outcome": outcome,
+            "payout_id": payout_id,
+        }),
+    )
+    .await?;
+    tracing::warn!(
+        cause = "provider_outcome_after_close",
+        reference_kind = kind.as_str(),
+        outcome,
+        "provider outcome for a closed payout reference; check for a double payment"
+    );
+    Ok(())
+}
+
+/// Asks the provider about a closed reference (outside any transaction) and
+/// raises the alert when the answer is worth one ([`late_outcome_label`]).
+/// An inconclusive answer cannot rule a success out, so it alerts as
+/// `unconfirmed`. `Ok(Some(RetryLater))` when the provider cannot answer now
+/// (a webhook answers 503 and the provider redelivers).
+async fn check_late_outcome(
+    state: &AppState,
+    provider_name: &str,
+    reference: &str,
+    provider_payout_id: Option<&str>,
+    payout_id: Uuid,
+    kind: ClosedRef,
+) -> Result<Option<SettlePayoutOutcome>, AppError> {
+    let Some(provider) = state.providers.by_name(provider_name) else {
+        tracing::warn!("payout provider is not configured");
+        return Ok(Some(SettlePayoutOutcome::RetryLater));
+    };
+    let answer = tokio::time::timeout(
+        PAYOUT_CALL_TIMEOUT,
+        provider.payout_status(reference, provider_payout_id),
+    )
+    .await;
+    let outcome = match answer {
+        Ok(Ok(a)) => late_outcome_label(&a, kind),
+        Ok(Err(ProviderError::Inconclusive)) => Some("unconfirmed"),
+        Ok(Err(e)) => {
+            tracing::warn!(provider = provider.name(), error = %e, "closed payout status failed");
+            return Ok(Some(SettlePayoutOutcome::RetryLater));
+        }
+        Err(_) => {
+            tracing::warn!(
+                provider = provider.name(),
+                "closed payout status timed out"
+            );
+            return Ok(Some(SettlePayoutOutcome::RetryLater));
+        }
+    };
+    if let Some(outcome) = outcome {
+        alert_late_outcome(&state.db, payout_id, kind, outcome).await?;
+    }
+    Ok(None)
+}
+
+/// A reference no payout carries: a retired attempt's (checked with the
+/// provider for a late outcome, see [`check_late_outcome`]) or none of ours.
+async fn retired_reference(
+    state: &AppState,
+    reference: &str,
+    from_provider: Option<&str>,
+) -> Result<SettlePayoutOutcome, AppError> {
+    let attempt: Option<(Uuid, Option<String>, String)> = sqlx::query_as(
+        "SELECT a.payout_id, a.provider_payout_id, p.provider \
+         FROM payout_attempts a JOIN payouts p ON p.id = a.payout_id \
+         WHERE a.reference = $1",
+    )
+    .bind(reference)
+    .fetch_optional(&state.db)
+    .await
+    .context("find payout attempt")?;
+    let Some((payout_id, provider_id, provider)) =
+        attempt.filter(|(_, _, p)| from_provider.is_none_or(|f| f == p))
+    else {
+        return Ok(SettlePayoutOutcome::UnknownReference);
+    };
+    let checked = check_late_outcome(
+        state,
+        &provider,
+        reference,
+        provider_id.as_deref(),
+        payout_id,
+        ClosedRef::Retired,
+    )
+    .await?;
+    Ok(checked.unwrap_or(SettlePayoutOutcome::UnknownReference))
+}
 
 /// Whether a payout the owner might settle by hand may in fact have been paid
 /// by the provider: an `unknown` outcome, or a `manual` payout the provider
@@ -889,8 +1035,8 @@ pub async fn settle_payout_from(
     from_provider: Option<&str>,
 ) -> Result<SettlePayoutOutcome, AppError> {
     let row: Option<SettleLookup> = sqlx::query_as(&format!(
-        "SELECT status::text AS status, provider, provider_payout_id, last_error, \
-                {CLOSED} AS closed \
+        "SELECT id, status::text AS status, provider, provider_payout_id, last_error, \
+                {CLOSED} AS closed, {OWNER_SETTLED} AS owner_settled \
          FROM payouts WHERE reference = $1"
     ))
     .bind(reference)
@@ -898,16 +1044,36 @@ pub async fn settle_payout_from(
     .await
     .context("find payout")?;
     let Some(SettleLookup {
+        id: payout_id,
         status,
         provider: provider_name,
         provider_payout_id: provider_id,
         last_error,
         closed,
+        owner_settled,
     }) = row.filter(|r| from_provider.is_none_or(|f| f == r.provider))
     else {
-        return Ok(SettlePayoutOutcome::UnknownReference);
+        return retired_reference(state, reference, from_provider).await;
     };
-    if closed || !settleable(&status, provider_id.is_some(), last_error.as_deref()) {
+    if closed {
+        // The answer changes nothing, but a success on a payout the owner
+        // paid by hand is a double payment: the owner must hear of it.
+        if owner_settled
+            && let Some(retry) = check_late_outcome(
+                state,
+                &provider_name,
+                reference,
+                provider_id.as_deref(),
+                payout_id,
+                ClosedRef::OwnerSettled,
+            )
+            .await?
+        {
+            return Ok(retry);
+        }
+        return Ok(SettlePayoutOutcome::Settled { status });
+    }
+    if !settleable(&status, provider_id.is_some(), last_error.as_deref()) {
         return Ok(SettlePayoutOutcome::Settled { status });
     }
     let Some(provider) = state.providers.by_name(&provider_name) else {
@@ -961,7 +1127,8 @@ pub async fn settle_payout_from(
     let p: Option<SettleRow> = sqlx::query_as(&format!(
         "SELECT p.id, p.status::text AS status, p.amount_kobo, p.provider_fee_kobo, \
                 p.pending_since, p.order_id, o.checkout_id, o.store_id, p.round, \
-                p.provider_payout_id, {CLOSED} AS closed, now() AS now \
+                p.provider_payout_id, {CLOSED} AS closed, \
+                {OWNER_SETTLED} AS owner_settled, now() AS now \
          FROM payouts p JOIN orders o ON o.id = p.order_id \
          WHERE p.reference = $1 FOR UPDATE OF p"
     ))
@@ -970,10 +1137,23 @@ pub async fn settle_payout_from(
     .await
     .map_err(db_err("lock payout"))?;
     // Re-queued under a new reference while the provider was answering.
+    // The answer was for this reference, which is now retired: a success is
+    // a double payment (see [`late_outcome_label`]).
     let Some(p) = p else {
+        drop(tx);
+        if let Some(outcome) = late_outcome_label(&answer, ClosedRef::Retired) {
+            alert_late_outcome(&state.db, payout_id, ClosedRef::Retired, outcome).await?;
+        }
         return Ok(SettlePayoutOutcome::UnknownReference);
     };
     if p.closed {
+        drop(tx);
+        // Mark-paid landed while the provider was answering.
+        if p.owner_settled
+            && let Some(outcome) = late_outcome_label(&answer, ClosedRef::OwnerSettled)
+        {
+            alert_late_outcome(&state.db, p.id, ClosedRef::OwnerSettled, outcome).await?;
+        }
         return Ok(SettlePayoutOutcome::Settled { status: p.status });
     }
     let key_ref = round_ref(p.id, p.round);
@@ -1015,9 +1195,33 @@ pub async fn settle_payout_from(
                 p.status.clone()
             }
         }
-        PayoutState::Successful { fee_kobo } if not_final => {
+        PayoutState::Successful {
+            fee_kobo,
+            amount_kobo: reported,
+        } if not_final => {
             // A negative fee is bad provider data; book none.
             let fee = fee_kobo.max(0);
+            // The money has moved, so it settles at the payout's own amount;
+            // a different reported amount is for the owner to chase.
+            if let Some(reported) = reported.filter(|r| *r != p.amount_kobo) {
+                audit::record(
+                    &mut tx,
+                    None,
+                    "payout.amount_mismatch",
+                    "payout",
+                    Some(p.id),
+                    json!({
+                        "payout_id": p.id,
+                        "expected_kobo": p.amount_kobo,
+                        "reported_kobo": reported,
+                    }),
+                )
+                .await?;
+                tracing::warn!(
+                    cause = "payout_amount_mismatch",
+                    "provider reported a different payout amount"
+                );
+            }
             const KIND: &str = "payout_success";
             ledger::post(
                 &mut tx,

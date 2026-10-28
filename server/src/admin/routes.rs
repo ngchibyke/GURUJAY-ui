@@ -278,7 +278,9 @@ async fn reconciliation(
     let rows = r.payouts.len()
         + r.refunds.len()
         + r.flagged_checkouts.len()
-        + r.mismatched_checkouts.len();
+        + r.mismatched_checkouts.len()
+        + r.late_provider_outcomes.len()
+        + r.payout_amount_mismatches.len();
     viewed(&state, &staff.0, "reconciliation", rows).await?;
     Ok(Json(r))
 }
