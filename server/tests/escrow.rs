@@ -1435,6 +1435,8 @@ async fn refund_and_payment_posting_keys_are_recorded(pool: PgPool) {
             .unwrap();
     assert!(keys.contains(&("payment".to_string(), f.checkout_id.to_string())));
     assert!(keys.contains(&("refund".to_string(), out.refund_id.to_string())));
+    // I3: the absorbed collection fee is its own posting.
+    assert!(keys.contains(&("refund_fee".to_string(), out.refund_id.to_string())));
     // Each key points at the txn that holds its entries.
     assert_eq!(
         count(

@@ -353,10 +353,30 @@ async fn amount_mismatch_flagged(pool: PgPool) {
         checkout_status(&app, b.checkout_id).await,
         "amount_mismatch"
     );
+    // I2: the orders leave `pending_payment` (which has no other exit) in the
+    // same transaction; the money is the owner's resolve/refund flow.
     assert_eq!(
         order_statuses(&app, b.checkout_id).await,
-        vec!["pending_payment"]
+        vec!["cancelled"]
     );
+    let cancelled: Vec<(Uuid, Value)> = sqlx::query_as(
+        "SELECT subject_id, detail FROM audit_log WHERE action = 'order.cancelled' \
+         AND subject_type = 'order'",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].1["reason"], "amount_mismatch");
+    assert_eq!(cancelled[0].1["checkout_id"], b.checkout_id.to_string());
+    let cancelled_at: bool = sqlx::query_scalar(
+        "SELECT bool_and(cancelled_at IS NOT NULL) FROM orders WHERE checkout_id = $1",
+    )
+    .bind(b.checkout_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert!(cancelled_at);
     assert!(ledger_rows(&app).await.is_empty());
     assert_eq!(app.stock(b.listing.variant_id).await, 5);
     // The reservation is released (the owner refunds it later).
@@ -407,9 +427,10 @@ async fn verify_for_other_reference_settles_nothing(pool: PgPool) {
     );
     assert_status(&webhook(&app, "evt-1", &b.reference).await, 200, "received");
     assert_ne!(checkout_status(&app, b.checkout_id).await, "paid");
+    // Flagged as a mismatch: its orders are cancelled, never paid.
     assert_eq!(
         order_statuses(&app, b.checkout_id).await,
-        vec!["pending_payment"]
+        vec!["cancelled"]
     );
     assert!(ledger_rows(&app).await.is_empty());
     assert_eq!(app.stock(b.listing.variant_id).await, 5);
@@ -546,6 +567,9 @@ async fn paid_after_expiry_refunds_when_stock_gone(pool: PgPool) {
             ("escrow".into(), 2_000),
             ("escrow".into(), -2_000),
             ("refunds".into(), 2_000),
+            // I3: the collection fee the platform absorbs on a refund.
+            ("provider_fees".into(), 10),
+            ("platform_revenue".into(), -10),
         ]
     );
     // The buyer did not get the items: the cart keeps them.
@@ -1001,7 +1025,10 @@ async fn refund_order_restores_stock_and_takes_no_cut(pool: PgPool) {
         rows[2..],
         [
             ("escrow".to_string(), -2_000),
-            ("refunds".to_string(), 2_000)
+            ("refunds".to_string(), 2_000),
+            // I3: the provider kept its 10 kobo fee; the platform absorbs it.
+            ("provider_fees".to_string(), 10),
+            ("platform_revenue".to_string(), -10),
         ]
     );
     assert_eq!(
@@ -1019,7 +1046,8 @@ async fn refund_order_restores_stock_and_takes_no_cut(pool: PgPool) {
     assert_eq!(again.status, "processing");
     assert_eq!(app.fake.calls("refund"), 1);
     assert_eq!(app.stock(b.listing.variant_id).await, 5);
-    assert_eq!(ledger_rows(&app).await.len(), 4);
+    // Payment, refund and the absorbed fee: two entries each.
+    assert_eq!(ledger_rows(&app).await.len(), 6);
 }
 
 #[sqlx::test]
@@ -1086,7 +1114,8 @@ async fn refund_unavailable_retries_with_same_reference(pool: PgPool) {
     assert_eq!(sent[1].reference, reference);
     // Booked and restocked once.
     assert_eq!(app.stock(b.listing.variant_id).await, 5);
-    assert_eq!(ledger_rows(&app).await.len(), 4);
+    // Payment, refund and the absorbed fee: two entries each.
+    assert_eq!(ledger_rows(&app).await.len(), 6);
     assert_eq!(count(&app, "SELECT count(*) FROM refunds").await, 1);
 }
 
@@ -1219,7 +1248,8 @@ async fn refund_restore_clamps_at_stock_cap(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(clamped, 1);
-    assert_eq!(ledger_rows(&app).await.len(), 4);
+    // Payment, refund and the absorbed fee: two entries each.
+    assert_eq!(ledger_rows(&app).await.len(), 6);
 }
 
 #[sqlx::test]

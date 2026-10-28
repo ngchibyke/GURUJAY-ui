@@ -472,6 +472,27 @@ async fn owner_refunds_a_held_delivered_order_without_restocking(pool: PgPool) {
     // Items + delivery from escrow, no cut.
     assert_eq!(balance(&app, "escrow").await, 0);
     assert_eq!(balance(&app, "refunds").await, PRICE);
+    // I3: the provider kept its 1,500 collection fee; the platform absorbs it,
+    // so the order's books match the cash: in PRICE, out PRICE, fee 1,500.
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT account::text, sum(amount_kobo)::bigint FROM ledger_entries \
+         WHERE order_id = $1 GROUP BY account ORDER BY account::text",
+    )
+    .bind(f.order_id)
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    let rows: Vec<(&str, i64)> = rows.iter().map(|(a, n)| (a.as_str(), *n)).collect();
+    assert_eq!(
+        rows,
+        [
+            ("buyer_funds", -PRICE),
+            ("escrow", 0),
+            ("platform_revenue", -1_500),
+            ("provider_fees", 1_500),
+            ("refunds", PRICE),
+        ]
+    );
     let rows = audits(&app, "admin.order_refunded").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, Some(owner_id(&app).await));

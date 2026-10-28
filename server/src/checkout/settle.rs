@@ -14,7 +14,8 @@
 //!    order), the checkout, its orders. Status is re-checked under the locks.
 //!    - amount, currency (`NGN`) or reference differ, or the fee is negative or
 //!      above the total -> `amount_mismatch` + audit, a pending checkout's
-//!      reservation released (the owner refunds it);
+//!      reservation released, its `pending_payment` orders `cancelled` (with
+//!      an `order.cancelled` audit row each); the owner refunds the payment;
 //!    - `pending` -> commit the reservation (`stock -= q`, `reserved -= q`), paid;
 //!    - `expired` (reservation already released) -> if available stock covers
 //!      every line, `stock -= q` and paid; otherwise the checkout is `refunded`:
@@ -282,6 +283,28 @@ async fn apply(
             .execute(&mut *tx)
             .await
             .map_err(db_err("flag amount mismatch"))?;
+        // The orders are never paid: `pending_payment` has no other exit, so
+        // they are cancelled here (after expiry they already are). The money
+        // is the owner's to return (resolve / refund by hand).
+        let cancelled: Vec<Uuid> = sqlx::query_scalar(
+            "UPDATE orders SET status = 'cancelled', cancelled_at = now() \
+             WHERE checkout_id = $1 AND status = 'pending_payment' RETURNING id",
+        )
+        .bind(checkout_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_err("cancel mismatched orders"))?;
+        for order_id in &cancelled {
+            audit::record(
+                &mut tx,
+                None,
+                "order.cancelled",
+                "order",
+                Some(*order_id),
+                json!({ "reason": "amount_mismatch", "checkout_id": checkout_id }),
+            )
+            .await?;
+        }
         audit::record(
             &mut tx,
             None,

@@ -5,7 +5,9 @@
 //! 1. [`begin_refund`] (inside the caller's transaction, under the order lock):
 //!    order `paid -> refund_pending`, optional stock restore, a `refunds` row
 //!    with a fresh `RF` reference (status `requested`), ledger `escrow -T`,
-//!    `refunds +T`.
+//!    `refunds +T` (key `("refund", id)`), and the absorbed collection fee
+//!    `provider_fees +share`, `platform_revenue -share` (key
+//!    `("refund_fee", id)`, none when the share is 0).
 //! 2. [`send_refund`] (after commit): claims the row, calls `provider.refund`
 //!    with the same reference every time, and records the answer:
 //!    - Ok: refund `processing` (the buyer gets the money within about 10
@@ -186,16 +188,18 @@ async fn begin(
         Vec::new()
     };
 
-    let (status, items_total, delivery_fee, checkout_id, provider, held): (
+    let (status, items_total, delivery_fee, fee_share, checkout_id, provider, held): (
         String,
+        i64,
         i64,
         i64,
         Uuid,
         String,
         bool,
     ) = sqlx::query_as(
-        "SELECT o.status::text, o.items_total_kobo, o.delivery_fee_kobo, o.checkout_id, \
-                    c.provider, o.held_at IS NOT NULL \
+        "SELECT o.status::text, o.items_total_kobo, o.delivery_fee_kobo, \
+                    o.collection_fee_share_kobo, o.checkout_id, c.provider, \
+                    o.held_at IS NOT NULL \
              FROM orders o JOIN checkouts c ON c.id = o.checkout_id \
              WHERE o.id = $1 FOR UPDATE OF o",
     )
@@ -282,6 +286,25 @@ async fn begin(
         ],
     )
     .await?;
+    // The provider kept its collection fee on the payment and the buyer gets
+    // the full amount back, so the platform absorbs the fee (by ruling). It
+    // is booked here, as release books it, so `provider_fees` matches cash.
+    if fee_share > 0 {
+        const FEE_KIND: &str = "refund_fee";
+        let fee_entry = |account, amount_kobo| Entry {
+            kind: FEE_KIND,
+            ..entry(account, amount_kobo)
+        };
+        ledger::post(
+            conn,
+            (FEE_KIND, &refund_id.to_string()),
+            &[
+                fee_entry(Account::ProviderFees, fee_share),
+                fee_entry(Account::PlatformRevenue, -fee_share),
+            ],
+        )
+        .await?;
+    }
     audit::record(
         conn,
         None,
@@ -291,6 +314,7 @@ async fn begin(
         json!({
             "refund_id": refund_id,
             "amount_kobo": amount,
+            "absorbed_fee_kobo": fee_share,
             "restore_stock": restore,
             "clamped_units": clamped_units,
         }),
