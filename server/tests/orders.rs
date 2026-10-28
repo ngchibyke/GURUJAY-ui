@@ -124,7 +124,6 @@ const BUYER_KEYS: &[&str] = &[
     "items_total_kobo",
     "delivery_fee_kobo",
     "total_kobo",
-    "platform_cut_kobo",
     "held",
     "paid_at",
     "ship_by",
@@ -133,8 +132,11 @@ const BUYER_KEYS: &[&str] = &[
     "created_at",
 ];
 
+/// The seller view: the buyer's keys plus the cut (M3: buyers never see it,
+/// as at checkout), the buyer's display name and the expected payout.
 fn seller_keys(with_payout: bool) -> BTreeSet<String> {
     let mut k = set(BUYER_KEYS);
+    k.insert("platform_cut_kobo".into());
     k.insert("buyer_display_name".into());
     k.insert("expected_payout_kobo".into());
     if with_payout {
@@ -535,4 +537,127 @@ async fn orders_paginate_with_keyset_cursor(pool: PgPool) {
     ] {
         assert_eq!(get(&app, bad, &f.buyer).await.status, 422, "{bad}");
     }
+}
+
+/// `admin.viewed` rows for `order_id` written by `GET /orders/{id}`.
+async fn order_view_audits(app: &TestApp, order_id: Uuid) -> Vec<(Option<Uuid>, Value)> {
+    sqlx::query_as(
+        "SELECT actor_id, detail FROM audit_log \
+         WHERE action = 'admin.viewed' AND subject_type = 'order' AND subject_id = $1 \
+         ORDER BY at, id",
+    )
+    .bind(order_id)
+    .fetch_all(&app.pool)
+    .await
+    .unwrap()
+}
+
+async fn user_id(app: &TestApp, role: &str) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM users WHERE role::text = $1")
+        .bind(role)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+/// I4: staff reading someone else's order is audited like the admin lists,
+/// and Support never gets the buyer's name. The buyer and the store owner
+/// reading their own order write nothing.
+#[sqlx::test]
+async fn staff_order_reads_are_audited_and_support_gets_no_buyer_name(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    let path = format!("/orders/{}", f.order_id);
+
+    assert_eq!(get(&app, &path, &f.buyer).await.status, 200);
+    assert_eq!(get(&app, &path, &f.seller).await.status, 200);
+    assert!(order_view_audits(&app, f.order_id).await.is_empty());
+
+    // Owner: the seller view with the buyer's name (pending DPO review).
+    let owner = app.owner_token().await;
+    let res = get(&app, &path, &owner).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(keys(&res.json), seller_keys(false));
+    assert_eq!(res.json["buyer_display_name"], "Ada");
+
+    // Support: the same, minus the buyer's name.
+    let support = app.make_support().await;
+    let res = get(&app, &path, &support).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let mut expected = seller_keys(false);
+    expected.remove("buyer_display_name");
+    assert_eq!(keys(&res.json), expected);
+    assert!(!res.json.to_string().contains("Ada"));
+
+    let rows = order_view_audits(&app, f.order_id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, Some(user_id(&app, "owner").await));
+    assert_eq!(rows[1].0, Some(user_id(&app, "support").await));
+    for (_, detail) in &rows {
+        assert_eq!(detail, &json!({ "view": "order" }));
+    }
+
+    // A missing order is 404 and audits nothing.
+    let missing = get(&app, &format!("/orders/{}", Uuid::new_v4()), &support).await;
+    assert_eq!(missing.status, 404);
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM audit_log WHERE action = 'admin.viewed' AND subject_type = 'order'"
+        )
+        .await,
+        2
+    );
+}
+
+async fn expected_payout(app: &TestApp, f: &Fixture) -> Value {
+    let res = get(app, &format!("/orders/{}", f.order_id), &f.seller).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    res.json["expected_payout_kobo"].clone()
+}
+
+/// (12)+M4: the seller's expected payout comes from the fee schedule
+/// snapshotted on the order when it was paid, never goes below 0, and is left
+/// out once the order is cancelled or refunded.
+#[sqlx::test]
+async fn expected_payout_uses_the_order_fee_snapshot(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    // 10,000 - 500 cut - 10 fee share = 9,490; payout fee 3,500 -> 5,990.
+    assert_eq!(expected_payout(&app, &f).await, json!(5_990));
+
+    // An owner fee change after payment does not move the shown figure.
+    sqlx::query("UPDATE platform_settings SET fee_small_kobo = 9000, fee_large_kobo = 9000")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(expected_payout(&app, &f).await, json!(5_990));
+
+    // Without a snapshot (paid before 0017), the live schedule applies.
+    sqlx::query(
+        "UPDATE orders SET fee_small_kobo = NULL, fee_large_kobo = NULL, \
+                fee_threshold_kobo = NULL, stamp_duty_kobo = NULL, \
+                stamp_duty_threshold_kobo = NULL",
+    )
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    assert_eq!(expected_payout(&app, &f).await, json!(490));
+
+    // Fees above the order: 0, never negative (release books max(0) too).
+    sqlx::query("UPDATE orders SET fee_small_kobo = 20000, fee_large_kobo = 20000, \
+                 fee_threshold_kobo = 5000000, stamp_duty_kobo = 0, \
+                 stamp_duty_threshold_kobo = 0")
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(expected_payout(&app, &f).await, json!(0));
+
+    // Cancelled by the buyer: nothing is expected, so the field is left out.
+    assert_eq!(cancel(&app, f.order_id, &f.buyer).await.status, 200);
+    let res = get(&app, &format!("/orders/{}", f.order_id), &f.seller).await;
+    assert_eq!(res.json["status"], "cancelled");
+    let mut expected = seller_keys(false);
+    expected.remove("expected_payout_kobo");
+    assert_eq!(keys(&res.json), expected);
 }

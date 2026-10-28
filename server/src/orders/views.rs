@@ -1,26 +1,41 @@
 //! Read models for orders. Two audiences, two structs, each an explicit
 //! allowlist of fields (never serialise a database row):
 //!
-//! - [`BuyerOrderView`]: items, totals, cut, status, timestamps, held flag. No
-//!   payout data.
-//! - [`SellerOrderView`]: the same plus the buyer's display name only (no id,
-//!   phone or address), the expected payout and the payout's status. Refund
-//!   mechanics are hidden behind a coarse `cancelled` status.
+//! - [`BuyerOrderView`]: items, totals, status, timestamps, held flag. No
+//!   payout data, and no platform cut (as at checkout).
+//! - [`SellerOrderView`]: the same plus the platform cut, the buyer's display
+//!   name only (no id, phone or address), the expected payout and the
+//!   payout's status. Refund mechanics are hidden behind a coarse `cancelled`
+//!   status. The expected payout uses the fee schedule snapshotted on the
+//!   order when it was paid (the live one only for orders paid before the
+//!   snapshot existed), is never below 0, and is left out once the order is
+//!   cancelled or refunded.
 //!
 //! Every query puts the principal in the SQL, so a missing order and someone
 //! else's order are indistinguishable (both `NotFound`).
+//!
+//! **Staff reads.** Owner and Support may read any paid order through
+//! [`get_for_viewer`]; when the order is not their own (as buyer or store
+//! owner), the read writes an `admin.viewed` audit row (`view: "order"`), like
+//! every admin list. Support gets the seller view without the buyer's display
+//! name; the Owner keeps it (pending DPO review).
 
 use std::collections::HashMap;
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-use crate::{error::AppError, money, settings};
+use crate::{
+    audit,
+    error::AppError,
+    money::{self, FeeSchedule},
+    settings,
+};
 
 pub const DEFAULT_LIMIT: i64 = 20;
 pub const MAX_LIMIT: i64 = 100;
@@ -48,7 +63,6 @@ pub struct OrderCore {
     pub items_total_kobo: i64,
     pub delivery_fee_kobo: i64,
     pub total_kobo: i64,
-    pub platform_cut_kobo: i64,
     pub held: bool,
     #[serde(with = "time::serde::rfc3339::option")]
     pub paid_at: Option<OffsetDateTime>,
@@ -72,10 +86,30 @@ pub struct BuyerOrderView {
 pub struct SellerOrderView {
     #[serde(flatten)]
     pub order: OrderCore,
-    pub buyer_display_name: String,
-    pub expected_payout_kobo: i64,
+    pub platform_cut_kobo: i64,
+    /// Left out for Support (see the module docs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buyer_display_name: Option<String>,
+    /// Left out once the order is cancelled or refunded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_payout_kobo: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payout: Option<PayoutView>,
+}
+
+/// Staff reading an order through [`get_for_viewer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaffRole {
+    Owner,
+    Support,
+}
+
+/// Which view `build` makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Audience {
+    Buyer,
+    /// The seller view; `false` leaves out the buyer's display name.
+    Seller { buyer_name: bool },
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +162,7 @@ struct Row {
     id: Uuid,
     store_id: Uuid,
     buyer_id: Uuid,
+    store_owner_id: Uuid,
     status: String,
     items_total_kobo: i64,
     delivery_fee_kobo: i64,
@@ -142,14 +177,61 @@ struct Row {
     buyer_display_name: String,
     payout_status: Option<String>,
     payout_amount_kobo: Option<i64>,
+    fee_small_kobo: Option<i64>,
+    fee_large_kobo: Option<i64>,
+    fee_threshold_kobo: Option<i64>,
+    stamp_duty_kobo: Option<i64>,
+    stamp_duty_threshold_kobo: Option<i64>,
 }
 
-const SELECT: &str = "SELECT o.id, o.store_id, o.buyer_id, o.status::text AS status, \
+impl Row {
+    /// The payout fee schedule snapshotted when the order was paid, if any.
+    fn fee_snapshot(&self) -> Option<FeeSchedule> {
+        Some(FeeSchedule {
+            small_fee: self.fee_small_kobo?,
+            large_fee: self.fee_large_kobo?,
+            threshold: self.fee_threshold_kobo?,
+            stamp_duty_kobo: self.stamp_duty_kobo?,
+            stamp_duty_threshold: self.stamp_duty_threshold_kobo?,
+        })
+    }
+
+    /// What the seller should expect to be paid (see the module docs): the
+    /// payout's own amount once released, else the sum release makes. None
+    /// once the order is cancelled or refunded.
+    fn expected_payout(&self, live: Option<&FeeSchedule>) -> Option<i64> {
+        if matches!(
+            self.status.as_str(),
+            "cancelled" | "refund_pending" | "refunded"
+        ) {
+            return None;
+        }
+        if let Some(amount) = self.payout_amount_kobo {
+            return Some(amount.max(0));
+        }
+        let snapshot = self.fee_snapshot();
+        let schedule = snapshot.as_ref().or(live)?;
+        let before_fee = self
+            .items_total_kobo
+            .saturating_sub(self.platform_cut_kobo)
+            .saturating_sub(self.collection_fee_share_kobo);
+        Some(
+            before_fee
+                .saturating_sub(money::payout_fee_kobo(before_fee, schedule))
+                .max(0),
+        )
+    }
+}
+
+const SELECT: &str = "SELECT o.id, o.store_id, o.buyer_id, s.owner_id AS store_owner_id, \
+        o.status::text AS status, \
         o.items_total_kobo, o.delivery_fee_kobo, o.platform_cut_kobo, \
         o.collection_fee_share_kobo, (o.held_at IS NOT NULL) AS held, \
         COALESCE(o.paid_at, c.paid_at) AS paid_at, o.ship_by, o.delivered_at, o.release_at, \
         o.created_at, u.display_name AS buyer_display_name, \
-        p.status::text AS payout_status, p.amount_kobo AS payout_amount_kobo \
+        p.status::text AS payout_status, p.amount_kobo AS payout_amount_kobo, \
+        o.fee_small_kobo, o.fee_large_kobo, o.fee_threshold_kobo, \
+        o.stamp_duty_kobo, o.stamp_duty_threshold_kobo \
      FROM orders o \
      JOIN checkouts c ON c.id = o.checkout_id \
      JOIN users u ON u.id = o.buyer_id \
@@ -195,7 +277,6 @@ fn core(r: &Row, items: Vec<ItemView>, seller: bool) -> Result<OrderCore, AppErr
         items_total_kobo: r.items_total_kobo,
         delivery_fee_kobo: r.delivery_fee_kobo,
         total_kobo: total,
-        platform_cut_kobo: r.platform_cut_kobo,
         held: r.held,
         paid_at: r.paid_at,
         ship_by: r.ship_by,
@@ -205,34 +286,36 @@ fn core(r: &Row, items: Vec<ItemView>, seller: bool) -> Result<OrderCore, AppErr
     })
 }
 
-async fn build(db: &PgPool, rows: Vec<Row>, seller: bool) -> Result<Vec<OrderView>, AppError> {
+async fn build(
+    db: &PgPool,
+    rows: Vec<Row>,
+    audience: Audience,
+) -> Result<Vec<OrderView>, AppError> {
     let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
     let mut items = items_for(db, &ids).await?;
-    let schedule = if seller {
+    let Audience::Seller { buyer_name } = audience else {
+        return rows
+            .into_iter()
+            .map(|r| {
+                let order = core(&r, items.remove(&r.id).unwrap_or_default(), false)?;
+                Ok(OrderView::Buyer(BuyerOrderView { order }))
+            })
+            .collect();
+    };
+    // The live schedule only for orders paid before the snapshot existed.
+    let live = if rows.iter().any(|r| r.fee_snapshot().is_none()) {
         Some(settings::load(db).await?.fee_schedule())
     } else {
         None
     };
     rows.into_iter()
         .map(|r| {
-            let order = core(&r, items.remove(&r.id).unwrap_or_default(), seller)?;
-            let Some(schedule) = &schedule else {
-                return Ok(OrderView::Buyer(BuyerOrderView { order }));
-            };
-            let expected = match r.payout_amount_kobo {
-                Some(amount) => amount,
-                None => {
-                    let before_fee = r
-                        .items_total_kobo
-                        .saturating_sub(r.platform_cut_kobo)
-                        .saturating_sub(r.collection_fee_share_kobo);
-                    before_fee - money::payout_fee_kobo(before_fee, schedule)
-                }
-            };
+            let order = core(&r, items.remove(&r.id).unwrap_or_default(), true)?;
             Ok(OrderView::Seller(SellerOrderView {
                 order,
-                buyer_display_name: r.buyer_display_name,
-                expected_payout_kobo: expected,
+                platform_cut_kobo: r.platform_cut_kobo,
+                expected_payout_kobo: r.expected_payout(live.as_ref()),
+                buyer_display_name: buyer_name.then_some(r.buyer_display_name),
                 payout: r.payout_status.map(|status| PayoutView { status }),
             }))
         })
@@ -243,11 +326,11 @@ async fn page(
     db: &PgPool,
     mut rows: Vec<Row>,
     limit: i64,
-    seller: bool,
+    audience: Audience,
 ) -> Result<Page<OrderView>, AppError> {
     let more = rows.len() as i64 > limit;
     rows.truncate(usize::try_from(limit).unwrap_or(0));
-    let items = build(db, rows, seller).await?;
+    let items = build(db, rows, audience).await?;
     let next_cursor = match (more, items.last()) {
         (true, Some(last)) => {
             let (ts, id) = last.key();
@@ -278,7 +361,7 @@ pub async fn list_for_buyer(
     .fetch_all(db)
     .await
     .context("list buyer orders")?;
-    page(db, rows, limit, false).await
+    page(db, rows, limit, Audience::Buyer).await
 }
 
 /// A store's orders. The owner is part of the query: a store that is missing
@@ -314,30 +397,53 @@ pub async fn list_for_store(
     .fetch_all(db)
     .await
     .context("list store orders")?;
-    page(db, rows, limit, true).await
+    page(db, rows, limit, Audience::Seller { buyer_name: true }).await
 }
 
 /// One order for `viewer`: the buyer sees the buyer view; the store's owner and
-/// owner/support admins see the seller view. The principal is part of the
-/// query, so a missing order and someone else's order are both `NotFound`.
+/// owner/support staff (`staff`) see the seller view. The principal is part of
+/// the query, so a missing order and someone else's order are both
+/// `NotFound`. A staff read of an order that is not the viewer's own is
+/// audited (`admin.viewed`, written before the response, so a failure fails
+/// the read), and Support gets no buyer display name (see the module docs).
 pub async fn get_for_viewer(
     db: &PgPool,
     viewer: Uuid,
-    is_admin: bool,
+    staff: Option<StaffRole>,
     order_id: Uuid,
 ) -> Result<OrderView, AppError> {
     let row: Option<Row> = sqlx::query_as(&format!(
-        "{SELECT} WHERE o.id = $1 AND (o.buyer_id = $2 OR \n         ((s.owner_id = $2 OR $3) AND o.status <> 'pending_payment'))"
+        "{SELECT} WHERE o.id = $1 AND (o.buyer_id = $2 OR \
+         ((s.owner_id = $2 OR $3) AND o.status <> 'pending_payment'))"
     ))
     .bind(order_id)
     .bind(viewer)
-    .bind(is_admin)
+    .bind(staff.is_some())
     .fetch_optional(db)
     .await
     .context("load order")?;
     let row = row.ok_or(AppError::NotFound)?;
-    let seller = row.buyer_id != viewer;
-    build(db, vec![row], seller)
+    let audience = if row.buyer_id == viewer {
+        Audience::Buyer
+    } else if row.store_owner_id == viewer {
+        Audience::Seller { buyer_name: true }
+    } else {
+        // Only staff get here: the query admits no one else.
+        let mut conn = db.acquire().await.context("acquire")?;
+        audit::record(
+            &mut conn,
+            Some(viewer),
+            "admin.viewed",
+            "order",
+            Some(order_id),
+            json!({ "view": "order" }),
+        )
+        .await?;
+        Audience::Seller {
+            buyer_name: staff == Some(StaffRole::Owner),
+        }
+    };
+    build(db, vec![row], audience)
         .await?
         .pop()
         .ok_or(AppError::NotFound)

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::views::{self, DEFAULT_LIMIT, MAX_LIMIT, OrderView, Page};
+use super::views::{self, DEFAULT_LIMIT, MAX_LIMIT, OrderView, Page, StaffRole};
 use crate::{
     AppState, audit,
     auth::{AuthUser, extractor::Role},
@@ -70,9 +70,13 @@ async fn show(
     Path(id): Path<String>,
 ) -> Result<Json<OrderView>, AppError> {
     let id = parse_id(&id)?;
-    let admin = matches!(user.role, Role::Owner | Role::Support);
+    let staff = match user.role {
+        Role::Owner => Some(StaffRole::Owner),
+        Role::Support => Some(StaffRole::Support),
+        Role::User => None,
+    };
     Ok(Json(
-        views::get_for_viewer(&state.db, user.id, admin, id).await?,
+        views::get_for_viewer(&state.db, user.id, staff, id).await?,
     ))
 }
 
@@ -158,7 +162,7 @@ async fn cancel(
     }
     record(&state, &user, "order.cancelled_by_buyer", id, &status).await;
     Ok(Json(
-        views::get_for_viewer(&state.db, user.id, false, id).await?,
+        views::get_for_viewer(&state.db, user.id, None, id).await?,
     ))
 }
 
@@ -202,6 +206,6 @@ async fn received(
         _ => return Err(AppError::Conflict("invalid_order_state")),
     }
     Ok(Json(
-        views::get_for_viewer(&state.db, user.id, false, id).await?,
+        views::get_for_viewer(&state.db, user.id, None, id).await?,
     ))
 }
