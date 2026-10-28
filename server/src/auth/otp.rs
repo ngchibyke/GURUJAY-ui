@@ -115,7 +115,7 @@ pub async fn issue_otp(
     reason: IssueReason,
 ) -> Result<Issued, AppError> {
     // Serialise issuance per user so concurrent calls cannot slip past the throttle.
-    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
         .bind(user_id)
         .fetch_optional(&mut *conn)
         .await
@@ -228,7 +228,7 @@ pub async fn verify_otp(db: &PgPool, verification_id: &str, code: &str) -> Resul
     let mut tx = db.begin().await.map_err(anyhow::Error::from)?;
     // Same lock as credential changes: a concurrent reclaim either commits first (and this
     // code is already superseded) or waits until the phone is verified (and then fails).
-    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
         .bind(user_id)
         .fetch_optional(&mut *tx)
         .await

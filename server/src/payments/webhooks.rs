@@ -1,0 +1,199 @@
+//! `POST /webhooks/{provider}`: unauthenticated provider callbacks.
+//!
+//! - The body is taken as raw bytes, capped at 64 KiB on this route only
+//!   (413 `payload_too_large`, nothing stored).
+//! - The provider's secret/signature is checked before the body is parsed:
+//!   unknown provider -> 404, mismatch -> 401 `invalid_signature`.
+//! - A malformed body after a valid signature, and events we do not act on,
+//!   -> 200 `{"status":"ignored"}` (nothing stored).
+//! - Payment and payout events are deduplicated on `(provider, event_id)`: a
+//!   row with `processed_at` set -> 200 `{"status":"duplicate"}`.
+//! - A payment is settled ([`settle`](crate::checkout::settle::settle)), which
+//!   marks the event processed with the state change. When the payment cannot
+//!   be verified right now the answer is 503 `verify_unavailable`, so the
+//!   provider redelivers.
+//! - A payout is settled by our reference
+//!   ([`settle_payout`](crate::escrow::settle_payout)), which re-fetches the
+//!   payout's status from the provider; the event is marked processed after it.
+//!   When the status cannot be fetched the answer is 503 `payout_status_unavailable`.
+//!
+//! Logging: the provider name and event kind only, never the body or headers
+//! (bodies can carry the payer's bank account).
+
+use anyhow::Context;
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{Path, State, rejection::BytesRejection},
+    http::{HeaderMap, StatusCode},
+    middleware::map_response,
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use serde_json::json;
+use tower_http::limit::RequestBodyLimitLayer;
+
+use super::{ProviderError, WebhookEvent};
+use crate::{
+    AppState,
+    checkout::settle::{SettleOutcome, Source, settle},
+    error::AppError,
+    escrow::{SettlePayoutOutcome, release::settle_payout_from},
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventKind {
+    Payment,
+    Payout,
+}
+
+impl EventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            EventKind::Payment => "payment",
+            EventKind::Payout => "payout",
+        }
+    }
+}
+
+/// Largest webhook body accepted.
+pub const MAX_WEBHOOK_BODY: usize = 64 * 1024;
+const MAX_EVENT_ID_LEN: usize = 200;
+
+pub fn router() -> Router<AppState> {
+    // Router::layer here wraps only this router's route (it is merged afterwards).
+    Router::new()
+        .route("/webhooks/{provider}", post(receive))
+        .layer(RequestBodyLimitLayer::new(MAX_WEBHOOK_BODY))
+        // Outermost, so it also sees the limit layer's own 413.
+        .layer(map_response(envelope_413))
+}
+
+/// The limit layer answers an over-long declared length itself, in plain text;
+/// give it the JSON error envelope.
+async fn envelope_413(res: Response) -> Response {
+    if res.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge.into_response()
+    } else {
+        res
+    }
+}
+
+fn status(s: &'static str) -> Response {
+    (StatusCode::OK, Json(json!({ "status": s }))).into_response()
+}
+
+async fn receive(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, AppError> {
+    let provider = state
+        .providers
+        .by_name(&provider)
+        .ok_or(AppError::NotFound)?;
+    let body = body.map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            AppError::PayloadTooLarge
+        } else {
+            AppError::Validation("Request body could not be read".into())
+        }
+    })?;
+    let name = provider.name();
+    let event = match provider.verify_webhook(&headers, &body) {
+        Ok(event) => event,
+        Err(ProviderError::InvalidSignature) => {
+            tracing::warn!(provider = name, "webhook with invalid signature");
+            return Err(AppError::InvalidSignature);
+        }
+        Err(_) => {
+            tracing::info!(provider = name, kind = "malformed", "webhook ignored");
+            return Ok(status("ignored"));
+        }
+    };
+    let (event_id, reference, kind) = match event {
+        WebhookEvent::Payment {
+            event_id,
+            reference,
+        } => (event_id, reference, EventKind::Payment),
+        WebhookEvent::Payout {
+            event_id,
+            reference,
+        } => (event_id, reference, EventKind::Payout),
+        _ => {
+            tracing::info!(provider = name, kind = "other", "webhook ignored");
+            return Ok(status("ignored"));
+        }
+    };
+    let kind_name = kind.as_str();
+    if event_id.is_empty() || event_id.len() > MAX_EVENT_ID_LEN {
+        tracing::info!(provider = name, kind = "bad_event_id", "webhook ignored");
+        return Ok(status("ignored"));
+    }
+    tracing::info!(provider = name, kind = kind_name, "webhook received");
+
+    sqlx::query(
+        "INSERT INTO provider_events (provider, event_id, kind) VALUES ($1, $2, $3) \
+         ON CONFLICT (provider, event_id) DO NOTHING",
+    )
+    .bind(name)
+    .bind(&event_id)
+    .bind(kind_name)
+    .execute(&state.db)
+    .await
+    .context("record provider event")?;
+    let processed: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL FROM provider_events WHERE provider = $1 AND event_id = $2",
+    )
+    .bind(name)
+    .bind(&event_id)
+    .fetch_one(&state.db)
+    .await
+    .context("load provider event")?;
+    if processed {
+        return Ok(status("duplicate"));
+    }
+
+    if kind == EventKind::Payout {
+        // settle_payout is idempotent (status checks under the payout lock and
+        // ledger posting keys), so marking the event processed after it is safe.
+        return match settle_payout_from(&state, &reference, Some(name)).await? {
+            SettlePayoutOutcome::RetryLater => {
+                Err(AppError::Unavailable("payout_status_unavailable"))
+            }
+            // Retrying cannot settle it (the owner must): 200 so the provider
+            // stops, but the event stays unprocessed so a later delivery is
+            // handled again.
+            SettlePayoutOutcome::Inconclusive => {
+                tracing::warn!(
+                    provider = name,
+                    cause = "payout_lookup_inconclusive",
+                    "payout webhook not settled"
+                );
+                Ok(status("received"))
+            }
+            _ => {
+                sqlx::query(
+                    "UPDATE provider_events SET processed_at = now() \
+                     WHERE provider = $1 AND event_id = $2 AND processed_at IS NULL",
+                )
+                .bind(name)
+                .bind(&event_id)
+                .execute(&state.db)
+                .await
+                .context("mark event processed")?;
+                Ok(status("received"))
+            }
+        };
+    }
+
+    let source = Source::Webhook {
+        provider: name,
+        event_id: &event_id,
+    };
+    match settle(&state, &reference, source).await? {
+        SettleOutcome::RetryLater => Err(AppError::Unavailable("verify_unavailable")),
+        _ => Ok(status("received")),
+    }
+}

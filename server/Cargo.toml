@@ -13,6 +13,7 @@ base64 = "0.22"
 dotenvy = "0.15"
 hmac = "0.12"
 rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,8 +21,9 @@ sha2 = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "time", "migrate", "macros"] }
 thiserror = "2"
 time = { version = "0.3", features = ["parsing", "formatting", "serde-well-known"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
+tokio-util = "0.7"
+tower-http = { version = "0.6", features = ["trace", "limit"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["serde", "v4"] }
@@ -30,9 +32,13 @@ uuid = { version = "1", features = ["serde", "v4"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+wiremock = "0.6"
 
 # Argon2 is deliberately slow; keep it fast enough in debug test builds.
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
+
+[profile.release]
+overflow-checks = true

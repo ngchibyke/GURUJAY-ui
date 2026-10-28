@@ -11,10 +11,16 @@ use server::{
     build_app,
     config::Config,
     crypto::FieldCipher,
+    escrow::jobs,
+    payments::{ProviderRegistry, mono::MonoProvider},
     phone::normalize_ng_phone,
+    pool_options,
 };
-use sqlx::postgres::PgPoolOptions;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+/// How long open connections get to finish after a shutdown signal.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug)]
 enum Command {
@@ -51,11 +57,23 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&config.database_url)
-        .await?;
+    // Before connecting or migrating: a production server with no payment
+    // provider would fail every checkout. Admin commands still run.
+    if matches!(command, Command::Serve) {
+        require_payment_provider(&config.app_env, config.mono.is_some())?;
+    }
+    let db = pool_options(10).connect(&config.database_url).await?;
     sqlx::migrate!("./migrations").run(&db).await?;
+
+    let mut providers = ProviderRegistry::new();
+    match config.mono.clone() {
+        Some(mono_cfg) => {
+            let live = mono_cfg.live;
+            providers.register(Arc::new(MonoProvider::new(mono_cfg)?));
+            tracing::info!(live, "mono payment provider registered");
+        }
+        None => tracing::warn!("MONO_SECRET_KEY not set: no payment provider is configured"),
+    }
 
     let state = AppState {
         db,
@@ -64,6 +82,9 @@ async fn main() -> anyhow::Result<()> {
         otp: Arc::new(LogOtpSender {
             echo: config.otp_dev_echo,
         }),
+        providers: Arc::new(providers),
+        payment_redirect_url: config.public_redirect_url.clone(),
+        verify_gate: Arc::new(server::payments::VerifyGate::default()),
     };
 
     match command {
@@ -75,7 +96,77 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(state: AppState, config: &Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "listening");
-    axum::serve(listener, build_app(state)).await?;
+    let db = state.db.clone();
+    // Background jobs (Task 9): stopped by the same shutdown signal, and
+    // awaited before the pool closes.
+    let stop_jobs = CancellationToken::new();
+    let jobs_loop = tokio::spawn(jobs::run_loop(state.clone(), stop_jobs.clone()));
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let cancel_jobs = stop_jobs.clone();
+    let server = axum::serve(listener, build_app(state)).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown signal received, draining connections");
+        cancel_jobs.cancel();
+        let _ = signalled_tx.send(());
+    });
+    // Idle keep-alive connections can stall the drain forever, so bound it once the signal fires.
+    let served = tokio::select! {
+        res = server => res,
+        _ = async {
+            if signalled_rx.await.is_ok() {
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::warn!("drain timed out, shutting down with connections still open");
+            Ok(())
+        }
+    };
+    // Also on a server error: the jobs stop between rows, never mid-call.
+    stop_jobs.cancel();
+    if tokio::time::timeout(SHUTDOWN_GRACE, jobs_loop)
+        .await
+        .is_err()
+    {
+        tracing::warn!("jobs did not stop in time, shutting down anyway");
+    }
+    db.close().await;
+    tracing::info!("shut down");
+    served?;
+    Ok(())
+}
+
+/// Resolves on Ctrl-C or (on unix) SIGTERM so in-flight requests can finish.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+/// Production refuses to start without a payment provider: every checkout
+/// would fail and webhooks would 404.
+fn require_payment_provider(app_env: &str, mono_configured: bool) -> anyhow::Result<()> {
+    if app_env == "production" && !mono_configured {
+        bail!("APP_ENV is production but no payment provider is configured (set MONO_SECRET_KEY)");
+    }
     Ok(())
 }
 
@@ -131,6 +222,16 @@ mod tests {
             panic!("expected create-owner")
         };
         assert_eq!(rest, args(&["--phone", "080", "--name", "N"]));
+    }
+
+    #[test]
+    fn production_requires_a_payment_provider() {
+        let err = require_payment_provider("production", false).unwrap_err();
+        assert!(err.to_string().contains("MONO_SECRET_KEY"), "{err}");
+        assert!(require_payment_provider("production", true).is_ok());
+        for env in ["development", "test", "staging"] {
+            assert!(require_payment_provider(env, false).is_ok(), "{env}");
+        }
     }
 
     #[test]

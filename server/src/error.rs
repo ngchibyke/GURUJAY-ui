@@ -20,6 +20,16 @@ pub enum AppError {
     Validation(String),
     #[error("unauthorized")]
     Unauthorized,
+    /// 401 `invalid_signature`: a webhook whose secret/signature did not match.
+    #[error("invalid webhook signature")]
+    InvalidSignature,
+    /// 413 `payload_too_large`.
+    #[error("payload too large")]
+    PayloadTooLarge,
+    /// 503 with the given code: try again later (e.g. a webhook the provider
+    /// should redeliver because the payment could not be verified yet).
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(&'static str),
     #[error("invalid credentials")]
     InvalidCredentials,
     #[error("forbidden: {0}")]
@@ -33,10 +43,19 @@ pub enum AppError {
     MethodNotAllowed,
     #[error("conflict: {0}")]
     Conflict(&'static str),
+    /// 409 with a specific message, e.g. `out_of_stock` naming the variant id.
+    #[error("conflict: {0}")]
+    ConflictDetail(&'static str, String),
     #[error("unprocessable: {0}")]
     Unprocessable(&'static str, String),
     #[error("too many requests: {0}")]
     TooManyRequests(&'static str),
+    /// 502 `payment_provider_unavailable`: the payment provider failed or is not configured.
+    #[error("payment provider unavailable")]
+    ProviderUnavailable,
+    /// 501 `not_supported`: the provider does not offer this operation.
+    #[error("not supported")]
+    NotSupported,
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -55,6 +74,18 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
                 body("unauthorized", "Authentication required"),
+            ),
+            AppError::InvalidSignature => (
+                StatusCode::UNAUTHORIZED,
+                body("invalid_signature", "Invalid signature"),
+            ),
+            AppError::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                body("payload_too_large", "Request body is too large"),
+            ),
+            AppError::Unavailable(code) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                body(code, "Temporarily unavailable, try again later"),
             ),
             AppError::InvalidCredentials => (
                 StatusCode::UNAUTHORIZED,
@@ -81,12 +112,24 @@ impl IntoResponse for AppError {
                 StatusCode::CONFLICT,
                 body(code, "Conflict with existing data"),
             ),
+            AppError::ConflictDetail(code, msg) => (StatusCode::CONFLICT, body(code, &msg)),
             AppError::Unprocessable(code, msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, body(code, &msg))
             }
             AppError::TooManyRequests(code) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 body(code, "Too many attempts, try again later"),
+            ),
+            AppError::ProviderUnavailable => (
+                StatusCode::BAD_GATEWAY,
+                body(
+                    "payment_provider_unavailable",
+                    "The payment provider is unavailable, try again later",
+                ),
+            ),
+            AppError::NotSupported => (
+                StatusCode::NOT_IMPLEMENTED,
+                body("not_supported", "This operation is not supported"),
             ),
             AppError::Internal(err) => {
                 tracing::error!(error = ?err, "internal error");

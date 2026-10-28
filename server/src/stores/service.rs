@@ -220,7 +220,7 @@ pub async fn create_store(
 
     let mut tx = db.begin().await.context("begin")?;
     // Serialise concurrent creates for the same user (lock order: users row first).
-    sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE")
         .bind(owner)
         .fetch_one(&mut *tx)
         .await
@@ -398,7 +398,7 @@ async fn lock_owned(
     id: Uuid,
 ) -> Result<Store, AppError> {
     sqlx::query_as(&format!(
-        "SELECT {COLUMNS} FROM stores WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL FOR UPDATE"
+        "SELECT {COLUMNS} FROM stores WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL FOR NO KEY UPDATE"
     ))
     .bind(id)
     .bind(owner)

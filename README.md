@@ -14,12 +14,21 @@ The server foundation (part 1 of 8):
 - **Products:** photos, condition, brand, and variants such as size and colour, each with its own stock and optional price.
 - **Data protection:** phone numbers and addresses are encrypted at rest, lookups use a keyed hash, personal data is never logged, and an append-only audit log records sensitive actions.
 
+Payments and escrow (part 2):
+
+- **Paying:** a cart becomes one checkout paid through Mono DirectPay (behind a provider layer that can be switched), split into one order per store. Stock is reserved while the buyer pays.
+- **Held funds and ledger:** every money movement is a balanced entry in an append-only, double-entry ledger, and the platform takes a 5% cut.
+- **Payouts:** sellers register a payout account, which is verified and stored encrypted. Funds are released to the seller through Mono Disburse after the buyer confirms, or 3 days after delivery. The pickup and delivery steps arrive in part 3, so until then orders stay at `paid` and nothing is released automatically.
+- **Refunds and cancellations:** refunds are retried by a background sweeper.
+- **Background jobs:** expiry, lost-webhook re-verification, auto-release, the 30-day backstop queue and payout polling.
+- **Owner admin:** release, refund and hold orders; mark payouts paid or refunds refunded by hand; re-queue reversed payouts. A reconciliation list shows everything that needs attention. Every staff read and override is audited.
+
 ## Roadmap
 
 | Part | What it adds |
 |---|---|
 | 1 | Server foundation (done) |
-| 2 | Payments and escrow (Paystack): cart, orders, held funds, release, refunds, 5% platform cut |
+| 2 | Payments and escrow (Mono first, behind a switchable provider layer): cart, orders, held funds, release, refunds, 5% platform cut (done) |
 | 3 | Delivery and tracking: NIPOST postcodes, Shipbubble couriers, self-delivery, handover codes |
 | 4 | Moderated chat and reviews |
 | 5 | Disputes and notifications |
@@ -74,3 +83,6 @@ These are tracked in the roadmap:
 - Rate limits per network address on sign-up and sign-in.
 - A restricted production database role.
 - Legal review of the escrow setup, and data-protection (DPO) review.
+- The ship-deadline job (`platform_settings.jobs_ship_deadline_enabled`) stays **off** until plan 3 ships a pickup route. Until then nothing can move an order out of `paid`, so the job would refund every paid order and strike its seller.
+- Confirm with Mono which unit (kobo or naira) each product's `amount` fields use (`MONO_DIRECTPAY_AMOUNT_UNIT`, `MONO_DISBURSE_AMOUNT_UNIT`), then run a sandbox smoke test of a payment, a payout and a webhook before switching to live keys.
+- DPO review of whether the Owner should keep seeing buyer display names on order reads. Support already does not, and every staff read is audited.
