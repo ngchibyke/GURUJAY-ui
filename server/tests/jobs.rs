@@ -1372,3 +1372,164 @@ async fn pool_sets_idle_in_transaction_timeout() {
     assert_eq!(v, "1min");
     pool.close().await;
 }
+
+// ------------------------------------------------- (7) failure-path checks
+
+/// A test-only trigger that makes `table` updates matching `when` fail.
+async fn fail_updates(app: &TestApp, table: &str, when: &str) {
+    exec(
+        app,
+        "CREATE FUNCTION test_fail() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'test failure'; END $$",
+    )
+    .await;
+    exec(
+        app,
+        &format!(
+            "CREATE TRIGGER test_fail BEFORE UPDATE ON {table} FOR EACH ROW \
+             WHEN ({when}) EXECUTE FUNCTION test_fail()"
+        ),
+    )
+    .await;
+}
+
+/// A second paid order from the same buyer and listing.
+async fn another_paid_order(app: &TestApp, f: &Fixture) -> Uuid {
+    assert_eq!(app.set_cart(&f.buyer, f.variant_id, 1).await.status, 200);
+    let res = app.checkout(&f.buyer, METHOD).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let reference = res.json["reference"].as_str().unwrap().to_string();
+    paid(app, &reference, PRICE);
+    assert_eq!(
+        settle_payment(&app.state, &reference).await.unwrap(),
+        SettleOutcome::Paid
+    );
+    let checkout_id: Uuid = res.json["checkout_id"].as_str().unwrap().parse().unwrap();
+    sqlx::query_scalar("SELECT id FROM orders WHERE checkout_id = $1")
+        .bind(checkout_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+/// (7): the exhausted-refund escalation failing does not stop the sweeper
+/// sending the other due refunds; the escalation runs on a later tick.
+#[sqlx::test]
+async fn refund_escalation_failure_still_lets_the_sweeper_send(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    let second = another_paid_order(&app, &f).await;
+    app.fake.set_refund_supported(true);
+    app.fake
+        .fail_refund_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    for order in [f.order_id, second] {
+        let out = server::escrow::refund::refund_order(&app.state, order, true)
+            .await
+            .unwrap();
+        assert_eq!(out.status, "requested");
+    }
+    app.fake.clear_refund_failure();
+    exec(
+        &app,
+        "UPDATE refunds SET updated_at = now() - interval '2 minutes', next_attempt_at = NULL",
+    )
+    .await;
+    exec(
+        &app,
+        &format!(
+            "UPDATE refunds SET attempts = {MAX_REFUND_ATTEMPTS} WHERE order_id = '{}'",
+            f.order_id
+        ),
+    )
+    .await;
+    fail_updates(&app, "refunds", "NEW.status = 'manual'").await;
+    let calls = app.fake.calls("refund");
+
+    let r = tokio::time::timeout(Duration::from_secs(30), tick(&app))
+        .await
+        .unwrap();
+    assert!(r.failed >= 1, "{r:?}");
+    assert_eq!(r.refunds_retried, 1);
+    assert_eq!(app.fake.calls("refund"), calls + 1);
+    assert_eq!(order_status(&app, second).await, "refunded");
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM refunds WHERE status = 'requested'").await,
+        1
+    );
+
+    exec(&app, "DROP TRIGGER test_fail ON refunds").await;
+    tick(&app).await;
+    assert_eq!(
+        count(&app, "SELECT count(*) FROM refunds WHERE status = 'manual'").await,
+        1
+    );
+}
+
+/// (7): the refund and reverify jobs push failed rows back through their own
+/// columns; an error writes no `job_row_failures` row for them.
+#[sqlx::test]
+async fn refund_and_reverify_errors_write_no_push_back_rows(pool: PgPool) {
+    let app = TestApp::new(pool).await;
+    let f = paid_order(&app).await;
+    app.fake.set_refund_supported(true);
+    app.fake
+        .fail_refund_with(ProviderError::Unavailable(anyhow::anyhow!("down")));
+    server::escrow::refund::refund_order(&app.state, f.order_id, true)
+        .await
+        .unwrap();
+    exec(
+        &app,
+        "UPDATE refunds SET updated_at = now() - interval '2 minutes', next_attempt_at = NULL",
+    )
+    .await;
+    // A lost-webhook checkout the reverify will find paid.
+    let listing = app
+        .make_active_store_with_product("08011111112", "Buka", PRICE, 5)
+        .await;
+    let (_, buyer) = app.sign_up_verified("08022222229").await;
+    assert_eq!(app.set_cart(&buyer, listing.variant_id, 1).await.status, 200);
+    let res = app.checkout(&buyer, METHOD).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let reference = res.json["reference"].as_str().unwrap().to_string();
+    let checkout_id: Uuid = res.json["checkout_id"].as_str().unwrap().parse().unwrap();
+    exec(
+        &app,
+        &format!("UPDATE checkouts SET expires_at = now() - interval '1 minute' WHERE id = '{checkout_id}'"),
+    )
+    .await;
+    paid(&app, &reference, PRICE);
+
+    // Both engine calls fail inside the database.
+    exec(
+        &app,
+        "CREATE FUNCTION test_fail() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'test failure'; END $$",
+    )
+    .await;
+    exec(
+        &app,
+        "CREATE TRIGGER test_fail_refunds BEFORE UPDATE ON refunds FOR EACH ROW \
+         WHEN (NEW.sending_until IS NOT NULL) EXECUTE FUNCTION test_fail()",
+    )
+    .await;
+    exec(
+        &app,
+        "CREATE TRIGGER test_fail_checkouts BEFORE UPDATE ON checkouts FOR EACH ROW \
+         WHEN (NEW.status = 'paid') EXECUTE FUNCTION test_fail()",
+    )
+    .await;
+    let r = tick(&app).await;
+    assert!(r.failed >= 2, "{r:?}");
+    assert_eq!(r.refunds_retried, 0);
+    assert_eq!(r.reverified, 0);
+    assert_eq!(checkout_status(&app, checkout_id).await, "expired");
+    assert_eq!(
+        count(
+            &app,
+            "SELECT count(*) FROM job_row_failures \
+             WHERE job IN ('refunds', 'reverify_checkouts')"
+        )
+        .await,
+        0
+    );
+}
