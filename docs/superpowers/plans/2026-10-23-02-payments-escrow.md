@@ -73,8 +73,8 @@ server/migrations/
   0008_platform_settings.sql
   0009_payout_accounts.sql
   0010_cart_checkout_orders.sql   carts, checkouts, orders, order_items, stock reservations
-  0011_ledger.sql                 ledger_entries (append-only)
-  0012_payments_payouts.sql       provider_events, payouts, refunds, seller_strikes
+  0012_ledger.sql                 ledger_entries (append-only)  [0011 became reserved_stock]
+  0013_payments_payouts.sql       provider_events, payouts, refunds, seller_strikes
 server/src/
   money.rs                        Kobo helpers: checked_sum, cut_bps, payout_fee
   settings/{mod,service,routes}.rs
@@ -323,7 +323,7 @@ impl ProviderRegistry {
 
 ### Task 6: Webhooks and marking checkouts paid
 
-**Files:** `migrations/0011_ledger.sql`, `migrations/0012_payments_payouts.sql`, `src/payments/webhooks.rs`, `src/ledger.rs`, `src/checkout/service.rs` (`settle_payment`), `tests/webhooks.rs`
+**Files:** `migrations/0012_ledger.sql`, `migrations/0013_payments_payouts.sql`, `src/payments/webhooks.rs`, `src/ledger.rs`, `src/checkout/service.rs` (`settle_payment`), `tests/webhooks.rs`
 
 **Interfaces — Produces:**
 - Table `provider_events(provider text, event_id text, received_at, pk(provider, event_id))` for dedupe.
@@ -380,7 +380,7 @@ impl ProviderRegistry {
   - `refund_order(.., restore_stock: true)` on a paid order adds the committed units back to `stock`.
 - When marking orders paid, set `ship_by = paid_at + ship_deadline_hours` and `backstop_at = paid_at + backstop_days`, using the settings read at that moment.
 - `enabled_methods` is checked **only** at `POST /checkout`. Webhooks, polls and refunds always use the checkout's stored `provider`, even if the owner has since disabled the method. Test: `disabled_method_still_settles`.
-- Migration 0012 creates `provider_events`, `payouts`, `refunds` and `seller_strikes`, so Tasks 8 and 9 add no migration. `payouts` gets the extra columns from the Task 8 amendment.
+- Migration 0013 (planned as 0012; numbers shifted when 0011 became `reserved_stock`) creates `provider_events`, `payouts`, `refunds` and `seller_strikes`, so Tasks 8 and 9 add no migration. `payouts` gets the extra columns from the Task 8 amendment.
 
 ---
 
